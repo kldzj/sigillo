@@ -164,9 +164,9 @@ function toEnvironmentSummary(environment: z.infer<typeof environmentSummarySche
   }
 }
 
-function toProjectPayload(project: ProjectWithOrgAndEnvs, environmentId?: string | null): z.infer<typeof projectListItemSchema> {
-  const environments = environmentId
-    ? project.environments.filter((environment) => environment.id === environmentId)
+function toProjectPayload(project: ProjectWithOrgAndEnvs, environmentIds?: string[] | null): z.infer<typeof projectListItemSchema> {
+  const environments = environmentIds
+    ? project.environments.filter((environment) => environmentIds.includes(environment.id))
     : project.environments
   return {
     id: project.id,
@@ -479,7 +479,7 @@ export const apiApp = new Spiceflow()
           with: { org: true, environments: true },
         })
         if (!project || (query.orgId && project.orgId !== query.orgId)) return { projects: [] }
-        return { projects: [toProjectPayload(project, apiToken.environmentId)] }
+        return { projects: [toProjectPayload(project, apiToken.environmentIds)] }
       }
 
       const session = await requireApiSession(request)
@@ -533,7 +533,7 @@ export const apiApp = new Spiceflow()
           with: { org: true, environments: true },
         })
         if (!project) return json({ error: 'not found' }, { status: 404 })
-        return toProjectPayload(project, apiToken.environmentId)
+        return toProjectPayload(project, apiToken.environmentIds)
       }
 
       const session = await requireApiSession(request)
@@ -607,8 +607,8 @@ export const apiApp = new Spiceflow()
         if (apiToken.projectId !== params.projectId) return json({ error: 'forbidden' }, { status: 403 })
         const db = getDb()
         const environments = (await db.query.environment.findMany({
-          where: apiToken.environmentId
-            ? { projectId: params.projectId, id: apiToken.environmentId }
+          where: apiToken.environmentIds
+            ? { projectId: params.projectId, id: { in: apiToken.environmentIds } }
             : { projectId: params.projectId },
           orderBy: { createdAt: 'asc' },
         })).map(toEnvironmentSummary)
@@ -655,7 +655,7 @@ export const apiApp = new Spiceflow()
         if (apiToken.projectId !== params.projectId) return json({ error: 'forbidden' }, { status: 403 })
         const environment = await resolveEnvironment(params.id, params.projectId)
         if (!environment || environment.projectId !== apiToken.projectId) return json({ error: 'not found' }, { status: 404 })
-        if (apiToken.environmentId && apiToken.environmentId !== environment.id) {
+        if (apiToken.environmentIds && !apiToken.environmentIds.includes(environment.id)) {
           return json({ error: 'forbidden' }, { status: 403 })
         }
         return toEnvironmentSummary(environment)
@@ -720,7 +720,7 @@ export const apiApp = new Spiceflow()
 
   // ── Secrets ─────────────────────────────────────────────────────
   // These routes accept both session cookies and Bearer tokens.
-  // Token auth is scoped to a project (and optionally a single environment).
+  // Token auth is scoped to a project (and optionally an env allowlist).
   .route({
     method: 'GET',
     path: '/api/v0/projects/:projectId/environments/:environmentId/secrets',

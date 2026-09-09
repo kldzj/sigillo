@@ -30,6 +30,34 @@ async function getTestAuth() {
   return cachedAuth
 }
 
+async function insertApiToken({
+  name,
+  projectId,
+  createdBy,
+  environmentIds,
+}: {
+  name: string
+  projectId: string
+  createdBy: string
+  environmentIds?: string[]
+}) {
+  const { key, hashedKey, prefix } = await generateApiToken()
+  const db = getDb()
+  const [token] = await db.insert(schema.apiToken).values({
+    name,
+    projectId,
+    prefix,
+    hashedKey,
+    createdBy,
+  }).returning({ id: schema.apiToken.id })
+  if (environmentIds?.length) {
+    await db.insert(schema.apiTokenEnvironment).values(
+      environmentIds.map((environmentId) => ({ tokenId: token!.id, environmentId })),
+    )
+  }
+  return { key, tokenId: token!.id }
+}
+
 async function createTestUser(overrides?: { email?: string; name?: string }) {
   const email = overrides?.email ?? `test-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`
   const name = overrides?.name ?? 'Test User'
@@ -457,6 +485,7 @@ describe('api tokens', () => {
   let userToken: string
   let projectId: string
   let devEnvId: string
+  let previewEnvId: string
   let prodEnvId: string
 
   beforeAll(async () => {
@@ -468,6 +497,7 @@ describe('api tokens', () => {
     projectId = proj.id
     const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: projectId } }))
     devEnvId = envs.environments.find((e) => e.slug === 'dev')!.id
+    previewEnvId = envs.environments.find((e) => e.slug === 'preview')!.id
     prodEnvId = envs.environments.find((e) => e.slug === 'prod')!.id
 
     // Seed a secret in dev
@@ -479,15 +509,10 @@ describe('api tokens', () => {
   })
 
   test('project-scoped token can access secrets', async () => {
-    const db = getDb()
     const user = await createTestUser({ name: 'TokenCreator' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'ci-token',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -500,17 +525,12 @@ describe('api tokens', () => {
   })
 
   test('env-scoped token cannot access other environments', async () => {
-    const db = getDb()
     const user = await createTestUser({ name: 'ScopedTokenUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'dev-only',
       projectId,
-      environmentId: devEnvId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
+      environmentIds: [devEnvId],
     })
 
     const tokenFetch = authedFetch(key)
@@ -537,14 +557,10 @@ describe('api tokens', () => {
   })
 
   test('project-scoped token can get its project (setup path)', async () => {
-    const db = getDb()
     const user = await createTestUser({ name: 'SetupTokenUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'setup-token',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -556,14 +572,10 @@ describe('api tokens', () => {
   })
 
   test('project-scoped token can list only its project', async () => {
-    const db = getDb()
     const user = await createTestUser({ name: 'ListTokenUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'list-token',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -572,14 +584,10 @@ describe('api tokens', () => {
   })
 
   test('project-scoped token can list its environments', async () => {
-    const db = getDb()
     const user = await createTestUser({ name: 'EnvListTokenUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'env-list-token',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -596,12 +604,9 @@ describe('api tokens', () => {
     const otherOrg = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Other Org' } }))
     const otherProj = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Other Project', orgId: otherOrg.id } }))
 
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'scoped-token',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -612,16 +617,12 @@ describe('api tokens', () => {
   })
 
   test('env-scoped token only sees that environment on the project', async () => {
-    const db = getDb()
     const user = await createTestUser({ name: 'EnvScopedSetupUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'dev-setup',
       projectId,
-      environmentId: devEnvId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
+      environmentIds: [devEnvId],
     })
 
     const project = assertOk(await authedFetch(key)('/api/v0/projects/:id', {
@@ -636,14 +637,10 @@ describe('api tokens', () => {
   })
 
   test('token cannot mutate a project', async () => {
-    const db = getDb()
     const user = await createTestUser({ name: 'MutateTokenUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await db.insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'read-only',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -677,14 +674,11 @@ describe('api tokens', () => {
       body: { name: 'PROD_SECRET', value: 'prod-value' },
     }))
 
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await getDb().insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'dev-only',
       projectId: proj.id,
-      environmentId: dev.id,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
+      environmentIds: [dev.id],
     })
 
     assertOk(await af('/api/v0/projects/:pid/environments/:id', {
@@ -700,12 +694,9 @@ describe('api tokens', () => {
 
   test('project-scoped token can call me and list its org', async () => {
     const user = await createTestUser({ name: 'MeTokenUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await getDb().insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'me-token',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -721,12 +712,9 @@ describe('api tokens', () => {
 
   test('project-scoped token can get an environment', async () => {
     const user = await createTestUser({ name: 'EnvGetTokenUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await getDb().insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'env-get-token',
       projectId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
     })
 
@@ -739,20 +727,91 @@ describe('api tokens', () => {
 
   test('env-scoped token cannot get a different environment', async () => {
     const user = await createTestUser({ name: 'EnvGetScopedUser' })
-    const { key, hashedKey, prefix } = await generateApiToken()
-    await getDb().insert(schema.apiToken).values({
+    const { key } = await insertApiToken({
       name: 'dev-get',
       projectId,
-      environmentId: devEnvId,
-      prefix,
-      hashedKey,
       createdBy: user.user.id,
+      environmentIds: [devEnvId],
     })
 
     const result = await authedFetch(key)('/api/v0/projects/:pid/environments/:id', {
       params: { pid: projectId, id: prodEnvId },
     })
     assertErrorStatus(result, 403)
+  })
+
+  test('token scoped to multiple envs can access those envs but not others', async () => {
+    const user = await createTestUser({ name: 'MultiEnvTokenUser' })
+    const { key } = await insertApiToken({
+      name: 'dev-preview',
+      projectId,
+      createdBy: user.user.id,
+      environmentIds: [devEnvId, previewEnvId],
+    })
+
+    const tokenFetch = authedFetch(key)
+    assertOk(await tokenFetch('/api/v0/projects/:pid/environments/:eid/secrets', {
+      params: { pid: projectId, eid: devEnvId },
+    }))
+    assertOk(await tokenFetch('/api/v0/projects/:pid/environments/:eid/secrets', {
+      params: { pid: projectId, eid: previewEnvId },
+    }))
+    assertErrorStatus(await tokenFetch('/api/v0/projects/:pid/environments/:eid/secrets', {
+      params: { pid: projectId, eid: prodEnvId },
+    }), 403)
+
+    const project = assertOk(await tokenFetch('/api/v0/projects/:id', {
+      params: { id: projectId },
+    }))
+    expect(project.environments.map((e) => e.slug).sort()).toEqual(['dev', 'preview'])
+
+    const envs = assertOk(await tokenFetch('/api/v0/projects/:pid/environments', {
+      params: { pid: projectId },
+    }))
+    expect(envs.environments.map((e) => e.slug).sort()).toEqual(['dev', 'preview'])
+  })
+
+  test('deleting one env from a multi-env token keeps the others', async () => {
+    const user = await createTestUser({ name: 'PartialCascadeUser' })
+    const af = authedFetch(user.token)
+    const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Partial Cascade Org' } }))
+    const proj = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Partial Cascade Project', orgId: org.id } }))
+    const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: proj.id } }))
+    const dev = envs.environments.find((e) => e.slug === 'dev')!
+    const preview = envs.environments.find((e) => e.slug === 'preview')!
+    const prod = envs.environments.find((e) => e.slug === 'prod')!
+
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST',
+      params: { pid: proj.id, eid: preview.id },
+      body: { name: 'PREVIEW_SECRET', value: 'preview-value' },
+    }))
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST',
+      params: { pid: proj.id, eid: prod.id },
+      body: { name: 'PROD_SECRET', value: 'prod-value' },
+    }))
+
+    const { key } = await insertApiToken({
+      name: 'dev-preview',
+      projectId: proj.id,
+      createdBy: user.user.id,
+      environmentIds: [dev.id, preview.id],
+    })
+
+    assertOk(await af('/api/v0/projects/:pid/environments/:id', {
+      method: 'DELETE',
+      params: { pid: proj.id, id: dev.id },
+    }))
+
+    const tokenFetch = authedFetch(key)
+    const previewSecret = assertOk(await tokenFetch('/api/v0/projects/:pid/environments/:eid/secrets/:name', {
+      params: { pid: proj.id, eid: preview.id, name: 'PREVIEW_SECRET' },
+    }))
+    expect(previewSecret.value).toBe('preview-value')
+    assertErrorStatus(await tokenFetch('/api/v0/projects/:pid/environments/:eid/secrets/:name', {
+      params: { pid: proj.id, eid: prod.id, name: 'PROD_SECRET' },
+    }), 403)
   })
 })
 

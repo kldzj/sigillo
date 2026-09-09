@@ -176,19 +176,15 @@ export const secretEvent = sqliteCore.sqliteTable('secret_event', {
 ])
 
 // ── API tokens ──────────────────────────────────────────────────────
-// Programmatic access tokens scoped to a project (and optionally to a
-// specific environment). The full key is shown once at creation and never
-// stored — only a SHA-256 hash is persisted for verification. A short
-// prefix (e.g. "sig_abc1...") is kept for display in the UI.
+// Programmatic access tokens scoped to a project. Optional env allowlist
+// lives in apiTokenEnvironment (same 0-rows = all pattern as memberAccess).
+// The full key is shown once at creation and never stored — only a SHA-256
+// hash is persisted. A short prefix (e.g. "sig_abc1...") is kept for display.
 
 export const apiToken = sqliteCore.sqliteTable('api_token', {
   id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
   name: sqliteCore.text('name').notNull(),
-  // Project this token grants access to (always required)
   projectId: sqliteCore.text('project_id').notNull().references(() => project.id, { onDelete: 'cascade' }),
-  // Optional: restrict to a single environment. Null = all envs in the project.
-  // Cascade so deleting that env revokes the token instead of widening it.
-  environmentId: sqliteCore.text('environment_id').references(() => environment.id, { onDelete: 'cascade' }),
   // First 12 chars after the "sig_" prefix, for display (e.g. "sig_a1b2c3d4e5f6...")
   prefix: sqliteCore.text('prefix').notNull(),
   // SHA-256 hex digest of the full key — used for verification lookups
@@ -198,6 +194,21 @@ export const apiToken = sqliteCore.sqliteTable('api_token', {
 }, (table) => [
   sqliteCore.index('api_token_project_id_idx').on(table.projectId),
   sqliteCore.index('api_token_hashed_key_idx').on(table.hashedKey),
+])
+
+// Env allowlist for a token. Zero rows = all envs in the project.
+// One or more rows = only those envs. Migration 0007 adds a trigger that
+// revokes the token when its last row is deleted, so cascade cannot widen
+// a scoped token to all. D1 keeps foreign_keys ON, so that migration also
+// parks secret_event before DROP TABLE api_token (api_token_id CASCADE).
+export const apiTokenEnvironment = sqliteCore.sqliteTable('api_token_environment', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  tokenId: sqliteCore.text('token_id').notNull().references(() => apiToken.id, { onDelete: 'cascade' }),
+  environmentId: sqliteCore.text('environment_id').notNull().references(() => environment.id, { onDelete: 'cascade' }),
+}, (table) => [
+  sqliteCore.uniqueIndex('api_token_environment_token_env_unique').on(table.tokenId, table.environmentId),
+  sqliteCore.index('api_token_environment_token_id_idx').on(table.tokenId),
+  sqliteCore.index('api_token_environment_environment_id_idx').on(table.environmentId),
 ])
 
 // ── Member access (project-level permissions) ──────────────────────
@@ -261,7 +272,7 @@ export const deviceCode = sqliteCore.sqliteTable('device_code', {
 // ── Relations (v2 API) ──────────────────────────────────────────────
 
 export const relations = defineRelations(
-  { user, session, account, verification, org, orgMember, orgInvitation, project, environment, secretEvent, apiToken, deviceCode, oauthDomain, memberAccess },
+  { user, session, account, verification, org, orgMember, orgInvitation, project, environment, secretEvent, apiToken, apiTokenEnvironment, deviceCode, oauthDomain, memberAccess },
   (r) => ({
     user: {
       sessions: r.many.session(),
@@ -304,6 +315,7 @@ export const relations = defineRelations(
     environment: {
       project: r.one.project({ from: r.environment.projectId, to: r.project.id }),
       secretEvents: r.many.secretEvent(),
+      apiTokenEnvironments: r.many.apiTokenEnvironment(),
     },
     secretEvent: {
       environment: r.one.environment({ from: r.secretEvent.environmentId, to: r.environment.id }),
@@ -312,8 +324,12 @@ export const relations = defineRelations(
     },
     apiToken: {
       project: r.one.project({ from: r.apiToken.projectId, to: r.project.id }),
-      environment: r.one.environment({ from: r.apiToken.environmentId, to: r.environment.id }),
       creator: r.one.user({ from: r.apiToken.createdBy, to: r.user.id }),
+      environments: r.many.apiTokenEnvironment(),
+    },
+    apiTokenEnvironment: {
+      token: r.one.apiToken({ from: r.apiTokenEnvironment.tokenId, to: r.apiToken.id }),
+      environment: r.one.environment({ from: r.apiTokenEnvironment.environmentId, to: r.environment.id }),
     },
     deviceCode: {
       user: r.one.user({ from: r.deviceCode.userId, to: r.user.id }),

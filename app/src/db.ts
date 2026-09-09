@@ -661,7 +661,7 @@ export async function requireSecretsApiAuth(
   if (apiToken) {
     const env = await resolveEnvironment(environmentRef, apiToken.projectId)
     if (!env || env.projectId !== apiToken.projectId) throw forbiddenResponse('token does not have access to this environment')
-    if (apiToken.environmentId && apiToken.environmentId !== env.id) {
+    if (apiToken.environmentIds && !apiToken.environmentIds.includes(env.id)) {
       throw forbiddenResponse('token is scoped to a different environment')
     }
     return { userId: null, apiTokenId: apiToken.tokenId, environmentId: env.id }
@@ -711,16 +711,23 @@ export async function generateApiToken(): Promise<{ key: string; hashedKey: stri
 export async function verifyApiToken(key: string): Promise<{
   tokenId: string
   projectId: string
-  environmentId: string | null
+  environmentIds: string[] | null
 } | null> {
   const hashedKey = await hashTokenKey(key)
   const db = getDb()
   const token = await db.query.apiToken.findFirst({
     where: { hashedKey },
-    columns: { id: true, projectId: true, environmentId: true },
+    columns: { id: true, projectId: true },
+    with: { environments: { columns: { environmentId: true } } },
   })
   if (!token) return null
-  return { tokenId: token.id, projectId: token.projectId, environmentId: token.environmentId }
+  return {
+    tokenId: token.id,
+    projectId: token.projectId,
+    environmentIds: token.environments.length === 0
+      ? null
+      : token.environments.map((row) => row.environmentId),
+  }
 }
 
 // Reads a sig_ bearer token from the request. Returns null when the request
@@ -729,7 +736,7 @@ export async function verifyApiToken(key: string): Promise<{
 export async function getRequestApiToken(request: Request): Promise<{
   tokenId: string
   projectId: string
-  environmentId: string | null
+  environmentIds: string[] | null
 } | null> {
   const authHeader = request.headers.get('authorization')
   const bearer = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null

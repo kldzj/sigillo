@@ -340,10 +340,10 @@ export async function removeOrgMemberAction({ memberId }: { memberId: string }) 
 
 // ── API Token actions ───────────────────────────────────────────────
 
-export async function createTokenAction({ name, projectId, environmentId }: {
+export async function createTokenAction({ name, projectId, environmentIds }: {
   name: string
   projectId: string
-  environmentId?: string | null
+  environmentIds?: string[]
 }) {
   if (!name) throw new Error('Name is required')
   if (!projectId) throw new Error('Project is required')
@@ -352,29 +352,34 @@ export async function createTokenAction({ name, projectId, environmentId }: {
   if (!orgId) throw new Error('Project not found')
   await requireOrgMember(session.userId, orgId)
 
-  // If environmentId is provided, verify it belongs to this project
-  if (environmentId) {
-    const db = getDb()
-    const env = await db.query.environment.findFirst({
-      where: { id: environmentId, projectId },
+  const uniqueEnvIds = Array.from(new Set(environmentIds ?? []))
+  const db = getDb()
+  if (uniqueEnvIds.length > 0) {
+    const envs = await db.query.environment.findMany({
+      where: { projectId, id: { in: uniqueEnvIds } },
       columns: { id: true },
     })
-    if (!env) throw new Error('Environment not found in this project')
+    if (envs.length !== uniqueEnvIds.length) throw new Error('Environment not found in this project')
   }
 
   const { key, hashedKey, prefix } = await generateApiToken()
-  const db = getDb()
-  const [token] = await db.insert(schema.apiToken).values({
-    name,
-    projectId,
-    environmentId: environmentId || null,
-    prefix,
-    hashedKey,
-    createdBy: session.userId,
-  }).returning({ id: schema.apiToken.id })
+  const tokenId = ulid()
+  await db.batch([
+    db.insert(schema.apiToken).values({
+      id: tokenId,
+      name,
+      projectId,
+      prefix,
+      hashedKey,
+      createdBy: session.userId,
+    }),
+    ...uniqueEnvIds.map((environmentId) =>
+      db.insert(schema.apiTokenEnvironment).values({ tokenId, environmentId }),
+    ),
+  ] as [any, ...any[]])
 
   // Return the full key — this is the only time it's ever available
-  return { id: token!.id, key }
+  return { id: tokenId, key }
 }
 
 export async function deleteTokenAction({ tokenId }: { tokenId: string }) {

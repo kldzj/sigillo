@@ -521,7 +521,7 @@ export const app = new Spiceflow({ tracer })
       where: { projectId },
       with: {
         creator: { columns: { id: true, name: true } },
-        environment: { columns: { id: true, name: true } },
+        environments: { with: { environment: { columns: { id: true, name: true } } } },
       },
       orderBy: { createdAt: 'desc' },
     })
@@ -532,8 +532,9 @@ export const app = new Spiceflow({ tracer })
         id: t.id,
         name: t.name,
         prefix: t.prefix,
-        environmentId: t.environmentId,
-        environmentName: t.environment?.name ?? null,
+        environmentNames: t.environments
+          .map((row) => row.environment?.name)
+          .filter((name): name is string => Boolean(name)),
         createdBy: t.creator?.name ?? '—',
         createdAt: t.createdAt,
       })),
