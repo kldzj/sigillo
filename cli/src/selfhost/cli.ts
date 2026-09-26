@@ -1,8 +1,11 @@
-// `npx sigillo self-host` — deploy Sigillo to the customer's own Cloudflare
+// `npx @kldzj/sigillo self-host` — deploy Sigillo to the customer's own Cloudflare
 // account. TypeScript-only command (goke + clack), invoked from bin.ts before
 // the Zig binary is exec'd, so it only exists in the npm package.
 //
-// Idempotent: re-running updates the worker to the latest release, applies
+// Deploys two workers: the app and its own login provider (Google sign-in),
+// so a deployment depends on nobody else's infrastructure.
+//
+// Idempotent: re-running updates both workers to the latest release, applies
 // only new D1 migrations, and never rotates BETTER_AUTH_SECRET or ENCRYPTION_KEY.
 
 import { goke, colors, isAgent } from 'goke'
@@ -15,12 +18,16 @@ import {
   writeState,
   type CfClient,
   type DeploymentState,
+  type WorkerSettings,
 } from './cloudflare.js'
 import {
+  appCompatibilityFlags,
   applyMigrations,
   ensureDatabase,
   fetchReleaseInfo,
+  isSigilloProviderWorker,
   isSigilloWorker,
+  providerSecretsForDeploy,
   secretsForDeploy,
   loadBundle,
   syncAssets,
@@ -34,7 +41,7 @@ const cli = goke('sigillo self-host')
 cli
   .command(
     '',
-    'Deploy Sigillo to your own Cloudflare account (Worker + D1). Safe to re-run for updates.',
+    'Deploy Sigillo and its own login provider to your Cloudflare account (Workers + D1). Safe to re-run for updates.',
   )
   .option('--name [name]', z.string().optional().describe('Worker name (default: sigillo)'))
   .option('--account [id]', z.string().optional().describe('Cloudflare account id'))
@@ -43,10 +50,12 @@ cli
   .option('--release-url [url]', z.string().optional().describe('Download the bundle from a custom URL'))
   .option('--domain [hostname]', z.string().optional().describe('Attach this custom domain (zone must be on your account)'))
   .option('--skip-domain', 'Skip the custom domain prompt')
+  .option('--google-client-id [id]', z.string().optional().describe('Google OAuth client ID for the login provider (asked for on a new deployment)'))
+  .option('--google-client-secret [secret]', z.string().optional().describe('Google OAuth client secret for the login provider'))
   .option('--yes', 'Accept all defaults (non-interactive)')
-  .example('npx sigillo self-host')
-  .example('npx sigillo self-host --name sigillo --domain secrets.acme.com')
-  .example('CLOUDFLARE_API_TOKEN=xxx npx sigillo self-host --yes')
+  .example('npx @kldzj/sigillo self-host')
+  .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
+  .example('CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes --google-client-id xxx --google-client-secret xxx')
   .action(async (options) => {
     clack.intro(colors.bold('sigillo self-host'))
     const releaseLock = acquireLock()
@@ -68,6 +77,8 @@ interface SelfHostOptions {
   releaseUrl?: string
   domain?: string
   skipDomain?: boolean
+  googleClientId?: string
+  googleClientSecret?: string
   yes?: boolean
 }
 
@@ -108,12 +119,11 @@ async function selfHost(options: SelfHostOptions) {
   // An unrelated worker with the same name must never be overwritten.
   let workerName = options.name ?? savedDeployments.find((d) => d.accountId === accountId)?.workerName ?? 'sigillo'
   let saved: DeploymentState | undefined
-  let workerExists = false
+  let appSettings: WorkerSettings | null = null
   for (;;) {
     saved = readState().deployments?.[`${accountId}/${workerName}`]
-    const settings = await client.getWorkerSettings(accountId, workerName)
-    workerExists = settings != null
-    if (!workerExists || saved || isSigilloWorker(settings)) break
+    appSettings = await client.getWorkerSettings(accountId, workerName)
+    if (!appSettings || saved || isSigilloWorker(appSettings)) break
 
     const conflict = `A worker named "${workerName}" already exists on this account and does not look like a Sigillo deployment.`
     if (!interactive() || options.yes) {
@@ -124,6 +134,7 @@ async function selfHost(options: SelfHostOptions) {
     if (clack.isCancel(input) || !String(input).trim()) process.exit(0)
     workerName = String(input).trim()
   }
+  const workerExists = appSettings != null
   const stateKey = `${accountId}/${workerName}`
   if (workerExists) {
     clack.log.info(saved ? 'Found existing deployment — updating it' : 'Found an existing Sigillo worker — adopting and updating it')
@@ -140,13 +151,20 @@ async function selfHost(options: SelfHostOptions) {
       : `Release v${bundle.version}${saved?.deployedVersion ? ` (updating from v${saved.deployedVersion})` : ''}`,
   )
 
+  // ── workers.dev subdomain ─────────────────────────────────────────
+  // Resolved before any upload: both workers are told the provider's URL.
+  const subdomain = await ensureWorkersDevSubdomain({ client, accountId, workerName, options })
+  const workersDevUrl = `https://${workerName}.${subdomain}.workers.dev`
+
   // ── D1 + migrations ───────────────────────────────────────────────
   spinner.start('Provisioning D1 database')
-  const firstMigrationName = Object.keys(bundle.migrations).sort()[0]
+  const firstMigrationName = Object.keys(bundle.app.migrations).sort()[0]
   const databaseId =
     saved?.databaseId ??
-    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName, secretsKept: workerExists }))
-  const applied = await applyMigrations({ client, accountId, databaseId, migrations: bundle.migrations })
+    (await ensureDatabase({
+      client, accountId, name: `${workerName}-db`, firstMigrationName, dataTable: 'secret_event', secretsKept: workerExists,
+    }))
+  const applied = await applyMigrations({ client, accountId, databaseId, migrations: bundle.app.migrations })
   spinner.stop(
     applied.length > 0
       ? `D1 ready — applied ${applied.length} migration${applied.length > 1 ? 's' : ''}`
@@ -156,66 +174,66 @@ async function selfHost(options: SelfHostOptions) {
   // ── Secret handling (see secretsForDeploy) ────────────────────────
   const { betterAuthSecret, encryptionKey } = secretsForDeploy({ workerExists, saved })
 
-  // ── Assets + worker upload ────────────────────────────────────────
-  spinner.start('Uploading static assets')
-  const assetsJwt = await syncAssets({
-    client,
-    accountId,
-    scriptName: workerName,
-    bundle,
-    onProgress: (uploaded, total) => {
-      spinner.message(`Uploading static assets ${uploaded}/${total}`)
-    },
-  })
-  spinner.stop('Static assets synced')
-
-  spinner.start(`Uploading worker (${Object.keys(bundle.modules).length} modules)`)
-  await uploadWorker(client, { accountId, scriptName: workerName, bundle, databaseId, assetsJwt, betterAuthSecret, encryptionKey })
-  spinner.stop('Worker deployed')
-
-  // ── workers.dev URL ───────────────────────────────────────────────
-  let subdomain = (await client.getAccountSubdomain(accountId))?.subdomain ?? null
-  if (!subdomain) {
-    let desired = workerName
-    for (;;) {
-      if (interactive() && !options.yes) {
-        const input = await clack.text({
-          message: 'Your account has no workers.dev subdomain yet — pick one',
-          placeholder: desired,
-          defaultValue: desired,
-        })
-        if (clack.isCancel(input)) process.exit(0)
-        desired = String(input).trim() || desired
-      }
-      try {
-        subdomain = (await client.createAccountSubdomain(accountId, desired)).subdomain
-        break
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        // Taken/invalid subdomains: re-prompt interactively, otherwise fail
-        // with a hint since --yes runs can't pick an alternative.
-        if (!interactive() || options.yes) {
-          throw new Error(`Could not register workers.dev subdomain "${desired}": ${message}`)
-        }
-        clack.log.warn(`Subdomain "${desired}" was rejected (likely taken): ${message}`)
-        desired = `${workerName}-${Math.random().toString(36).slice(2, 6)}`
-      }
-    }
+  // ── Login provider ────────────────────────────────────────────────
+  // Every deployment signs in through its own provider worker. An app that
+  // already points at another provider (e.g. deployed by upstream's self-host
+  // against auth.sigillo.dev) keeps it: a new provider would give every user
+  // a new login identity.
+  const providerWorkerName = saved?.providerWorkerName ?? `${workerName}-auth`
+  const ownProviderUrl = `https://${providerWorkerName}.${subdomain}.workers.dev`
+  const currentProviderUrl = plainTextBinding(appSettings, 'PROVIDER_URL')
+  const provider = currentProviderUrl && currentProviderUrl !== ownProviderUrl
+    ? undefined
+    : await deployProvider({ client, accountId, bundle, options, saved, spinner, workerName: providerWorkerName, url: ownProviderUrl })
+  if (!provider) {
+    clack.log.warn(`This deployment signs in through ${currentProviderUrl} — keeping it, since a new provider would change every user's login`)
   }
-  await client.enableWorkersDev(accountId, workerName)
-  const workersDevUrl = `https://${workerName}.${subdomain}.workers.dev`
+  const providerUrl = provider ? ownProviderUrl : currentProviderUrl!
 
-  // ── Save state before slow steps so re-runs resume cleanly ───────
+  // ── Save state before the app upload so re-runs resume cleanly ────
   const deployment: DeploymentState = {
     accountId,
     workerName,
     databaseId,
     betterAuthSecret: betterAuthSecret ?? saved?.betterAuthSecret,
     encryptionKey: encryptionKey ?? saved?.encryptionKey,
-    deployedVersion: bundle.version,
+    ...provider,
+    deployedVersion: saved?.deployedVersion,
     url: workersDevUrl,
     customDomain: saved?.customDomain,
   }
+  writeState({ ...readState(), deployments: { ...readState().deployments, [stateKey]: deployment } })
+
+  // ── Assets + worker upload ────────────────────────────────────────
+  spinner.start('Uploading static assets')
+  const assetsJwt = await syncAssets({
+    client,
+    accountId,
+    scriptName: workerName,
+    worker: bundle.app,
+    onProgress: (uploaded, total) => {
+      spinner.message(`Uploading static assets ${uploaded}/${total}`)
+    },
+  })
+  spinner.stop('Static assets synced')
+
+  spinner.start(`Uploading worker (${Object.keys(bundle.app.modules).length} modules)`)
+  await uploadWorker(client, {
+    accountId,
+    scriptName: workerName,
+    worker: bundle.app,
+    databaseId,
+    assetsJwt,
+    vars: { PROVIDER_URL: providerUrl },
+    secrets: betterAuthSecret
+      ? { BETTER_AUTH_SECRET: betterAuthSecret, ...(encryptionKey ? { ENCRYPTION_KEY: encryptionKey } : {}) }
+      : undefined,
+    compatibilityFlags: appCompatibilityFlags(bundle.app.compatibilityFlags),
+  })
+  await client.enableWorkersDev(accountId, workerName)
+  spinner.stop('Worker deployed')
+
+  deployment.deployedVersion = bundle.version
   writeState({ ...readState(), deployments: { ...readState().deployments, [stateKey]: deployment } })
 
   spinner.start('Waiting for the deployment to become healthy')
@@ -236,14 +254,148 @@ async function selfHost(options: SelfHostOptions) {
       ...(customDomain ? [`${colors.bold('Fallback:')}   ${workersDevUrl}`] : []),
       `${colors.bold('Version:')}    v${bundle.version}`,
       '',
-      'Sign in with the hosted Sigillo auth — no OAuth setup needed.',
+      `${colors.bold('Login:')}      ${providerUrl} (Google)`,
       `Point the CLI at your instance:  sigillo login --api-url ${primaryUrl}`,
       '',
-      'Re-run `npx sigillo self-host` anytime to deploy updates.',
+      'Re-run `npx @kldzj/sigillo self-host` anytime to deploy updates.',
     ].join('\n'),
     'Sigillo is self-hosted 🎉',
   )
   clack.outro('Done')
+}
+
+function plainTextBinding(settings: WorkerSettings | null, name: string): string | undefined {
+  return settings?.bindings?.find((b) => b.type === 'plain_text' && b.name === name)?.text
+}
+
+async function ensureWorkersDevSubdomain({ client, accountId, workerName, options }: {
+  client: CfClient
+  accountId: string
+  workerName: string
+  options: SelfHostOptions
+}): Promise<string> {
+  const existing = (await client.getAccountSubdomain(accountId))?.subdomain
+  if (existing) return existing
+  let desired = workerName
+  for (;;) {
+    if (interactive() && !options.yes) {
+      const input = await clack.text({
+        message: 'Your account has no workers.dev subdomain yet — pick one',
+        placeholder: desired,
+        defaultValue: desired,
+      })
+      if (clack.isCancel(input)) process.exit(0)
+      desired = String(input).trim() || desired
+    }
+    try {
+      return (await client.createAccountSubdomain(accountId, desired)).subdomain
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // Taken/invalid subdomains: re-prompt interactively, otherwise fail
+      // with a hint since --yes runs can't pick an alternative.
+      if (!interactive() || options.yes) {
+        throw new Error(`Could not register workers.dev subdomain "${desired}": ${message}`)
+      }
+      clack.log.warn(`Subdomain "${desired}" was rejected (likely taken): ${message}`)
+      desired = `${workerName}-${Math.random().toString(36).slice(2, 6)}`
+    }
+  }
+}
+
+// Only a brand-new login provider needs a Google OAuth client, from the
+// flags or asked for here. Re-runs reuse what the state file saved.
+async function askGoogleClient({ options, redirectUri }: {
+  options: SelfHostOptions
+  redirectUri: string
+}): Promise<{ clientId: string; clientSecret: string }> {
+  if (options.googleClientId && options.googleClientSecret) {
+    return { clientId: options.googleClientId, clientSecret: options.googleClientSecret }
+  }
+  const instructions = [
+    'Sign-in goes through your own login provider, which uses Google.',
+    'Create an OAuth client at https://console.cloud.google.com/apis/credentials',
+    '(Create credentials → OAuth client ID → Web application) with this redirect URI:',
+    '',
+    `  ${redirectUri}`,
+  ].join('\n')
+  if (!interactive() || options.yes) {
+    throw new Error(`${instructions}\n\nThen re-run with --google-client-id and --google-client-secret.`)
+  }
+  clack.note(instructions, 'Google sign-in')
+  const clientId = options.googleClientId ?? await clack.text({
+    message: 'Google OAuth client ID',
+    validate: (value) => (value?.trim() ? undefined : 'Required'),
+  })
+  if (clack.isCancel(clientId)) process.exit(0)
+  const clientSecret = options.googleClientSecret ?? await clack.password({
+    message: 'Google OAuth client secret',
+    validate: (value) => (value?.trim() ? undefined : 'Required'),
+  })
+  if (clack.isCancel(clientSecret)) process.exit(0)
+  return { clientId: String(clientId).trim(), clientSecret: String(clientSecret).trim() }
+}
+
+// Deploys (or updates) the deployment's own login provider: a second worker
+// with its own D1, reachable at `url`. Returns what the state file keeps.
+async function deployProvider({ client, accountId, bundle, options, saved, spinner, workerName, url }: {
+  client: CfClient
+  accountId: string
+  bundle: SelfhostBundle
+  options: SelfHostOptions
+  saved?: DeploymentState
+  spinner: ReturnType<typeof clack.spinner>
+  workerName: string
+  url: string
+}): Promise<Pick<DeploymentState, 'providerWorkerName' | 'providerDatabaseId' | 'providerAuthSecret' | 'googleClientId' | 'googleClientSecret'>> {
+  const settings = await client.getWorkerSettings(accountId, workerName)
+  const providerExists = settings != null
+  if (providerExists && !saved?.providerWorkerName && !isSigilloProviderWorker(settings)) {
+    throw new Error(
+      `A worker named "${workerName}" already exists on this account and does not look like a Sigillo login provider. ` +
+        'Re-run with --name <other-name>.',
+    )
+  }
+  // A new provider needs a Google client: from the flags, else the saved one, else ask
+  const useSaved = !options.googleClientId && saved?.googleClientId && saved?.googleClientSecret
+  const google = providerExists || useSaved
+    ? undefined
+    : await askGoogleClient({ options, redirectUri: `${url}/api/auth/callback/google` })
+
+  spinner.start('Deploying the login provider')
+  const databaseId =
+    saved?.providerDatabaseId ??
+    (await ensureDatabase({
+      client,
+      accountId,
+      name: `${workerName}-db`,
+      firstMigrationName: Object.keys(bundle.provider.migrations).sort()[0],
+      dataTable: 'jwks',
+      secretsKept: providerExists,
+    }))
+  await applyMigrations({ client, accountId, databaseId, migrations: bundle.provider.migrations })
+  const secrets = providerSecretsForDeploy({ providerExists, saved, google })
+  const assetsJwt = await syncAssets({ client, accountId, scriptName: workerName, worker: bundle.provider })
+  await uploadWorker(client, {
+    accountId,
+    scriptName: workerName,
+    worker: bundle.provider,
+    databaseId,
+    assetsJwt,
+    vars: { BETTER_AUTH_URL: url },
+    secrets,
+  })
+  await client.enableWorkersDev(accountId, workerName)
+  // The app needs the provider's discovery document before it can boot
+  const healthy = await waitForHealth(url, '/api/auth/.well-known/openid-configuration')
+  spinner.stop(healthy ? `Login provider is live: ${url}` : `Login provider deployed: ${url} (still propagating)`)
+
+  return {
+    providerWorkerName: workerName,
+    providerDatabaseId: databaseId,
+    providerAuthSecret: secrets?.BETTER_AUTH_SECRET ?? saved?.providerAuthSecret,
+    googleClientId: google?.clientId ?? saved?.googleClientId,
+    googleClientSecret: google?.clientSecret ?? saved?.googleClientSecret,
+  }
 }
 
 async function maybeAttachDomain(args: {

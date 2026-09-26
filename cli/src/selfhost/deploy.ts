@@ -1,8 +1,9 @@
-// Idempotent deploy steps for `npx sigillo self-host`.
+// Idempotent deploy steps for `npx @kldzj/sigillo self-host`.
 //
-// Downloads a prebuilt release bundle (worker modules + assets + D1
-// migrations, built by app/scripts/build-selfhost-bundle.ts), then provisions
-// everything on the customer's Cloudflare account via raw API calls:
+// Downloads a prebuilt release bundle with two workers, the app and its own
+// login provider (modules + assets + D1 migrations each, built by
+// app/scripts/build-selfhost-bundle.ts), then provisions both on the
+// customer's Cloudflare account via raw API calls:
 //
 //   D1 create → migrations (wrangler-compatible d1_migrations table) →
 //   assets upload session → worker PUT (multipart modules + bindings) →
@@ -22,17 +23,21 @@ const GITHUB_RELEASES_URL = 'https://api.github.com/repos/kldzj/sigillo/releases
 export const BUNDLE_ASSET_NAME = 'sigillo-selfhost-bundle.json.gz'
 
 // Keep in sync with app/scripts/build-selfhost-bundle.ts
-export interface SelfhostBundle {
-  formatVersion: 1
-  version: string
-  createdAt: string
-  providerUrl: string
+export interface WorkerBundle {
   compatibilityDate: string
   compatibilityFlags: string[]
   mainModule: string
   modules: Record<string, string>
   assets: Record<string, { base64: string; hash: string; size: number; contentType: string }>
   migrations: Record<string, string>
+}
+
+export interface SelfhostBundle {
+  formatVersion: 2
+  version: string
+  createdAt: string
+  app: WorkerBundle
+  provider: WorkerBundle
 }
 
 export interface ReleaseInfo {
@@ -66,7 +71,7 @@ export async function fetchReleaseInfo(): Promise<ReleaseInfo> {
 
 export function parseBundle(gzipped: Buffer): SelfhostBundle {
   const bundle = JSON.parse(gunzipSync(gzipped).toString('utf-8')) as SelfhostBundle
-  if (bundle.formatVersion !== 1) {
+  if (bundle.formatVersion !== 2) {
     throw new Error(`Unsupported bundle format ${bundle.formatVersion} — update the sigillo CLI`)
   }
   return bundle
@@ -99,6 +104,15 @@ export function isSigilloWorker(settings: { bindings?: Array<{ type: string; nam
   )
 }
 
+/** Same check for the login provider, which has BETTER_AUTH_URL instead of PROVIDER_URL. */
+export function isSigilloProviderWorker(settings: { bindings?: Array<{ type: string; name: string }> } | null): boolean {
+  const bindings = settings?.bindings ?? []
+  return (
+    bindings.some((b) => b.type === 'd1' && b.name === 'DB') &&
+    bindings.some((b) => b.type === 'plain_text' && b.name === 'BETTER_AUTH_URL')
+  )
+}
+
 // ── D1 ──────────────────────────────────────────────────────────────
 
 /**
@@ -110,11 +124,13 @@ export function isSigilloWorker(settings: { bindings?: Array<{ type: string; nam
  * that already stores secrets is only adopted when the existing worker keeps
  * its secrets: new ones would make every stored secret unreadable.
  */
-export async function ensureDatabase({ client, accountId, name, firstMigrationName, secretsKept }: {
+export async function ensureDatabase({ client, accountId, name, firstMigrationName, dataTable, secretsKept }: {
   client: CfClient
   accountId: string
   name: string
   firstMigrationName?: string
+  /** a table whose rows only the old keys can read: secret_event (app) or jwks (provider) */
+  dataTable: string
   /** false when this deploy generates new secrets (see secretsForDeploy) */
   secretsKept: boolean
 }): Promise<string> {
@@ -145,7 +161,7 @@ export async function ensureDatabase({ client, accountId, name, firstMigrationNa
       const [secretsResult] = await client.d1Query({
         accountId,
         databaseId: existing.uuid,
-        sql: 'SELECT 1 FROM secret_event LIMIT 1;',
+        sql: `SELECT 1 FROM ${dataTable} LIMIT 1;`,
       })
       if (!secretsResult?.results?.length) return existing.uuid
       throw new Error(
@@ -205,15 +221,15 @@ export async function applyMigrations({ client, accountId, databaseId, migration
  * completion JWT to attach to the worker upload. Unchanged files (matched by
  * hash) are skipped server-side, which is what makes re-runs fast.
  */
-export async function syncAssets({ client, accountId, scriptName, bundle, onProgress }: {
+export async function syncAssets({ client, accountId, scriptName, worker, onProgress }: {
   client: CfClient
   accountId: string
   scriptName: string
-  bundle: SelfhostBundle
+  worker: WorkerBundle
   onProgress?: (uploaded: number, total: number) => void
 }): Promise<string> {
   const manifest: Record<string, { hash: string; size: number }> = {}
-  for (const [assetPath, asset] of Object.entries(bundle.assets)) {
+  for (const [assetPath, asset] of Object.entries(worker.assets)) {
     manifest[assetPath] = { hash: asset.hash, size: asset.size }
   }
   const session = await client.createAssetsUploadSession({ accountId, scriptName, manifest })
@@ -224,7 +240,7 @@ export async function syncAssets({ client, accountId, scriptName, bundle, onProg
   const totalFiles = buckets.flat().length
   if (totalFiles === 0) return session.jwt
 
-  const byHash = new Map(Object.values(bundle.assets).map((asset) => [asset.hash, asset]))
+  const byHash = new Map(Object.values(worker.assets).map((asset) => [asset.hash, asset]))
   let completionJwt = ''
   let uploaded = 0
   for (const bucket of buckets) {
@@ -270,40 +286,67 @@ export function secretsForDeploy({ workerExists, saved }: {
   return { betterAuthSecret: generateBetterAuthSecret(), encryptionKey: randomBytes(32).toString('base64') }
 }
 
+// Same rule as secretsForDeploy, for the provider: never rotate its
+// BETTER_AUTH_SECRET (it encrypts the JWT signing keys in its D1). An
+// existing provider keeps everything via keep_bindings, a recreated one
+// reuses what the state file saved, and only a brand-new one needs a Google
+// OAuth client from the user.
+export function providerSecretsForDeploy({ providerExists, saved, google }: {
+  providerExists: boolean
+  saved?: DeploymentState
+  google?: { clientId: string; clientSecret: string }
+}): Record<string, string> | undefined {
+  if (providerExists) return undefined
+  // A client passed explicitly wins, so a wrong saved one can be replaced
+  const clientId = google?.clientId ?? saved?.googleClientId
+  const clientSecret = google?.clientSecret ?? saved?.googleClientSecret
+  if (!clientId || !clientSecret) {
+    throw new Error('A new deployment needs a Google OAuth client ID and secret for its login provider')
+  }
+  return {
+    BETTER_AUTH_SECRET: saved?.providerAuthSecret ?? generateBetterAuthSecret(),
+    GOOGLE_CLIENT_ID: clientId,
+    GOOGLE_CLIENT_SECRET: clientSecret,
+  }
+}
+
+// The app fetches its provider, another worker on the same account's
+// workers.dev subdomain, which Cloudflare refuses (error 1042) unless the
+// fetch goes out over the public internet.
+export function appCompatibilityFlags(flags: string[]): string[] {
+  return flags.includes('global_fetch_strictly_public') ? flags : [...flags, 'global_fetch_strictly_public']
+}
+
 export async function uploadWorker(
   client: CfClient,
   args: {
     accountId: string
     scriptName: string
-    bundle: SelfhostBundle
+    worker: WorkerBundle
     databaseId: string
     assetsJwt: string
-    /** undefined = worker already exists, inherit stored secrets via keep_bindings */
-    betterAuthSecret?: string
-    /** set on new deployments only, see secretsForDeploy */
-    encryptionKey?: string
+    /** plain-text bindings, e.g. PROVIDER_URL for the app or BETTER_AUTH_URL for the provider */
+    vars: Record<string, string>
+    /** set for a new worker only; an existing one keeps its secrets via keep_bindings */
+    secrets?: Record<string, string>
+    compatibilityFlags?: string[]
   },
 ): Promise<void> {
-  const { bundle } = args
+  const { worker } = args
   const bindings: Array<Record<string, unknown>> = [
     { type: 'd1', name: 'DB', id: args.databaseId },
-    { type: 'plain_text', name: 'PROVIDER_URL', text: bundle.providerUrl },
+    ...Object.entries(args.vars).map(([name, text]) => ({ type: 'plain_text', name, text })),
+    ...Object.entries(args.secrets ?? {}).map(([name, text]) => ({ type: 'secret_text', name, text })),
   ]
-  if (args.betterAuthSecret) {
-    bindings.push({ type: 'secret_text', name: 'BETTER_AUTH_SECRET', text: args.betterAuthSecret })
-  }
-  if (args.encryptionKey) {
-    bindings.push({ type: 'secret_text', name: 'ENCRYPTION_KEY', text: args.encryptionKey })
-  }
 
   const metadata = {
-    main_module: bundle.mainModule,
-    compatibility_date: bundle.compatibilityDate,
-    compatibility_flags: bundle.compatibilityFlags,
+    main_module: worker.mainModule,
+    compatibility_date: worker.compatibilityDate,
+    compatibility_flags: args.compatibilityFlags ?? worker.compatibilityFlags,
     bindings,
-    // Never clobber secrets on update: BETTER_AUTH_SECRET derives the AES
-    // encryption key, rotating it would make all stored secrets unreadable.
-    ...(args.betterAuthSecret ? {} : { keep_bindings: ['secret_text', 'secret_key'] }),
+    // Never clobber secrets on update: they hold the keys to data already
+    // stored, and rotating them would make it unreadable.
+    ...(args.secrets ? {} : { keep_bindings: ['secret_text', 'secret_key'] }),
     placement: { mode: 'smart' },
     observability: { enabled: true },
     assets: { jwt: args.assetsJwt, config: {} },
@@ -314,7 +357,7 @@ export async function uploadWorker(
     'metadata',
     new File([JSON.stringify(metadata)], 'metadata.json', { type: 'application/json' }),
   )
-  for (const [modulePath, base64] of Object.entries(bundle.modules)) {
+  for (const [modulePath, base64] of Object.entries(worker.modules)) {
     formData.append(
       modulePath,
       new File([Buffer.from(base64, 'base64')], modulePath, { type: 'application/javascript+module' }),
@@ -326,11 +369,11 @@ export async function uploadWorker(
 
 // ── workers.dev + health ────────────────────────────────────────────
 
-export async function waitForHealth(url: string, timeoutMs = 60_000): Promise<boolean> {
+export async function waitForHealth(url: string, path = '/health', timeoutMs = 60_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${url}/health`)
+      const res = await fetch(`${url}${path}`)
       if (res.ok) return true
     } catch {
       // DNS for fresh workers.dev subdomains can lag — keep retrying
