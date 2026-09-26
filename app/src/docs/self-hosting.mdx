@@ -52,7 +52,9 @@ Re-run the same command anytime to **update** to the latest release:
 npx sigillo self-host
 ```
 
-Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and your auth secret is never rotated, so your stored secrets stay decryptable.
+Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and your auth secret and encryption key are never rotated, so your stored secrets stay decryptable.
+
+New deployments get their own `ENCRYPTION_KEY`, separate from the auth secret that signs sessions. Both are saved in `~/.sigillo/selfhost.json` on the machine that ran the command. Keep a copy in your password manager: a database backup cannot be decrypted without the key. Deployments made before this keep deriving their key from the auth secret.
 
 ## Options
 
