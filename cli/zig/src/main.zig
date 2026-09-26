@@ -84,7 +84,15 @@ fn needsInteractivePrompt(has_value: bool, stdin_is_tty: bool) bool {
 
 const Global = zeke.globalOpts()
     .option("--token [token]", "Auth token override")
-    .option("--api-url [url]", "API URL override (default: https://sigillo.dev)");
+    .option("--api-url [url]", "API URL of your Sigillo instance");
+
+// There is no default server: every instance is self-hosted
+fn exitNoApiUrl(stderr: Writer) noreturn {
+    color.err(stderr, "error") catch {};
+    stderr.writeAll(": no Sigillo server configured\n") catch {};
+    stderr.writeAll("  sigillo login --api-url https://<your-instance>\n") catch {};
+    std.process.exit(1);
+}
 
 fn printChildScopes(
     allocator: std.mem.Allocator,
@@ -279,10 +287,10 @@ fn exitEnvNotFound(
 
 const Login = zeke.cmd("login", "Authenticate to Sigillo with device flow")
     .option("--scope [scope]", "Scope for saved auth (default: /)")
-    .example("sigillo login")
-    .example("SIGILLO_TOKEN=sig_xxx sigillo login --scope /")
-    .example("sigillo login --token sig_xxx --scope /")
-    .example("sigillo login --api-url https://sigillo.dev --scope /Users/me/project");
+    .example("sigillo login --api-url https://sigillo.example.com")
+    .example("SIGILLO_TOKEN=sig_xxx sigillo login --api-url https://sigillo.example.com --scope /")
+    .example("sigillo login --api-url https://sigillo.example.com --token sig_xxx --scope /")
+    .example("sigillo login --api-url https://sigillo.example.com --scope /Users/me/project");
 
 const Logout = zeke.cmd("logout", "Remove saved auth for a scope")
     .option("--scope [scope]", "Directory scope to clear (default: /)");
@@ -402,7 +410,7 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
         .api_url = global.api_url,
     });
 
-    const api_url = resolved.api_url.?; // always set — defaults to https://sigillo.dev
+    const api_url = resolved.api_url orelse exitNoApiUrl(stderr);
 
     if (resolved.token) |token| {
         try config.setScope(allocator, scope, .{
@@ -549,14 +557,8 @@ fn logoutAction(_: Logout.Args, opts: Logout.Options, _: Global.Options) !void {
     if (try config.getScope(allocator, scope)) |entry| {
         if (entry.token) |token| {
             if (isSessionToken(token)) {
-                const revoked = if (client.request(.{
-                    .allocator = allocator,
-                    .method = .POST,
-                    .base_url = entry.api_url orelse "https://sigillo.dev",
-                    .path = "/api/auth/sign-out",
-                    .token = token,
-                    .json_body = "{}", // std.http asserts that a POST has a body
-                })) |res| res.status == 200 else |_| false;
+                // A token saved without its server can't be revoked anywhere
+                const revoked = if (entry.api_url) |api_url| revokeSession(allocator, api_url, token) else false;
                 if (!revoked) {
                     try color.yellow(stderr, "warning");
                     try stderr.writeAll(": could not revoke the session on the server, it stays valid until it expires\n");
@@ -570,6 +572,18 @@ fn logoutAction(_: Logout.Args, opts: Logout.Options, _: Global.Options) !void {
     try stdout.writeAll(" Logged out from scope ");
     try color.bold(stdout, scope);
     try stdout.writeAll("\n");
+}
+
+fn revokeSession(allocator: std.mem.Allocator, api_url: []const u8, token: []const u8) bool {
+    const res = client.request(.{
+        .allocator = allocator,
+        .method = .POST,
+        .base_url = api_url,
+        .path = "/api/auth/sign-out",
+        .token = token,
+        .json_body = "{}", // std.http asserts that a POST has a body
+    }) catch return false;
+    return res.status == 200;
 }
 
 /// Device-flow logins save a server session token. `sig_` API tokens are not
@@ -594,13 +608,13 @@ fn meAction(_: Me.Args, opts: Me.Options, global: Global.Options) !void {
         .api_url = global.api_url,
     });
 
+    const api_url = resolved.api_url orelse exitNoApiUrl(stderr);
     const token = resolved.token orelse {
         try color.err(stderr, "error");
         try stderr.print(": not logged in\n", .{});
         try stderr.writeAll("  sigillo login\n");
         std.process.exit(1);
     };
-    const api_url = resolved.api_url.?; // always set — defaults to https://sigillo.dev
 
     const res = client.getMe(.{
         .allocator = allocator,
@@ -703,13 +717,13 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
         .api_url = global.api_url,
     });
 
+    const api_url = resolved.api_url orelse exitNoApiUrl(stderr);
     const token = resolved.token orelse {
         try color.err(stderr, "error");
         try stderr.print(": not logged in\n", .{});
         try stderr.writeAll("  sigillo login\n");
         std.process.exit(1);
     };
-    const api_url = resolved.api_url.?; // always set — defaults to https://sigillo.dev
 
     const is_tty = std.posix.isatty(File.stdin().handle) and
         std.posix.isatty(File.stdout().handle);
@@ -902,13 +916,13 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
         .environment = envOverride(opts.env, opts.config),
     });
 
+    const api_url = resolved.api_url orelse exitNoApiUrl(stderr);
     const token = resolved.token orelse {
         try color.err(stderr, "error");
         try stderr.print(": not logged in\n", .{});
         try stderr.writeAll("  sigillo login\n");
         std.process.exit(1);
     };
-    const api_url = resolved.api_url.?; // always set — defaults to https://sigillo.dev
     const project = try requireProjectId(allocator, stderr, .{ .api_url = api_url, .token = token }, resolved.project orelse {
         try color.err(stderr, "error");
         try stderr.print(": project not configured for {s}\n", .{cwd});
@@ -1484,7 +1498,7 @@ const EnvironmentContext = struct {
 fn resolveApiContext(allocator: std.mem.Allocator, cwd: []const u8, flags: config.ResolvedConfig) !ApiContext {
     const resolved = try config.resolve(allocator, cwd, flags);
     return .{
-        .api_url = resolved.api_url orelse "https://sigillo.dev",
+        .api_url = resolved.api_url orelse return error.NoApiUrl,
         .token = resolved.token orelse return error.NotLoggedIn,
     };
 }
@@ -1493,7 +1507,7 @@ fn resolveProjectContext(allocator: std.mem.Allocator, cwd: []const u8, flags: c
     const resolved = try config.resolve(allocator, cwd, flags);
     return .{
         .api = .{
-            .api_url = resolved.api_url orelse "https://sigillo.dev",
+            .api_url = resolved.api_url orelse return error.NoApiUrl,
             .token = resolved.token orelse return error.NotLoggedIn,
         },
         .project_id = resolved.project orelse return error.ProjectNotConfigured,
@@ -1506,7 +1520,7 @@ fn resolveEnvironmentContext(allocator: std.mem.Allocator, cwd: []const u8, flag
     const resolved = try config.resolve(allocator, cwd, flags);
     return .{
         .api = .{
-            .api_url = resolved.api_url orelse "https://sigillo.dev",
+            .api_url = resolved.api_url orelse return error.NoApiUrl,
             .token = resolved.token orelse return error.NotLoggedIn,
         },
         .project_id = resolved.project orelse return error.ProjectNotConfigured,
@@ -1520,6 +1534,7 @@ fn quoteString(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
 
 fn requireApiContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []const u8, flags: config.ResolvedConfig) !ApiContext {
     return resolveApiContext(allocator, cwd, flags) catch |err| switch (err) {
+        error.NoApiUrl => exitNoApiUrl(stderr),
         error.NotLoggedIn => {
             try color.err(stderr, "error");
             try stderr.print(": not logged in\n", .{});
@@ -1532,6 +1547,7 @@ fn requireApiContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []const 
 
 fn requireProjectContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []const u8, flags: config.ResolvedConfig) !ProjectContext {
     var ctx = resolveProjectContext(allocator, cwd, flags) catch |err| switch (err) {
+        error.NoApiUrl => exitNoApiUrl(stderr),
         error.NotLoggedIn => {
             try color.err(stderr, "error");
             try stderr.print(": not logged in\n", .{});
@@ -1553,6 +1569,7 @@ fn requireProjectContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []co
 
 fn requireEnvironmentContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []const u8, flags: config.ResolvedConfig) !EnvironmentContext {
     var ctx = resolveEnvironmentContext(allocator, cwd, flags) catch |err| switch (err) {
+        error.NoApiUrl => exitNoApiUrl(stderr),
         error.NotLoggedIn => {
             try color.err(stderr, "error");
             try stderr.print(": not logged in\n", .{});

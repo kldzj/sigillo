@@ -528,7 +528,7 @@ function resolveConfiguredAuth(cwd: string) {
   const config = readSigilloConfig()
   const resolved = {
     token: process.env.SIGILLO_TOKEN ?? '',
-    apiUrl: process.env.SIGILLO_API_URL ?? 'https://sigillo.dev',
+    apiUrl: process.env.SIGILLO_API_URL ?? '',
   }
 
   let bestTokenScope = 0
@@ -546,6 +546,7 @@ function resolveConfiguredAuth(cwd: string) {
   }
 
   expect(resolved.token).not.toBe('')
+  expect(resolved.apiUrl, 'run `sigillo login --api-url <instance>` first').not.toBe('')
   return resolved
 }
 
