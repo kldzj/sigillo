@@ -166,10 +166,12 @@ export const secretEvent = sqliteCore.sqliteTable('secret_event', {
   valueEncrypted: sqliteCore.text('value_encrypted'),
   // AES-GCM initialization vector, stored as base64. Null for delete events.
   iv: sqliteCore.text('iv'),
-  // Exactly one of userId/apiTokenId is set — identifies who performed the action.
+  // Exactly one of userId/apiTokenId is set on insert — identifies who performed the action.
   // userId for human users (session auth), apiTokenId for programmatic access (bearer token).
-  userId: sqliteCore.text('user_id').references(() => user.id, { onDelete: 'cascade' }),
-  apiTokenId: sqliteCore.text('api_token_id').references(() => apiToken.id, { onDelete: 'cascade' }),
+  // SET NULL, not CASCADE: these rows ARE the secrets, so deleting the actor
+  // must keep them. Both are null once the actor is gone.
+  userId: sqliteCore.text('user_id').references(() => user.id, { onDelete: 'set null' }),
+  apiTokenId: sqliteCore.text('api_token_id').references(() => apiToken.id, { onDelete: 'set null' }),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
 }, (table) => [
   sqliteCore.index('secret_event_env_name_idx').on(table.environmentId, table.name, table.createdAt),

@@ -960,6 +960,82 @@ describe('secrets derivation — batching & multi-author', () => {
   })
 })
 
+// ── Secret history — deleted authors ────────────────────────────────
+
+// secret_event rows are the secrets themselves (event sourcing), so deleting
+// whoever wrote them must never delete the rows. Only attribution is lost.
+describe('secret history — deleted authors', () => {
+  let af: ReturnType<typeof authedFetch>
+  let orgId: string
+  let projectId: string
+  let devEnvId: string
+
+  beforeAll(async () => {
+    const owner = await createTestUser({ name: 'HistoryOwner' })
+    af = authedFetch(owner.token)
+    const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'History Org' } }))
+    orgId = org.id
+    const proj = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'History Project', orgId } }))
+    projectId = proj.id
+    const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: projectId } }))
+    devEnvId = envs.environments.find((e) => e.slug === 'dev')!.id
+  })
+
+  async function countEvents() {
+    return getDb().$count(schema.secretEvent, orm.eq(schema.secretEvent.environmentId, devEnvId))
+  }
+
+  async function secretValue(name: string) {
+    const secret = assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets/:name', {
+      params: { pid: projectId, eid: devEnvId, name },
+    }))
+    return secret.value
+  }
+
+  test('deleting an API token keeps the secrets it wrote', async () => {
+    const db = getDb()
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST', params: { pid: projectId, eid: devEnvId },
+      body: { name: 'TOKEN_DB_URL', value: 'v1-by-owner' },
+    }))
+    const creator = await createTestUser({ name: 'HistoryTokenCreator' })
+    const { key, hashedKey, prefix } = await generateApiToken()
+    const [token] = await db.insert(schema.apiToken).values({
+      name: 'ci', projectId, prefix, hashedKey, createdBy: creator.user.id,
+    }).returning({ id: schema.apiToken.id })
+    assertOk(await authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'PUT', params: { pid: projectId, eid: devEnvId },
+      body: { secrets: { TOKEN_DB_URL: 'v2-by-ci', TOKEN_API_KEY: 'k' } },
+    }))
+    const eventsBefore = await countEvents()
+
+    // Same delete deleteTokenAction runs when a token is revoked in the UI
+    await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, token!.id))
+
+    expect(await secretValue('TOKEN_DB_URL')).toBe('v2-by-ci')
+    expect(await secretValue('TOKEN_API_KEY')).toBe('k')
+    expect(await countEvents()).toBe(eventsBefore)
+  })
+
+  test('deleting a user keeps the secrets they wrote', async () => {
+    // No route deletes users today; this guards manual deletes and any
+    // future account deletion.
+    const db = getDb()
+    const writer = await createTestUser({ name: 'HistoryWriter' })
+    await db.insert(schema.orgMember).values({ orgId, userId: writer.user.id, role: 'member' })
+    assertOk(await authedFetch(writer.token)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST', params: { pid: projectId, eid: devEnvId },
+      body: { name: 'USER_SECRET', value: 'by-writer' },
+    }))
+    const eventsBefore = await countEvents()
+
+    await db.delete(schema.user).where(orm.eq(schema.user.id, writer.user.id))
+
+    expect(await secretValue('USER_SECRET')).toBe('by-writer')
+    expect(await countEvents()).toBe(eventsBefore)
+  })
+})
+
 // ── Encryption roundtrip ────────────────────────────────────────────
 
 // ── Secrets list — isEmpty and allNames ─────────────────────────────
