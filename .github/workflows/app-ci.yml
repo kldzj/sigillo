@@ -1,0 +1,59 @@
+# CI for the app worker: typecheck the workspace and run the app integration
+# suite (workerd + in-memory D1, no network).
+#
+# cli-ci.yml also calls this workflow before publishing, because the publish
+# job builds the app into the self-host bundle that `npx sigillo self-host`
+# deploys. A red app suite must never reach npm.
+
+name: sigillo app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'db/**'
+      - 'provider/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.npmrc'
+      - 'tsconfig.base.json'
+      - '.github/workflows/app-ci.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'db/**'
+      - 'provider/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.npmrc'
+      - 'tsconfig.base.json'
+      - '.github/workflows/app-ci.yml'
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10.33.4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Test app
+        run: pnpm --dir app test
