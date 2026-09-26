@@ -177,6 +177,16 @@ pub fn setScope(allocator: std.mem.Allocator, scope_input: []const u8, updates: 
     try writeConfig(allocator, &config);
 }
 
+/// The entry saved for exactly this scope (no parent-scope fallback).
+pub fn getScope(allocator: std.mem.Allocator, scope_input: []const u8) !?ScopedEntry {
+    const config = try readConfig(allocator);
+    const normalized_scope = try normalizeScope(allocator, scope_input);
+    for (config.scopes.items) |record| {
+        if (std.mem.eql(u8, record.scope, normalized_scope)) return record.entry;
+    }
+    return null;
+}
+
 pub fn clearScope(allocator: std.mem.Allocator, scope_input: []const u8) !void {
     var config = try readConfig(allocator);
 

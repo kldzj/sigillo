@@ -15,7 +15,7 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, deleteOrgMember } from './db.js'
 import { schema } from 'db'
 import { formatAbsoluteDate, formatTime } from './lib/utils.js'
 
@@ -1159,6 +1159,48 @@ describe('secrets derivation — batching & multi-author', () => {
     // PROD_ONLY + SHARED_KEY are seeded and never deleted, so always present.
     expect(withoutSelection.allNames).toContain('PROD_ONLY')
     expect(withoutSelection.allNames).toContain('SHARED_KEY')
+  })
+})
+
+// ── Removing a member ───────────────────────────────────────────────
+
+describe('removing a member', () => {
+  test('revokes the tokens and invite links they created and keeps their secrets', async () => {
+    const admin = await createTestUser({ name: 'RemovalAdmin' })
+    const leaver = await createTestUser({ name: 'RemovalLeaver' })
+    const af = authedFetch(admin.token)
+    const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Removal Org' } }))
+    const project = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Removal Project', orgId: org.id } }))
+    const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: project.id } }))
+    const devEnvId = envs.environments.find((e) => e.slug === 'dev')!.id
+
+    const db = getDb()
+    const [member] = await db.insert(schema.orgMember)
+      .values({ orgId: org.id, userId: leaver.user.id, role: 'admin' })
+      .returning({ id: schema.orgMember.id, orgId: schema.orgMember.orgId, userId: schema.orgMember.userId })
+    const leaverToken = await generateApiToken()
+    await db.insert(schema.apiToken).values({
+      name: 'leaver-ci', projectId: project.id, prefix: leaverToken.prefix, hashedKey: leaverToken.hashedKey, createdBy: leaver.user.id,
+    })
+    // Tokens someone else created are not the leaver's to take along
+    const adminToken = await generateApiToken()
+    await db.insert(schema.apiToken).values({
+      name: 'admin-ci', projectId: project.id, prefix: adminToken.prefix, hashedKey: adminToken.hashedKey, createdBy: admin.user.id,
+    })
+    await db.insert(schema.orgInvitation).values({ orgId: org.id, createdBy: leaver.user.id, expiresAt: Date.now() + 60_000 })
+    assertOk(await authedFetch(leaverToken.key)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST', params: { pid: project.id, eid: devEnvId }, body: { name: 'BY_LEAVER_CI', value: 'v' },
+    }))
+
+    await deleteOrgMember(member!)
+
+    const listWith = (key: string) => authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      params: { pid: project.id, eid: devEnvId },
+    })
+    assertErrorStatus(await listWith(leaverToken.key), 401)
+    assertOk(await listWith(adminToken.key))
+    expect(await db.query.orgInvitation.findMany({ where: { orgId: org.id } })).toEqual([])
+    expect((await deriveSecrets(devEnvId)).map((s) => s.name)).toEqual(['BY_LEAVER_CI'])
   })
 })
 

@@ -408,6 +408,27 @@ async function lookupOrgMember(userId: string, orgId: string): Promise<{ role: s
   return { role: member.role }
 }
 
+// Removes a member together with what let them keep acting in the org on
+// their own: the API tokens they created for its projects, and the invite
+// links they created. Tokens and invites used to outlive their creator, so a
+// departed member's CI token kept reading secrets. The secrets those tokens
+// wrote stay (secret_event.api_token_id is SET NULL).
+export async function deleteOrgMember(member: { id: string; orgId: string; userId: string }) {
+  const db = getDb()
+  const orgProjectIds = db.select({ id: schema.project.id }).from(schema.project).where(orm.eq(schema.project.orgId, member.orgId))
+  await db.batch([
+    db.delete(schema.apiToken).where(orm.and(
+      orm.eq(schema.apiToken.createdBy, member.userId),
+      orm.inArray(schema.apiToken.projectId, orgProjectIds),
+    )),
+    db.delete(schema.orgInvitation).where(orm.and(
+      orm.eq(schema.orgInvitation.orgId, member.orgId),
+      orm.eq(schema.orgInvitation.createdBy, member.userId),
+    )),
+    db.delete(schema.orgMember).where(orm.eq(schema.orgMember.id, member.id)),
+  ])
+}
+
 // Distinct class instead of `new Error('FORBIDDEN')` so the API/page wrappers
 // below can tell an authorization denial apart from an infrastructure failure.
 // A bare `catch {}` there used to turn D1 outages into a bogus 403/redirect,
