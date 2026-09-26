@@ -314,6 +314,23 @@ export async function requirePageSession(request: Request): Promise<Session> {
 // load. Uses onConflictDoNothing so it's idempotent; no need to pre-check
 // existing memberships (the unique index on org_id+user_id handles it).
 
+// The email domain a user may turn auto-join on for, or why not. One org per
+// domain: the first org to claim it keeps it (org_auto_join_domain_unique is
+// unique). Otherwise any verified colleague could create a second org for
+// the same domain and silently enroll everyone who signs in next.
+export async function getClaimableAutoJoinDomain({ session, orgId }: {
+  session: Session
+  /** the org being updated, which may keep its own claim */
+  orgId?: string
+}): Promise<string | Error> {
+  if (!session.user.emailVerified) return new Error('Email must be verified to enable auto-join')
+  const domain = getEmailDomain(session.user.email)
+  if (!domain || COMMON_EMAIL_DOMAINS.has(domain)) return new Error('Cannot enable auto-join for public email domains')
+  const claimed = await getDb().query.org.findFirst({ where: { autoJoinDomain: domain }, columns: { id: true } })
+  if (claimed && claimed.id !== orgId) return new Error(`Another organization already auto-joins @${domain} accounts`)
+  return domain
+}
+
 export async function autoJoinOrgsByDomain(session: Session): Promise<void> {
   if (!session.user.emailVerified) return
   const domain = getEmailDomain(session.user.email)
