@@ -2,32 +2,40 @@
 $schema: https://holocron.so/frontmatter.json
 title: 'Self-host Sigillo on your own Cloudflare account'
 sidebarTitle: 'Self-hosting'
-description: 'Deploy Sigillo to your own Cloudflare account with a single command: Worker, D1 database, migrations, and custom domain, with no build step required.'
+description: 'Deploy Sigillo and its own login provider to your Cloudflare account with a single command: Workers, D1 databases, migrations, and custom domain, with no build step required.'
 icon: lucide:server
 ---
 
 Run Sigillo on **your own Cloudflare account** with a single command. No git clone, no build step, no wrangler config:
 
 ```bash
-npx sigillo self-host
+npx @kldzj/sigillo self-host
 ```
 
-The command provisions a **Worker and a D1 database** on your account, applies the database migrations, uploads the latest Sigillo release, and prints your instance URL. The whole thing runs on Cloudflare's **free plan**.
+The command provisions **two Workers and their D1 databases** on your account: the Sigillo app and its own login provider. It applies the database migrations, uploads the latest release, and prints your instance URL. The whole thing runs on Cloudflare's **free plan**, and depends on no one else's servers.
 
 ## What it does
 
 ```diagram
-npx sigillo self-host
+npx @kldzj/sigillo self-host
       │
       ├──> 1. Log in to Cloudflare (reuses wrangler login when present)
-      ├──> 2. Download the latest prebuilt Sigillo release bundle
-      ├──> 3. Create a D1 database ──> apply migrations
-      ├──> 4. Upload the Worker with static assets and bindings
-      ├──> 5. Enable your workers.dev URL
-      └──> 6. Optionally attach a custom domain
+      ├──> 2. Download the latest release bundle from github.com/kldzj/sigillo
+      ├──> 3. Deploy the login provider (<name>-auth): D1, migrations, Worker
+      ├──> 4. Deploy the app (<name>): D1, migrations, Worker, static assets
+      ├──> 5. Enable both workers.dev URLs
+      └──> 6. Optionally attach a custom domain to the app
 ```
 
-Authentication with your instance **just works**: the deployed app registers itself with the hosted Sigillo auth provider on first load, so you sign in with the same login as sigillo.dev. There are no OAuth keys to configure.
+## Google sign-in
+
+People sign in with Google through your login provider. A new deployment needs a Google OAuth client for it, and the command shows you exactly what to register:
+
+1. Open [Google Cloud credentials](https://console.cloud.google.com/apis/credentials) and choose **Create credentials → OAuth client ID → Web application**.
+2. Add the redirect URI the command prints, for example `https://sigillo-auth.<your-subdomain>.workers.dev/api/auth/callback/google`.
+3. Paste the client ID and secret when the command asks for them, or pass `--google-client-id` and `--google-client-secret`.
+
+The first time someone signs in to your instance, the login provider asks them to allow it once.
 
 ## Cloudflare credentials
 
@@ -49,12 +57,14 @@ Deploying over **SSH**? Pick the API token option: the pre-filled link opens on 
 Re-run the same command anytime to **update** to the latest release:
 
 ```bash
-npx sigillo self-host
+npx @kldzj/sigillo self-host
 ```
 
-Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and your auth secret and encryption key are never rotated, so your stored secrets stay decryptable.
+Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and no secret is ever rotated, so your stored secrets stay decryptable and your users stay signed in.
 
-New deployments get their own `ENCRYPTION_KEY`, separate from the auth secret that signs sessions. Both are saved in `~/.sigillo/selfhost.json` on the machine that ran the command. Keep a copy in your password manager: a database backup cannot be decrypted without the key. Deployments made before this keep deriving their key from the auth secret.
+New deployments get their own `ENCRYPTION_KEY`, separate from the auth secret that signs sessions. The keys, the login provider's secret and the Google client are saved in `~/.sigillo/selfhost.json` on the machine that ran the command. Keep a copy in your password manager: a database backup cannot be decrypted without the key.
+
+A deployment that already signs in through another provider, such as one made with upstream Sigillo's `self-host` against `auth.sigillo.dev`, keeps that provider on update: switching would give every user a new login.
 
 ## Options
 
@@ -62,17 +72,20 @@ See the full flag reference at [sigillo self-host](./cli/self-host.mdx).
 
 | Option | Description |
 |--------|-------------|
-| `--name <name>` | Worker name (default: `sigillo`) |
+| `--name <name>` | Worker name (default: `sigillo`); the login provider is `<name>-auth` |
 | `--account <id>` | Cloudflare account id (skips the account prompt) |
 | `--api-token <token>` | Cloudflare API token |
-| `--domain <hostname>` | Attach a custom domain (the zone must be on your account) |
+| `--google-client-id <id>` | Google OAuth client ID for a new login provider |
+| `--google-client-secret <secret>` | Google OAuth client secret for a new login provider |
+| `--domain <hostname>` | Attach a custom domain to the app (the zone must be on your account) |
 | `--skip-domain` | Skip the custom domain prompt |
 | `--yes` | Accept all defaults, non-interactive |
 
 Non-interactive example for **CI or agents**:
 
 ```bash
-CLOUDFLARE_API_TOKEN=xxx npx sigillo self-host --yes
+CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes \
+  --google-client-id xxx.apps.googleusercontent.com --google-client-secret xxx
 ```
 
 ## Using your instance
@@ -83,7 +96,7 @@ Point the CLI at your deployment with **`--api-url`**:
 sigillo login --api-url https://sigillo.<your-subdomain>.workers.dev
 ```
 
-Then everything works exactly like the hosted service:
+Then everything works exactly like before:
 
 ```bash
 sigillo setup

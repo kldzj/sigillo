@@ -1,15 +1,16 @@
 // Build the self-host deployment bundle for `npx sigillo self-host`.
 //
-// Packages the vite build output (worker modules + static assets), the D1
-// migrations, and deploy metadata into a single gzipped JSON file that the
-// CLI can upload to a customer's Cloudflare account via raw API calls —
-// no wrangler or node build step needed on the customer machine.
+// Packages two workers, the app and its own login provider, each as its vite
+// build output (worker modules + static assets) plus its D1 migrations, into
+// a single gzipped JSON file that the CLI can upload to a customer's
+// Cloudflare account via raw API calls — no wrangler or node build step
+// needed on the customer machine.
 //
 // Asset hashes are precomputed here with blake3 (same algorithm wrangler
 // uses: blake3(base64Contents + extension).hex.slice(0, 32)) so the CLI
 // needs no blake3 dependency.
 //
-// Run after `pnpm build`:  pnpm bundle:selfhost
+// Run after `pnpm build` here and in provider/:  pnpm bundle:selfhost
 // Output: dist/sigillo-selfhost-bundle.json.gz
 
 import { readFileSync, readdirSync, statSync, writeFileSync, existsSync } from 'node:fs'
@@ -23,18 +24,12 @@ const { hash: blake3hash } = require('blake3-wasm') as {
 }
 
 const appDir = join(import.meta.dirname, '..')
-const rscDir = join(appDir, 'dist/rsc')
-const clientDir = join(appDir, 'dist/client')
-const migrationsDir = join(appDir, '../db/drizzle-app')
+const providerDir = join(appDir, '../provider')
 const cliPackageJson = join(appDir, '../cli/package.json')
 const outPath = join(appDir, 'dist/sigillo-selfhost-bundle.json.gz')
 
 // Mirrors the shape consumed by cli/src/selfhost/deploy.ts — keep in sync.
-interface SelfhostBundle {
-  formatVersion: 1
-  version: string
-  createdAt: string
-  providerUrl: string
+interface WorkerBundle {
   compatibilityDate: string
   compatibilityFlags: string[]
   mainModule: string
@@ -44,6 +39,14 @@ interface SelfhostBundle {
   assets: Record<string, { base64: string; hash: string; size: number; contentType: string }>
   /** migration filename -> sql */
   migrations: Record<string, string>
+}
+
+interface SelfhostBundle {
+  formatVersion: 2
+  version: string
+  createdAt: string
+  app: WorkerBundle
+  provider: WorkerBundle
 }
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -86,7 +89,11 @@ function listFiles(dir: string): string[] {
   return out
 }
 
-function main() {
+// Worker vars (PROVIDER_URL, BETTER_AUTH_URL) are not bundled: self-host
+// sets them per deployment once it knows the workers.dev URLs.
+function readWorker(label: string, distDir: string, migrationsDir: string): WorkerBundle {
+  const rscDir = join(distDir, 'rsc')
+  const clientDir = join(distDir, 'client')
   for (const dir of [rscDir, clientDir]) {
     if (!existsSync(dir)) {
       console.error(`missing ${dir} — run 'pnpm build' first`)
@@ -95,8 +102,6 @@ function main() {
   }
 
   const wranglerConfig = JSON.parse(readFileSync(join(rscDir, 'wrangler.json'), 'utf-8'))
-  const version: string = JSON.parse(readFileSync(cliPackageJson, 'utf-8')).version
-  console.log(`bundling self-host release v${version}`)
 
   // ── Worker modules: all .js files under dist/rsc ──────────────────
   const modules: Record<string, string> = {}
@@ -104,7 +109,7 @@ function main() {
     if (!rel.endsWith('.js')) continue
     modules[rel] = readFileSync(join(rscDir, rel)).toString('base64')
   }
-  console.log(`worker modules: ${Object.keys(modules).length} (main: ${wranglerConfig.main})`)
+  console.log(`${label} worker modules: ${Object.keys(modules).length} (main: ${wranglerConfig.main})`)
   if (!modules[wranglerConfig.main]) {
     throw new Error(`main module ${wranglerConfig.main} not found in ${rscDir}`)
   }
@@ -126,7 +131,7 @@ function main() {
     return ignorePatterns.some((p) => rel === p || base === p)
   }
 
-  const assets: SelfhostBundle['assets'] = {}
+  const assets: WorkerBundle['assets'] = {}
   for (const rel of listFiles(clientDir)) {
     if (isIgnored(rel)) continue
     const content = readFileSync(join(clientDir, rel))
@@ -141,26 +146,35 @@ function main() {
       contentType: CONTENT_TYPES[extname(rel)] ?? 'application/null',
     }
   }
-  console.log(`static assets: ${Object.keys(assets).length}`)
+  console.log(`${label} static assets: ${Object.keys(assets).length}`)
 
-  // ── D1 migrations: flat .sql files in db/drizzle-app ──────────────
+  // ── D1 migrations: flat .sql files ────────────────────────────────
   const migrations: Record<string, string> = {}
   for (const name of readdirSync(migrationsDir).filter((f) => f.endsWith('.sql')).sort()) {
     migrations[name] = readFileSync(join(migrationsDir, name), 'utf-8')
   }
-  console.log(`migrations: ${Object.keys(migrations).length}`)
+  console.log(`${label} migrations: ${Object.keys(migrations).length}`)
 
-  const bundle: SelfhostBundle = {
-    formatVersion: 1,
-    version,
-    createdAt: new Date().toISOString(),
-    providerUrl: wranglerConfig.vars?.PROVIDER_URL ?? 'https://auth.sigillo.dev',
+  return {
     compatibilityDate: wranglerConfig.compatibility_date,
     compatibilityFlags: wranglerConfig.compatibility_flags ?? [],
     mainModule: wranglerConfig.main,
     modules,
     assets,
     migrations,
+  }
+}
+
+function main() {
+  const version: string = JSON.parse(readFileSync(cliPackageJson, 'utf-8')).version
+  console.log(`bundling self-host release v${version}`)
+
+  const bundle: SelfhostBundle = {
+    formatVersion: 2,
+    version,
+    createdAt: new Date().toISOString(),
+    app: readWorker('app', join(appDir, 'dist'), join(appDir, '../db/drizzle-app')),
+    provider: readWorker('provider', join(providerDir, 'dist'), join(providerDir, 'drizzle')),
   }
 
   const gz = gzipSync(Buffer.from(JSON.stringify(bundle)), { level: 9 })

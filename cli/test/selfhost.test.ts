@@ -6,7 +6,11 @@
 import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
-import { ensureDatabase, fetchReleaseInfo, parseBundle, secretsForDeploy, uploadWorker, type SelfhostBundle } from '../src/selfhost/deploy.js'
+import {
+  appCompatibilityFlags, ensureDatabase, fetchReleaseInfo, isSigilloProviderWorker, parseBundle, providerSecretsForDeploy,
+  secretsForDeploy, uploadWorker,
+  type SelfhostBundle, type WorkerBundle,
+} from '../src/selfhost/deploy.js'
 
 describe('parseWranglerToml', () => {
   const sample = [
@@ -51,11 +55,7 @@ describe('parseWranglerToml', () => {
 })
 
 describe('parseBundle', () => {
-  const bundle: SelfhostBundle = {
-    formatVersion: 1,
-    version: '0.13.0',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    providerUrl: 'https://auth.sigillo.dev',
+  const worker: WorkerBundle = {
     compatibilityDate: '2026-04-16',
     compatibilityFlags: ['nodejs_compat'],
     mainModule: 'index.js',
@@ -70,10 +70,22 @@ describe('parseBundle', () => {
     },
     migrations: { '0001_initial.sql': 'CREATE TABLE t(id);' },
   }
+  const bundle: SelfhostBundle = {
+    formatVersion: 2,
+    version: '0.14.0',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    app: worker,
+    provider: { ...worker, migrations: { '0001_initial.sql': 'CREATE TABLE u(id);' } },
+  }
 
   test('round-trips a gzipped bundle', () => {
     const parsed = parseBundle(gzipSync(Buffer.from(JSON.stringify(bundle))))
     expect(parsed).toEqual(bundle)
+  })
+
+  test('rejects bundles without a provider worker', () => {
+    const v1 = gzipSync(Buffer.from(JSON.stringify({ ...worker, formatVersion: 1, version: '0.13.0' })))
+    expect(() => parseBundle(v1)).toThrow('Unsupported bundle format 1')
   })
 
   test('rejects unknown format versions', () => {
@@ -151,39 +163,101 @@ describe('secretsForDeploy', () => {
 })
 
 describe('uploadWorker', () => {
-  test('binds ENCRYPTION_KEY as a secret when one is given', async () => {
-    let metadata: { bindings: unknown[] } | undefined
+  const worker = {
+    mainModule: 'index.js',
+    compatibilityDate: '2026-04-16',
+    compatibilityFlags: ['nodejs_compat'],
+    modules: { 'index.js': Buffer.from('export default {}').toString('base64') },
+  } as unknown as WorkerBundle
+  const upload = async (args: { vars: Record<string, string>; secrets?: Record<string, string> }) => {
+    let metadata: { bindings: unknown[]; keep_bindings?: string[] } | undefined
     const client = {
       async putWorker({ formData }: { formData: FormData }) {
         metadata = JSON.parse(await (formData.get('metadata') as File).text())
       },
     } as unknown as CfClient
-    const bundle = {
-      mainModule: 'index.js',
-      compatibilityDate: '2026-04-16',
-      compatibilityFlags: [],
-      providerUrl: 'https://auth.sigillo.dev',
-      modules: { 'index.js': Buffer.from('export default {}').toString('base64') },
-    } as unknown as SelfhostBundle
-    await uploadWorker(client, {
-      accountId: 'acc', scriptName: 'sigillo', bundle, databaseId: 'db', assetsJwt: 'jwt',
-      betterAuthSecret: 's', encryptionKey: 'k',
-    })
-    expect(metadata!.bindings).toContainEqual({ type: 'secret_text', name: 'ENCRYPTION_KEY', text: 'k' })
+    await uploadWorker(client, { accountId: 'acc', scriptName: 'sigillo', worker, databaseId: 'db', assetsJwt: 'jwt', ...args })
+    return metadata!
+  }
+
+  test('a new worker gets its vars and secrets', async () => {
+    const metadata = await upload({ vars: { PROVIDER_URL: 'https://sigillo-auth.example.workers.dev' }, secrets: { BETTER_AUTH_SECRET: 's', ENCRYPTION_KEY: 'k' } })
+    expect(metadata.bindings).toContainEqual({ type: 'plain_text', name: 'PROVIDER_URL', text: 'https://sigillo-auth.example.workers.dev' })
+    expect(metadata.bindings).toContainEqual({ type: 'secret_text', name: 'ENCRYPTION_KEY', text: 'k' })
+    expect(metadata.keep_bindings).toBeUndefined()
+  })
+
+  test('an existing worker keeps the secrets it has', async () => {
+    const metadata = await upload({ vars: { BETTER_AUTH_URL: 'https://sigillo-auth.example.workers.dev' } })
+    expect(metadata.bindings).not.toContainEqual(expect.objectContaining({ type: 'secret_text' }))
+    expect(metadata.keep_bindings).toEqual(['secret_text', 'secret_key'])
+  })
+})
+
+describe('isSigilloProviderWorker', () => {
+  test('recognizes a login provider by its DB and BETTER_AUTH_URL bindings', () => {
+    expect(isSigilloProviderWorker({ bindings: [{ type: 'd1', name: 'DB' }, { type: 'plain_text', name: 'BETTER_AUTH_URL' }] })).toBe(true)
+    expect(isSigilloProviderWorker({ bindings: [{ type: 'd1', name: 'DB' }, { type: 'plain_text', name: 'PROVIDER_URL' }] })).toBe(false)
+    expect(isSigilloProviderWorker(null)).toBe(false)
+  })
+})
+
+describe('appCompatibilityFlags', () => {
+  test('lets the app reach its provider, another worker on the same account', () => {
+    expect(appCompatibilityFlags(['nodejs_compat'])).toEqual(['nodejs_compat', 'global_fetch_strictly_public'])
+    expect(appCompatibilityFlags(['nodejs_compat', 'global_fetch_strictly_public'])).toEqual(['nodejs_compat', 'global_fetch_strictly_public'])
+  })
+})
+
+describe('providerSecretsForDeploy', () => {
+  const saved = (fields: Partial<DeploymentState>): DeploymentState => ({
+    accountId: 'acc', workerName: 'sigillo', databaseId: 'db', ...fields,
+  })
+  const google = { clientId: 'client-id', clientSecret: 'client-secret' }
+
+  test('an existing provider keeps the secrets it has, nothing is sent', () => {
+    expect(providerSecretsForDeploy({ providerExists: true, saved: saved({ providerAuthSecret: 'p' }), google })).toBeUndefined()
+  })
+
+  test('a recreated provider reuses its saved secret and Google client', () => {
+    expect(providerSecretsForDeploy({
+      providerExists: false,
+      saved: saved({ providerAuthSecret: 'p', googleClientId: 'saved-id', googleClientSecret: 'saved-secret' }),
+    })).toEqual({ BETTER_AUTH_SECRET: 'p', GOOGLE_CLIENT_ID: 'saved-id', GOOGLE_CLIENT_SECRET: 'saved-secret' })
+  })
+
+  test('a Google client passed explicitly replaces the saved one', () => {
+    expect(providerSecretsForDeploy({
+      providerExists: false,
+      saved: saved({ providerAuthSecret: 'p', googleClientId: 'saved-id', googleClientSecret: 'saved-secret' }),
+      google,
+    })).toEqual({ BETTER_AUTH_SECRET: 'p', GOOGLE_CLIENT_ID: 'client-id', GOOGLE_CLIENT_SECRET: 'client-secret' })
+  })
+
+  test('a new provider gets its own auth secret and the given Google client', () => {
+    const secrets = providerSecretsForDeploy({ providerExists: false, google })!
+    expect(Buffer.from(secrets.BETTER_AUTH_SECRET!, 'base64')).toHaveLength(32)
+    expect(secrets).toMatchObject({ GOOGLE_CLIENT_ID: 'client-id', GOOGLE_CLIENT_SECRET: 'client-secret' })
+  })
+
+  test('a new provider without a Google client is refused', () => {
+    expect(() => providerSecretsForDeploy({ providerExists: false })).toThrow(/Google OAuth client/)
   })
 })
 
 describe('ensureDatabase', () => {
   // A D1 named like ours that already holds a Sigillo deployment with stored secrets
+  const queries: string[] = []
   const fakeClient = ({ secretRows }: { secretRows: number }) => ({
     async findD1ByName() { return { uuid: 'db-1' } },
     async d1Query({ sql }: { sql: string }) {
+      queries.push(sql)
       if (sql.includes('sqlite_master')) return [{ results: [{ name: 'd1_migrations' }, { name: 'secret_event' }] }]
       if (sql.includes('d1_migrations')) return [{ results: [{ name: '0001_initial.sql' }] }]
       return [{ results: Array.from({ length: secretRows }, () => ({ 1: 1 })) }]
     },
   }) as unknown as CfClient
-  const args = { accountId: 'acc', name: 'sigillo-db', firstMigrationName: '0001_initial.sql' }
+  const args = { accountId: 'acc', name: 'sigillo-db', firstMigrationName: '0001_initial.sql', dataTable: 'secret_event' }
 
   test('refuses to put new secrets in front of stored ones', async () => {
     await expect(ensureDatabase({ client: fakeClient({ secretRows: 1 }), ...args, secretsKept: false }))
@@ -196,6 +270,12 @@ describe('ensureDatabase', () => {
 
   test('adopts it when no secret was ever stored', async () => {
     expect(await ensureDatabase({ client: fakeClient({ secretRows: 0 }), ...args, secretsKept: false })).toBe('db-1')
+  })
+
+  test('guards the provider database by its signing keys', async () => {
+    await expect(ensureDatabase({ client: fakeClient({ secretRows: 1 }), ...args, name: 'sigillo-auth-db', dataTable: 'jwks', secretsKept: false }))
+      .rejects.toThrow(/unreadable/)
+    expect(queries.at(-1)).toBe('SELECT 1 FROM jwks LIMIT 1;')
   })
 })
 

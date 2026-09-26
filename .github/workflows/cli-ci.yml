@@ -105,9 +105,9 @@ jobs:
         working-directory: cli
         run: pnpm build
 
+      # The bundle carries two workers: the app and its own login provider
       - name: Build self-host bundle
-        working-directory: app
-        run: pnpm build && pnpm bundle:selfhost
+        run: pnpm --dir provider build && pnpm --dir app build && pnpm --dir app bundle:selfhost
 
       - name: Download artifacts
         uses: actions/download-artifact@v4

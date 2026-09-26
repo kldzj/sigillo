@@ -1,4 +1,4 @@
-// Cloudflare authentication + API client for `npx sigillo self-host`.
+// Cloudflare authentication + API client for `npx @kldzj/sigillo self-host`.
 //
 // Auth ladder (first working credential wins):
 //   1. --api-token flag / CLOUDFLARE_API_TOKEN env
@@ -63,6 +63,11 @@ export interface OAuthTokens {
   expiration_time: string
 }
 
+export interface WorkerSettings {
+  /** plain_text bindings carry their value in text */
+  bindings?: Array<{ type: string; name: string; text?: string }>
+}
+
 export interface DeploymentState {
   accountId: string
   workerName: string
@@ -70,6 +75,12 @@ export interface DeploymentState {
   betterAuthSecret?: string
   /** unset for deployments made before self-host generated one */
   encryptionKey?: string
+  /** the deployment's own login provider (unset when it uses another one) */
+  providerWorkerName?: string
+  providerDatabaseId?: string
+  providerAuthSecret?: string
+  googleClientId?: string
+  googleClientSecret?: string
   deployedVersion?: string
   url?: string
   customDomain?: string
@@ -91,8 +102,8 @@ export function readState(): SelfhostState {
   }
 }
 
-// The state file holds Cloudflare tokens, BETTER_AUTH_SECRET and
-// ENCRYPTION_KEY (the DB encryption key): write it 0600, atomically (tmp + rename so
+// The state file holds Cloudflare tokens, BETTER_AUTH_SECRET, ENCRYPTION_KEY
+// (the DB encryption key) and the provider's secrets: write it 0600, atomically (tmp + rename so
 // a crash can't truncate the only copy), and re-chmod existing files that
 // were created before this hardening.
 export function writeState(state: SelfhostState) {
@@ -251,7 +262,7 @@ export class CfClient {
   /** Script settings, or null when the worker doesn't exist. Bindings are
    *  used to fingerprint whether an existing worker is a Sigillo deployment. */
   getWorkerSettings(accountId: string, scriptName: string) {
-    return this.getOrNull<{ bindings?: Array<{ type: string; name: string }> }>(
+    return this.getOrNull<WorkerSettings>(
       `/accounts/${accountId}/workers/scripts/${scriptName}/settings`,
     )
   }
