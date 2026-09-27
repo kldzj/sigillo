@@ -76,3 +76,41 @@ export function getEmailDomain(email: string): string | null {
   const domain = email.slice(at + 1).trim().toLowerCase()
   return domain || null
 }
+
+// ── Secret names and .env rendering (client-safe) ────────────────────
+// New secret names must be valid shell/env identifiers. A name with a
+// newline or "=" used to inject extra lines into env/docker/yaml downloads.
+export const SECRET_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+export function getSecretNameError(name: string): string | null {
+  if (SECRET_NAME_REGEX.test(name)) return null
+  return `Invalid secret name "${name}". Use letters, digits and underscores, not starting with a digit.`
+}
+
+// Names safe to emit as a line key in text formats. Looser than
+// SECRET_NAME_REGEX (dotenv key grammar) so legacy names like
+// "my-api-key" still download; anything else is dropped.
+export function isRenderableSecretName(name: string) {
+  return /^[\w.-]+$/.test(name)
+}
+
+// Quote a value so `source .env` never expands $(...), `...` or $VAR,
+// while staying readable by dotenv parsers whenever possible:
+// - no single quote: '...' (literal in both shell and dotenv)
+// - single quote but nothing shell-special: "..." (literal in both)
+// - otherwise: shell '\'' escaping (correct for shell; dotenv can't
+//   represent a value with both ' and $/`/"/\ losslessly anyway)
+export function quoteEnvValue(value: string) {
+  if (!value.includes("'")) return `'${value}'`
+  if (!/["$`\\]/.test(value)) return `"${value}"`
+  return `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+export function renderEnvFile(entries: Iterable<[string, string]>) {
+  const lines: string[] = []
+  for (const [name, value] of entries) {
+    if (!isRenderableSecretName(name)) continue
+    lines.push(`${name}=${quoteEnvValue(value)}`)
+  }
+  return lines.join('\n') + '\n'
+}

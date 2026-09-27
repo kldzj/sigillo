@@ -6,7 +6,7 @@
 
 import { ClockIcon, EyeIcon, EyeOffIcon } from "lucide-react";
 import { cn } from "sigillo-app/src/lib/utils";
-import { EmptyState } from "sigillo-app/src/components/ui/empty-state";
+import { AdminOnlyEnvironment, EmptyState } from "sigillo-app/src/components/ui/empty-state";
 import { useState } from "react";
 import { router, useLoaderData } from "spiceflow/react";
 import { Badge } from "sigillo-app/src/components/ui/badge";
@@ -36,6 +36,7 @@ export function EventLogTable() {
     events,
     environments,
     selectedEnvId,
+    locked,
     projectId,
   } = useLoaderData('/dash/projects/:projectId/envs/:envSlug/event-log');
   const [visibleValues, setVisibleValues] = useState<Record<string, boolean>>({});
@@ -71,7 +72,9 @@ export function EventLogTable() {
         </Select>
       </div>
 
-      {events.length === 0 ? (
+      {locked ? (
+        <AdminOnlyEnvironment />
+      ) : events.length === 0 ? (
         <EmptyState
           icon={<ClockIcon className="size-6 text-muted-foreground" />}
           title="No events yet"

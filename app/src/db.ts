@@ -397,15 +397,16 @@ export async function getAccessibleProjectIds(
 
 // ── Org authorization ───────────────────────────────────────────────
 
-const lookupOrgMember = memoize({
-  namespace: 'org-member',
-  fn: async (userId: string, orgId: string): Promise<{ role: string } | null> => {
-    const db = getDb()
-    const member = await db.query.orgMember.findFirst({ where: { userId, orgId } })
-    if (!member) return null
-    return { role: member.role }
-  },
-})
+// Membership and environment lookups are deliberately NOT memoized: they
+// carry authorization data (role, accessRole), and a Cache API entry cannot
+// be invalidated everywhere (it is per data center), so a removed member or
+// a newly admin-only environment kept working for up to 15 minutes.
+async function lookupOrgMember(userId: string, orgId: string): Promise<{ role: string } | null> {
+  const db = getDb()
+  const member = await db.query.orgMember.findFirst({ where: { userId, orgId } })
+  if (!member) return null
+  return { role: member.role }
+}
 
 // Distinct class instead of `new Error('FORBIDDEN')` so the API/page wrappers
 // below can tell an authorization denial apart from an infrastructure failure.
@@ -466,25 +467,61 @@ type ResolvedEnvironment = {
   orgId: string | null
 }
 
-export const resolveEnvironment = memoize({
-  namespace: 'resolve-env',
-  fn: async (identifier: string, projectId?: string | null): Promise<ResolvedEnvironment | null> => {
-    const db = getDb()
-    const byId = await db.query.environment.findFirst({
-      where: { id: identifier },
+// Not memoized: carries accessRole (see lookupOrgMember).
+export async function resolveEnvironment(identifier: string, projectId?: string | null): Promise<ResolvedEnvironment | null> {
+  const db = getDb()
+  const byId = await db.query.environment.findFirst({
+    where: { id: identifier },
+    with: { project: { columns: { orgId: true } } },
+  })
+  if (byId) return { ...byId, orgId: byId.project?.orgId ?? null }
+  if (projectId) {
+    const bySlug = await db.query.environment.findFirst({
+      where: { projectId, slug: identifier },
       with: { project: { columns: { orgId: true } } },
     })
-    if (byId) return { ...byId, orgId: byId.project?.orgId ?? null }
-    if (projectId) {
-      const bySlug = await db.query.environment.findFirst({
-        where: { projectId, slug: identifier },
-        with: { project: { columns: { orgId: true } } },
-      })
-      if (bySlug) return { ...bySlug, orgId: bySlug.project?.orgId ?? null }
-    }
-    return null
-  },
-})
+    if (bySlug) return { ...bySlug, orgId: bySlug.project?.orgId ?? null }
+  }
+  return null
+}
+
+// ── Environment authorization ───────────────────────────────────────
+// One rule for every secret read/write path (REST API, pages, actions):
+// org member + project access + admin role for admin-only envs.
+
+type MemberAccess = NonNullable<Awaited<ReturnType<typeof getMemberAccess>>>
+
+export function getEnvironmentAccessError(
+  access: MemberAccess | null,
+  env: { projectId: string; accessRole: string },
+): string | null {
+  if (!access) return 'forbidden'
+  if (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(env.projectId)) {
+    return 'you do not have access to this project'
+  }
+  if (env.accessRole === 'admin' && access.role !== 'admin') return 'admin access required for this environment'
+  return null
+}
+
+export async function getProjectMemberAccess(userId: string, projectId: string) {
+  const orgId = await getOrgIdForProject(projectId)
+  return orgId ? getMemberAccess({ userId, orgId }) : null
+}
+
+// Returns null when the environment does not exist; throws ForbiddenError
+// when the user may not access it.
+export async function getUserEnvironmentAccess({ userId, environmentRef, projectId }: {
+  userId: string
+  environmentRef: string
+  projectId?: string | null
+}) {
+  const env = await resolveEnvironment(environmentRef, projectId)
+  if (!env?.orgId) return null
+  const access = await getMemberAccess({ userId, orgId: env.orgId })
+  const error = getEnvironmentAccessError(access, env)
+  if (error || !access) throw new ForbiddenError(error ?? 'forbidden')
+  return { id: env.id, projectId: env.projectId, orgId: env.orgId, role: access.role }
+}
 
 export async function getOrgIdForEnvironment(environmentId: string, projectId?: string | null) {
   const env = await resolveEnvironment(environmentId, projectId)
@@ -664,6 +701,12 @@ export async function requireSecretsApiAuth(
     if (apiToken.environmentIds && !apiToken.environmentIds.includes(env.id)) {
       throw forbiddenResponse('token is scoped to a different environment')
     }
+    // Admin-only envs: the token acts for its creator, who must still be an
+    // org admin. Covers tokens made by members, and admins later demoted.
+    if (env.accessRole === 'admin') {
+      const creator = env.orgId ? await getMemberAccess({ userId: apiToken.createdBy, orgId: env.orgId }) : null
+      if (creator?.role !== 'admin') throw forbiddenResponse('admin access required for this environment')
+    }
     return { userId: null, apiTokenId: apiToken.tokenId, environmentId: env.id }
   }
 
@@ -671,21 +714,14 @@ export async function requireSecretsApiAuth(
   const session = await getSession(request)
   if (!session) throw unauthorizedResponse()
 
-  const env = await resolveEnvironment(environmentRef, projectId)
-  if (!env?.orgId) throw new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } })
-
-  // One query answers membership, granular project access, AND the role
-  // needed for admin-only environments (previously 3 sequential round-trips).
-  const access = await getMemberAccess({ userId: session.userId, orgId: env.orgId })
-  if (!access) throw forbiddenResponse()
-  if (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(env.projectId)) {
-    throw forbiddenResponse('you do not have access to this project')
+  try {
+    const env = await getUserEnvironmentAccess({ userId: session.userId, environmentRef, projectId })
+    if (!env) throw new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } })
+    return { userId: session.userId, apiTokenId: null, environmentId: env.id }
+  } catch (error) {
+    if (error instanceof ForbiddenError) throw forbiddenResponse(error.message)
+    throw error
   }
-  if (env.accessRole === 'admin' && access.role !== 'admin') {
-    throw forbiddenResponse('admin access required for this environment')
-  }
-
-  return { userId: session.userId, apiTokenId: null, environmentId: env.id }
 }
 
 // ── API token helpers ───────────────────────────────────────────────
@@ -711,19 +747,21 @@ export async function generateApiToken(): Promise<{ key: string; hashedKey: stri
 export async function verifyApiToken(key: string): Promise<{
   tokenId: string
   projectId: string
+  createdBy: string
   environmentIds: string[] | null
 } | null> {
   const hashedKey = await hashTokenKey(key)
   const db = getDb()
   const token = await db.query.apiToken.findFirst({
     where: { hashedKey },
-    columns: { id: true, projectId: true },
+    columns: { id: true, projectId: true, createdBy: true },
     with: { environments: { columns: { environmentId: true } } },
   })
   if (!token) return null
   return {
     tokenId: token.id,
     projectId: token.projectId,
+    createdBy: token.createdBy,
     environmentIds: token.environments.length === 0
       ? null
       : token.environments.map((row) => row.environmentId),
@@ -736,6 +774,7 @@ export async function verifyApiToken(key: string): Promise<{
 export async function getRequestApiToken(request: Request): Promise<{
   tokenId: string
   projectId: string
+  createdBy: string
   environmentIds: string[] | null
 } | null> {
   const authHeader = request.headers.get('authorization')

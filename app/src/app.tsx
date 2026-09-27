@@ -22,6 +22,8 @@ import {
   decrypt,
   autoJoinOrgsByDomain,
   getAccessibleProjectIds,
+  getEnvironmentAccessError,
+  getProjectMemberAccess,
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
@@ -346,14 +348,20 @@ export const app = new Spiceflow({ tracer })
       throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}`)
     }
 
+    // Never decrypt envs the user can't access (admin-only for members).
+    // Loaders run in parallel, so don't rely on the parent loader's checks.
+    const access = await getProjectMemberAccess(session.userId, projectId)
+    const readableEnvIds = environments.filter((e) => !getEnvironmentAccessError(access, e)).map((e) => e.id)
+    const locked = !!selectedEnvId && !readableEnvIds.includes(selectedEnvId)
+
     let secrets: { id: string; name: string; value: string; createdAt: number; updatedAt: number; createdBy: { id: string; name: string } | null }[] = []
     // One D1 batch derives the selected env's secrets AND the union of names
-    // across all envs, instead of a separate names round-trip + per-env query.
+    // across all readable envs, instead of a separate names round-trip.
     const { secrets: derived, allNames: allSecretNames } = await deriveEnvironmentSecretsAndNames({
-      environmentIds: environments.map((e) => e.id),
-      selectedEnvId,
+      environmentIds: readableEnvIds,
+      selectedEnvId: locked ? null : selectedEnvId,
     })
-    if (selectedEnvId) {
+    if (selectedEnvId && !locked) {
       // Resolve all secret authors in ONE query instead of findFirst per user.
       const userIds = [...new Set(derived.map((d) => d.userId).filter(isTruthy))]
       const userMap = new Map<string, { id: string; name: string }>()
@@ -376,6 +384,7 @@ export const app = new Spiceflow({ tracer })
 
     return {
       selectedEnvId,
+      locked,
       secrets,
       allSecretNames,
       showBanner: !hasCookie({ cookieHeader, name: cliBannerCookieName }),
@@ -449,9 +458,10 @@ export const app = new Spiceflow({ tracer })
     return redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}/event-log`)
   })
 
-  .loader('/dash/projects/:projectId/envs/:envSlug/event-log', async ({ params, redirect }) => {
+  .loader('/dash/projects/:projectId/envs/:envSlug/event-log', async ({ params, request, redirect }) => {
     const db = getDb()
     const { projectId, envSlug } = params
+    const session = await requirePageSession(request)
 
     const environments = await db.query.environment.findMany({ where: { projectId }, orderBy: { createdAt: 'asc' } })
 
@@ -462,9 +472,12 @@ export const app = new Spiceflow({ tracer })
       throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/event-log`)
     }
 
+    const access = await getProjectMemberAccess(session.userId, projectId)
+    const locked = !!matchedEnv && !!getEnvironmentAccessError(access, matchedEnv)
+
     // Load events for selected env, sorted by createdAt DESC
     let events: { id: string; name: string; operation: string; valueEncrypted: string | null; iv: string | null; createdAt: number; environmentName: string; userName: string }[] = []
-    if (selectedEnvId) {
+    if (selectedEnvId && !locked) {
       const envMap = new Map(environments.map((e) => [e.id, e.name]))
       const rows = await db.query.secretEvent.findMany({
         where: { environmentId: selectedEnvId },
@@ -498,6 +511,7 @@ export const app = new Spiceflow({ tracer })
     return {
       events: eventsWithValues,
       selectedEnvId,
+      locked,
       projectId,
     }
   })

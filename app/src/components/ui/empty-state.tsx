@@ -2,6 +2,7 @@
 // Used across secrets table, tokens page, and event log when there's no data.
 
 import type * as React from "react";
+import { LockIcon } from "lucide-react";
 import { cn } from "sigillo-app/src/lib/utils";
 
 export function EmptyState({
@@ -28,5 +29,16 @@ export function EmptyState({
       </p>
       {children}
     </div>
+  );
+}
+
+// Shown instead of secrets when a member opens an admin-only environment.
+export function AdminOnlyEnvironment() {
+  return (
+    <EmptyState
+      icon={<LockIcon className="size-6 text-muted-foreground" />}
+      title="Admin access required"
+      description="Only organization admins can view and edit secrets in this environment."
+    />
   );
 }

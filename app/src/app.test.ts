@@ -445,8 +445,110 @@ describe('secrets — download formats', () => {
   test('env format', async () => {
     const res = await downloadReq('env')
     const text = await res.text()
-    expect(text).toContain('DB_HOST="localhost"')
-    expect(text).toContain('DB_PORT="5432"')
+    expect(text).toContain(`DB_HOST='localhost'`)
+    expect(text).toContain(`DB_PORT='5432'`)
+  })
+
+  // Regression: values were JSON.stringify'd into double quotes, so
+  // `source .env` ran $(...) and backticks. Names were unvalidated, so a
+  // newline in a name injected extra lines into env/docker/yaml.
+  test('env/yaml/docker downloads cannot inject shell commands or lines', async () => {
+    const af = authedFetch(token)
+    const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: projectId } }))
+    const previewEnvId = envs.environments.find((e) => e.slug === 'preview')!.id
+
+    const badName = await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST',
+      params: { pid: projectId, eid: previewEnvId },
+      body: { name: 'A\nEVIL', value: 'x' },
+    })
+    expect(badName).toBeInstanceOf(Error)
+    const badBulk = await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'PUT',
+      params: { pid: projectId, eid: previewEnvId },
+      body: { secrets: { 'X=1 Y': 'x' } },
+    })
+    expect(badBulk).toBeInstanceOf(Error)
+
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'PUT',
+      params: { pid: projectId, eid: previewEnvId },
+      body: {
+        secrets: {
+          SUBSHELL: '$(touch /tmp/pwned)',
+          BACKTICK: '`id`',
+          VAR: '$HOME',
+          QUOTE_ONLY: `it's`,
+          QUOTE_AND_DOLLAR: `it's $(id)`,
+          MULTILINE: 'line1\nline2',
+        },
+      },
+    }))
+    // Legacy rows written before validation must still be sanitized on output.
+    const db = getDb()
+    const legacy = await encrypt('ok')
+    const injected = await encrypt('x')
+    await db.insert(schema.secretEvent).values([
+      { environmentId: previewEnvId, name: 'legacy-name', operation: 'set', valueEncrypted: legacy.encrypted, iv: legacy.iv },
+      { environmentId: previewEnvId, name: 'A\nEVIL', operation: 'set', valueEncrypted: injected.encrypted, iv: injected.iv },
+    ])
+
+    const download = async (format: string) => {
+      const res = await app.handle(new Request(
+        `http://e.ly/api/v0/projects/${projectId}/environments/${previewEnvId}/secrets/download?format=${format}`,
+        { headers: { authorization: `Bearer ${token}` } },
+      ))
+      return (await res.text()).split('\n').sort().join('\n')
+    }
+
+    expect(await download('env')).toMatchInlineSnapshot(`
+      "
+      BACKTICK='\`id\`'
+      MULTILINE='line1
+      QUOTE_AND_DOLLAR='it'\\''s $(id)'
+      QUOTE_ONLY="it's"
+      SUBSHELL='$(touch /tmp/pwned)'
+      VAR='$HOME'
+      legacy-name='ok'
+      line2'"
+    `)
+    expect(await download('yaml')).toMatchInlineSnapshot(`
+      "
+      BACKTICK: "\`id\`"
+      MULTILINE: "line1\\nline2"
+      QUOTE_AND_DOLLAR: "it's $(id)"
+      QUOTE_ONLY: "it's"
+      SUBSHELL: "$(touch /tmp/pwned)"
+      VAR: "$HOME"
+      legacy-name: "ok""
+    `)
+    expect(await download('docker')).toMatchInlineSnapshot(`
+      "
+      BACKTICK=\`id\`
+      MULTILINE=line1\\nline2
+      QUOTE_AND_DOLLAR=it's $(id)
+      QUOTE_ONLY=it's
+      SUBSHELL=$(touch /tmp/pwned)
+      VAR=$HOME
+      legacy-name=ok"
+    `)
+
+    // Output stays readable by our dotenv parser for dotenv-representable values.
+    const { parseEnv } = await import('./lib/parse-env.ts')
+    const { renderEnvFile } = await import('./lib/utils.ts')
+    const roundTrip = parseEnv(renderEnvFile([
+      ['SUBSHELL', '$(touch /tmp/pwned)'],
+      ['QUOTE_ONLY', `it's`],
+      ['MULTILINE', 'line1\nline2'],
+    ]))
+    expect(roundTrip).toMatchInlineSnapshot(`
+      {
+        "MULTILINE": "line1
+      line2",
+        "QUOTE_ONLY": "it's",
+        "SUBSHELL": "$(touch /tmp/pwned)",
+      }
+    `)
   })
 
   test('env-no-quotes format', async () => {
@@ -1471,7 +1573,6 @@ describe('environment access roles', () => {
     prodEnvId = envs.environments.find((e) => e.slug === 'prod')!.id
 
     // Restrict prod environment to admin-only BEFORE any secret operations
-    // (resolveEnvironment is memoized, so the accessRole must be set first)
     await db.update(schema.environment)
       .set({ accessRole: 'admin' })
       .where(orm.eq(schema.environment.id, prodEnvId))
@@ -1541,6 +1642,123 @@ describe('environment access roles', () => {
       { headers: { authorization: `Bearer ${memberToken}` } },
     ))
     expect(res.status).toBe(403)
+  })
+
+  // Regression: the API-token branch never checked accessRole, so a member
+  // could create a project-wide token and read admin-only envs with it.
+  test('admin-only env needs a token created by a current admin', async () => {
+    const db = getDb()
+    const admin = await db.query.orgMember.findFirst({ where: { orgId, role: 'admin' }, columns: { userId: true } })
+    const member = await db.query.orgMember.findFirst({ where: { orgId, role: 'member' }, columns: { userId: true } })
+    const memberKey = (await insertApiToken({ name: 'member-token', projectId, createdBy: member!.userId })).key
+    const adminKey = (await insertApiToken({ name: 'admin-token', projectId, createdBy: admin!.userId })).key
+    const path = '/api/v0/projects/:pid/environments/:eid/secrets/:name' as const
+
+    assertErrorStatus(await authedFetch(memberKey)(path, { params: { pid: projectId, eid: prodEnvId, name: 'PROD_SECRET' } }), 403)
+    assertOk(await authedFetch(memberKey)(path, { params: { pid: projectId, eid: devEnvId, name: 'DEV_SECRET' } }))
+    expect(assertOk(await authedFetch(adminKey)(path, { params: { pid: projectId, eid: prodEnvId, name: 'PROD_SECRET' } })).value).toBe('prod-value')
+  })
+
+  // Regression: authz lookups were memoized for up to 15 minutes.
+  test('making an env admin-only takes effect immediately', async () => {
+    const db = getDb()
+    const mf = authedFetch(memberToken)
+    const path = '/api/v0/projects/:pid/environments/:eid/secrets/:name' as const
+    assertOk(await mf(path, { params: { pid: projectId, eid: devEnvId, name: 'DEV_SECRET' } }))
+    await db.update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, devEnvId))
+    assertErrorStatus(await mf(path, { params: { pid: projectId, eid: devEnvId, name: 'DEV_SECRET' } }), 403)
+    await db.update(schema.environment).set({ accessRole: 'member' }).where(orm.eq(schema.environment.id, devEnvId))
+  })
+})
+
+// ── Authorization outside the secrets API ───────────────────────────
+// Environment and project routes used to check org membership only, so a
+// member scoped to one project could delete another project's admin-only
+// prod. Tests adapted from #13 and #15 by Nikolai Kolodziej.
+describe('authorization — project scoping and admin-only environments', () => {
+  let adminToken: string
+  let memberToken: string
+  let scopedToken: string
+  let orgId: string
+  let projectAId: string
+  let aDevEnvId: string
+  let aProdEnvId: string
+
+  beforeAll(async () => {
+    const admin = await createTestUser({ name: 'AuthzAdmin' })
+    const member = await createTestUser({ name: 'AuthzMember' })
+    const scoped = await createTestUser({ name: 'AuthzScoped' })
+    adminToken = admin.token
+    memberToken = member.token
+    scopedToken = scoped.token
+    const af = authedFetch(adminToken)
+    orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Authz Org' } })).id
+    projectAId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Authz A', orgId } })).id
+    const projectBId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Authz B', orgId } })).id
+    const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: projectAId } }))
+    aDevEnvId = envs.environments.find((e) => e.slug === 'dev')!.id
+    aProdEnvId = envs.environments.find((e) => e.slug === 'prod')!.id
+
+    const db = getDb()
+    await db.insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    const [scopedRow] = await db.insert(schema.orgMember)
+      .values({ orgId, userId: scoped.user.id, role: 'member' })
+      .returning({ id: schema.orgMember.id })
+    await db.insert(schema.memberAccess).values({ orgMemberId: scopedRow!.id, projectId: projectBId })
+    await db.update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, aProdEnvId))
+  })
+
+  test('a member scoped to another project gets 403 on every environment route', async () => {
+    const sf = authedFetch(scopedToken)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments', { params: { pid: projectAId } }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments/:id', { params: { pid: projectAId, id: aDevEnvId } }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments', {
+      method: 'POST', params: { pid: projectAId }, body: { name: 'Staging', slug: 'staging' },
+    }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments/:id', {
+      method: 'PATCH', params: { pid: projectAId, id: aDevEnvId }, body: { name: 'Renamed' },
+    }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments/:id', {
+      method: 'DELETE', params: { pid: projectAId, id: aDevEnvId },
+    }), 403)
+  })
+
+  test('a member cannot rename or delete an admin-only env, or its project', async () => {
+    const mf = authedFetch(memberToken)
+    assertErrorStatus(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'PATCH', params: { pid: projectAId, id: aProdEnvId }, body: { name: 'Pwned' },
+    }), 403)
+    assertErrorStatus(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'DELETE', params: { pid: projectAId, id: aProdEnvId },
+    }), 403)
+    assertErrorStatus(await mf('/api/v0/projects/:id', { method: 'DELETE', params: { id: projectAId } }), 403)
+    expect(await getDb().query.environment.findFirst({ where: { id: aProdEnvId } })).toBeDefined()
+  })
+
+  test('a member manages the environments they can read', async () => {
+    const mf = authedFetch(memberToken)
+    const created = assertOk(await mf('/api/v0/projects/:pid/environments', {
+      method: 'POST', params: { pid: projectAId }, body: { name: 'QA', slug: 'qa' },
+    }))
+    assertOk(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'PATCH', params: { pid: projectAId, id: created.id }, body: { name: 'QA 2' },
+    }))
+    assertOk(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'DELETE', params: { pid: projectAId, id: created.id },
+    }))
+  })
+
+  test('a removed member loses org access on the next request', async () => {
+    const extra = await createTestUser({ name: 'AuthzRemoved' })
+    await getDb().insert(schema.orgMember).values({ orgId, userId: extra.user.id, role: 'member' })
+    const xf = authedFetch(extra.token)
+    const createProject = (name: string) => xf('/api/v0/projects', { method: 'POST', body: { name, orgId } })
+    assertOk(await createProject('Before removal'))
+    await getDb().delete(schema.orgMember).where(orm.and(
+      orm.eq(schema.orgMember.orgId, orgId),
+      orm.eq(schema.orgMember.userId, extra.user.id),
+    ))
+    assertErrorStatus(await createProject('After removal'), 403)
   })
 })
 

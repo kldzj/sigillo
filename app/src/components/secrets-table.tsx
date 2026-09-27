@@ -12,7 +12,7 @@ import { EmptyState } from "sigillo-app/src/components/ui/empty-state";
 import { useState, useCallback } from "react";
 import { z } from "zod";
 import { parseFormData } from "spiceflow";
-import { cn } from "sigillo-app/src/lib/utils";
+import { cn, renderEnvFile } from "sigillo-app/src/lib/utils";
 import { Button } from "sigillo-app/src/components/ui/button";
 import { Frame } from "sigillo-app/src/components/ui/frame";
 import { Input, Textarea } from "sigillo-app/src/components/ui/input";
@@ -191,9 +191,7 @@ export function SecretsTable({
     ...dirtyMissingKeys.map((name): [string, string] => [name, missingEdits[name]!]),
     ...dirtyNewSecrets.map((secret): [string, string] => [secret.name, secret.value]),
   ];
-  const envFileText = currentEnvEntries
-    .map(([name, value]) => `${name}=${JSON.stringify(value)}`)
-    .join("\n") + "\n";
+  const envFileText = renderEnvFile(currentEnvEntries);
 
   const handleImportText = useCallback(async (text: string) => {
     const parsed = parseEnv(text);

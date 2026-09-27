@@ -6,6 +6,7 @@
 
 import { useState } from "react";
 import { XIcon } from "lucide-react";
+import { AdminOnlyEnvironment } from "sigillo-app/src/components/ui/empty-state";
 import { SecretsTable } from "sigillo-app/src/components/secrets-table";
 import { Button } from "sigillo-app/src/components/ui/button";
 import { FramePanel } from "sigillo-app/src/components/ui/frame";
@@ -106,6 +107,7 @@ export function ProjectPage() {
     projectName,
     environments,
     selectedEnvId,
+    locked,
     secrets,
     showBanner,
   } = useLoaderData('/dash/projects/:projectId/envs/:envSlug');
@@ -150,7 +152,9 @@ export function ProjectPage() {
       {showBanner && <CliBanner />}
 
       {/* Secrets table */}
-      {selectedEnvId ? (
+      {locked ? (
+        <AdminOnlyEnvironment />
+      ) : selectedEnvId ? (
         <SecretsTable allVisible={allVisible} />
       ) : (
         <p className="text-muted-foreground text-sm">No environments yet.</p>
@@ -158,3 +162,4 @@ export function ProjectPage() {
     </div>
   );
 }
+
