@@ -6,12 +6,14 @@ const builtin = @import("builtin");
 const zeke = @import("zeke");
 const config = @import("config.zig");
 const client = @import("client.zig");
+const audit = @import("audit.zig");
 const pty = @import("pty.zig");
 
 test {
     // Pull tests from imported files into `zig build test`.
     _ = config;
     _ = pty;
+    _ = audit;
 }
 
 const color = @import("color.zig");
@@ -391,6 +393,12 @@ const EnvironmentsRename = zeke.cmd("environments rename <id>", "Rename an env b
     .option("--slug [slug]", "Updated env slug");
 
 const EnvironmentsDelete = zeke.cmd("environments delete <id>", "Delete an env by id or slug");
+
+const AuditVerify = zeke.cmd("audit verify", "Check an env's secret changes and reads against their hash chains (org admins)")
+    .option("-p, --project [id]", "Project ID or name override")
+    .option("--env [slug]", "Env slug override (e.g. dev, prod)")
+    .option("-c, --config [slug]", "Env slug override")
+    .example("sigillo audit verify -c prod");
 
 // The real self-host implementation is TypeScript-only and lives in the npm
 // package (cli/src/selfhost/); bin.ts intercepts `self-host` before exec'ing
@@ -1895,6 +1903,87 @@ fn secretsAction(_: Secrets.Args, opts: Secrets.Options, global: Global.Options)
             try stdout.writeAll("\n");
         }
     }
+}
+
+fn auditVerifyAction(_: AuditVerify.Args, opts: AuditVerify.Options, global: Global.Options) !void {
+    const stderr = getStderr();
+    const stdout = getStdout();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cwd = try config.getCwd(allocator);
+    const ctx = try requireEnvironmentContext(allocator, stderr, cwd, .{
+        .token = global.token,
+        .api_url = global.api_url,
+        .project = opts.project,
+        .environment = envOverride(opts.env, opts.config),
+    });
+
+    const res = try client.parseJsonResult(audit.AuditResponse, .{
+        .allocator = allocator,
+        .method = .GET,
+        .base_url = ctx.api.api_url,
+        .path = try std.fmt.allocPrint(allocator, "/api/v0/projects/{s}/environments/{s}/audit", .{ ctx.project_id, ctx.environment_id }),
+        .token = ctx.api.token,
+    });
+    const chains = res.value orelse {
+        const message = client.parseError(allocator, res.body) orelse try allocator.dupe(u8, "unknown error");
+        try color.err(stderr, "error");
+        try stderr.print(": failed to get the audit chains ({d}): {s}\n", .{ res.status, message });
+        std.process.exit(1);
+    };
+
+    const key = try audit.witnessKey(allocator, ctx.api.api_url, chains.environmentId);
+    const witness = try audit.readWitness(allocator, key);
+    if (witness) |seen| {
+        if (!std.mem.eql(u8, seen.public_key, chains.publicKey)) {
+            try color.err(stderr, "✘");
+            try stderr.print(" the server's signing key changed since you last verified this env\n", .{});
+            try color.dim(stderr, "  It comes from BETTER_AUTH_SECRET. If that was changed on purpose, remove this env from ~/.sigillo/audit.json.\n");
+            std.process.exit(1);
+        }
+    }
+
+    var intact = true;
+    const Chain = struct { label: []const u8, rows: []const audit.ChainRow, seen: ?audit.Head };
+    const both = [_]Chain{
+        .{ .label = "changes", .rows = chains.events.rows, .seen = if (witness) |w| w.events else null },
+        .{ .label = "reads", .rows = chains.reads.rows, .seen = if (witness) |w| w.reads else null },
+    };
+    var heads: [2]?audit.Head = .{ null, null };
+    for (both, 0..) |chain, i| {
+        const problem = switch (try audit.verifyChain(allocator, chains.publicKey, chain.rows)) {
+            .ok => |head| blk: {
+                heads[i] = head;
+                break :blk try audit.compareWithWitness(allocator, chain.seen, chain.rows);
+            },
+            .problem => |problem| problem,
+        };
+        if (problem) |message| {
+            intact = false;
+            try color.err(stdout, "✘");
+            try stdout.print(" {s}: {s}\n", .{ chain.label, message });
+        } else {
+            try color.green(stdout, "✔");
+            try stdout.print(" {s}: {d} rows, intact\n", .{ chain.label, chain.rows.len });
+        }
+    }
+    if (chains.events.outside > 0) {
+        intact = false;
+        try color.err(stdout, "✘");
+        try stdout.print(" changes: {d} rows were added outside the chain\n", .{chains.events.outside});
+    }
+    if (!intact) std.process.exit(1);
+
+    try audit.writeWitness(allocator, key, .{
+        .public_key = chains.publicKey,
+        .events = heads[0],
+        .reads = heads[1],
+        .verified_at = std.time.milliTimestamp(),
+    });
+    if (witness == null) try color.dim(stdout, "First check of this env: its signing key and heads are saved in ~/.sigillo/audit.json.\n");
 }
 
 fn secretsGetAction(args: SecretsGet.Args, opts: SecretsGet.Options, global: Global.Options) !void {
@@ -3949,6 +4038,7 @@ pub fn main() !void {
         EnvironmentsGet.bindWith(Global, environmentsGetAction),
         EnvironmentsRename.bindWith(Global, environmentsRenameAction),
         EnvironmentsDelete.bindWith(Global, environmentsDeleteAction),
+        AuditVerify.bindWith(Global, auditVerifyAction),
         SelfHost.bindWith(Global, selfHostAction),
     }, Global).init(allocator, "sigillo");
 

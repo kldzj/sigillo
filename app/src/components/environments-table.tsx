@@ -21,7 +21,7 @@ import { Button } from "sigillo-app/src/components/ui/button";
 import { Frame } from "sigillo-app/src/components/ui/frame";
 import { Input } from "sigillo-app/src/components/ui/input";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
-import { createEnvAction, deleteEnvAction, renameEnvAction, updateEnvironmentAccessRoleAction } from "../actions.ts";
+import { createEnvAction, deleteEnvAction, renameEnvAction, updateEnvironmentAccessRoleAction, updateEnvironmentProtectionAction } from "../actions.ts";
 import { NativeSelect } from "sigillo-app/src/components/ui/native-select";
 import {
   Table,
@@ -37,6 +37,7 @@ type Environment = {
   name: string;
   slug: string;
   accessRole: string;
+  protected: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -193,6 +194,35 @@ export function EnvironmentsTable() {
         >
           <option value="member">Member</option>
           <option value="admin">Admin</option>
+        </NativeSelect>
+      ),
+    },
+    {
+      // Protected environments record every read of their values (Read Log tab)
+      accessorKey: "protected",
+      header: "Protected",
+      size: 120,
+      cell: ({ row }) => (
+        <NativeSelect
+          value={row.original.protected ? 'on' : 'off'}
+          onChange={async (e) => {
+            const select = e.currentTarget
+            const protect = select.value === 'on'
+            if (protect === row.original.protected) return
+            if (!protect && !confirm(`Stop recording reads of ${row.original.name}?`)) {
+              select.value = 'on'
+              return
+            }
+            try {
+              await updateEnvironmentProtectionAction({ environmentId: row.original.id, protect })
+            } catch (err: any) {
+              select.value = row.original.protected ? 'on' : 'off'
+              alert(err?.message || 'Failed to update protection')
+            }
+          }}
+        >
+          <option value="off">Off</option>
+          <option value="on">On</option>
         </NativeSelect>
       ),
     },

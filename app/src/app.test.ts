@@ -18,6 +18,7 @@ import { app } from './app.js'
 import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey } from './audit.js'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
@@ -491,12 +492,9 @@ describe('secrets — download formats', () => {
       },
     }))
     // Legacy rows written before validation must still be sanitized on output.
-    const db = getDb()
-    const legacy = await encrypt('ok')
-    const injected = await encrypt('x')
-    await db.insert(schema.secretEvent).values([
-      { environmentId: previewEnvId, name: 'legacy-name', operation: 'set', valueEncrypted: legacy.encrypted, iv: legacy.iv },
-      { environmentId: previewEnvId, name: 'A\nEVIL', operation: 'set', valueEncrypted: injected.encrypted, iv: injected.iv },
+    await appendSecretEvents([
+      { environmentId: previewEnvId, name: 'legacy-name', operation: 'set', value: 'ok', userId: null, apiTokenId: null },
+      { environmentId: previewEnvId, name: 'A\nEVIL', operation: 'set', value: 'x', userId: null, apiTokenId: null },
     ])
 
     const download = async (format: string) => {
@@ -685,10 +683,9 @@ describe('api tokens', () => {
 
     // Same for a deleted user (user_id was also ON DELETE CASCADE).
     const author = await createTestUser({ name: 'DeletedAuthor' })
-    const enc = await encrypt('written-by-deleted-user')
-    await getDb().insert(schema.secretEvent).values({
-      environmentId: devEnvId, name: 'USER_ONLY', operation: 'set', valueEncrypted: enc.encrypted, iv: enc.iv, userId: author.user.id,
-    })
+    await appendSecretEvents([{
+      environmentId: devEnvId, name: 'USER_ONLY', operation: 'set', value: 'written-by-deleted-user', userId: author.user.id, apiTokenId: null,
+    }])
 
     await getDb().delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
     await getDb().delete(schema.user).where(orm.eq(schema.user.id, author.user.id))
@@ -1167,9 +1164,8 @@ describe('secrets derivation — batching & multi-author', () => {
     const db = getDb()
     // Delete DEV_ONLY in dev — it should vanish from dev secrets, and since it
     // existed only in dev, it should vanish from the cross-env name union too.
-    await db.insert(schema.secretEvent).values({
-      environmentId: devEnvId, name: 'DEV_ONLY', operation: 'delete', userId: authorAId,
-    })
+    // Through the chain, which first takes in the rows from before it
+    await appendSecretEvents([{ environmentId: devEnvId, name: 'DEV_ONLY', operation: 'delete', userId: authorAId, apiTokenId: null }])
 
     const { secrets, allNames } = await deriveEnvironmentSecretsAndNames({
       environmentIds: [devEnvId, prodEnvId],
@@ -2171,5 +2167,203 @@ describe('describeUserAgent', () => {
       'curl/8.15.0',
       'Unknown device',
     ])
+  })
+})
+
+describe('tamper-evident history', () => {
+  let admin: Awaited<ReturnType<typeof createTestUser>>
+  let member: Awaited<ReturnType<typeof createTestUser>>
+  let projectId: string
+  let orgId: string
+
+  beforeAll(async () => {
+    admin = await createTestUser({ name: 'Chain Admin' })
+    member = await createTestUser({ name: 'Chain Member' })
+    const af = authedFetch(admin.token)
+    const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Chain Org' } }))
+    orgId = org.id
+    projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Chain Project', orgId } })).id
+    await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+  })
+
+  // A fresh environment per test, so each chain starts at 1
+  const newEnv = async () => {
+    const slug = `env-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    return assertOk(await authedFetch(admin.token)('/api/v0/projects/:projectId/environments', {
+      method: 'POST', params: { projectId }, body: { name: slug, slug },
+    })).id
+  }
+  const setSecret = (token: string, envId: string, name: string, value: string, headers: Record<string, string> = {}) =>
+    app.handle(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${envId}/secrets`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ name, value }),
+    }))
+  const get = (token: string, path: string, headers: Record<string, string> = {}) =>
+    app.handle(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${path}`, { headers: { authorization: `Bearer ${token}`, ...headers } }))
+  const verify = async (envId: string) => {
+    const res = await get(admin.token, `${envId}/audit`)
+    expect(res.status).toBe(200)
+    const chains = await res.json() as Awaited<ReturnType<typeof getAuditChains>>
+    return {
+      events: await verifyChain(chains.publicKey, chains.events.rows),
+      reads: await verifyChain(chains.publicKey, chains.reads.rows),
+      outside: chains.events.outside,
+      chains,
+    }
+  }
+  const eventRow = async (envId: string, seq: number) =>
+    (await getDb().query.secretEvent.findFirst({ where: { environmentId: envId, seq } }))!
+  const readKinds = async (envId: string) =>
+    (await getDb().query.secretRead.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } })).map((row) => row.kind)
+
+  test('every secret change is a signed row of its environment\'s chain, also after its author is deleted', async () => {
+    const envId = await newEnv()
+    const author = await createTestUser({ name: 'Leaving Author' })
+    await getDb().insert(schema.orgMember).values({ orgId, userId: author.user.id, role: 'admin' })
+    expect((await setSecret(author.token, envId, 'A', '1')).status).toBe(200)
+    const { key } = await insertApiToken({ name: 'chain-writer', projectId, createdBy: admin.user.id })
+    assertOk(await authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets', { method: 'PUT', params: { pid: projectId, eid: envId }, body: { secrets: { B: '2', C: '3' } } }))
+    assertOk(await authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets/:name', { method: 'DELETE', params: { pid: projectId, eid: envId, name: 'A' } }))
+    await getDb().delete(schema.user).where(orm.eq(schema.user.id, author.user.id))
+    const result = await verify(envId)
+    expect({ events: result.events, rows: result.chains.events.rows.map((row) => row.seq), outside: result.outside })
+      .toEqual({ events: { ok: true, head: { seq: 4, hash: result.chains.events.rows[3]!.hash } }, rows: [1, 2, 3, 4], outside: 0 })
+    expect(result.chains.publicKey).toBe(await getAuditPublicKey())
+  })
+
+  test('an edited row breaks the chain at that row', async () => {
+    const envId = await newEnv()
+    for (const [name, value] of [['X', '1'], ['X', '2'], ['Y', '3']] as const) await setSecret(admin.token, envId, name, value)
+    await getDb().update(schema.secretEvent).set({ name: 'Z' }).where(orm.eq(schema.secretEvent.id, (await eventRow(envId, 2)).id))
+    expect((await verify(envId)).events).toEqual({ ok: false, problem: 'row 2 does not match its hash' })
+  })
+
+  test('another row\'s ciphertext swapped in breaks the chain', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'old')
+    await setSecret(admin.token, envId, 'X', 'new')
+    const old = await eventRow(envId, 1)
+    // Rolls X back to its old value without the encryption key
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: old.valueEncrypted, iv: old.iv }).where(orm.eq(schema.secretEvent.id, (await eventRow(envId, 2)).id))
+    expect((await verify(envId)).events).toEqual({ ok: false, problem: 'row 2 does not match its hash' })
+  })
+
+  test('a deleted row shows as missing', async () => {
+    const envId = await newEnv()
+    for (const name of ['X', 'Y', 'Z']) await setSecret(admin.token, envId, name, 'v')
+    await getDb().delete(schema.secretEvent).where(orm.eq(schema.secretEvent.id, (await eventRow(envId, 2)).id))
+    expect((await verify(envId)).events).toEqual({ ok: false, problem: 'row 2 is missing' })
+  })
+
+  test('a forged row fails its signature even with the right hash', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'v')
+    const first = await eventRow(envId, 1)
+    const encrypted = await encrypt('forged')
+    await getDb().insert(schema.secretEvent).values({
+      environmentId: envId, name: 'X', operation: 'set', valueEncrypted: encrypted.encrypted, iv: encrypted.iv,
+      userId: admin.user.id, actor: `user:${admin.user.id}`, seq: 2, hash: 'x', signature: first.signature,
+    })
+    // Whoever forges it can compute the hash, not the signature
+    const forged = (await getAuditChains(envId)).events.rows[1]!
+    const { chainHash } = await import('./audit.js')
+    await getDb().update(schema.secretEvent).set({ hash: await chainHash(first.hash!, forged.preimage) }).where(orm.and(orm.eq(schema.secretEvent.environmentId, envId), orm.eq(schema.secretEvent.seq, 2)))
+    expect((await verify(envId)).events).toEqual({ ok: false, problem: 'row 2 has an invalid signature' })
+  })
+
+  test('a row added around the chain is counted and ignored', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'real')
+    const encrypted = await encrypt('planted')
+    await getDb().insert(schema.secretEvent).values({ environmentId: envId, name: 'X', operation: 'set', valueEncrypted: encrypted.encrypted, iv: encrypted.iv })
+    const derived = await deriveSecrets(envId)
+    const result = await verify(envId)
+    expect({ ok: result.events.ok, outside: result.outside, value: await decrypt(derived[0]!.valueEncrypted, derived[0]!.iv) })
+      .toEqual({ ok: true, outside: 1, value: 'real' })
+  })
+
+  test('rows from before the chain join it in their order', async () => {
+    const envId = await newEnv()
+    const values = await Promise.all(['1', '2'].map((value) => encrypt(value)))
+    await getDb().insert(schema.secretEvent).values(values.map((value, i) => ({
+      environmentId: envId, name: 'OLD', operation: 'set' as const, valueEncrypted: value.encrypted, iv: value.iv, createdAt: 1000 + i,
+    })))
+    await setSecret(admin.token, envId, 'NEW', '3')
+    const result = await verify(envId)
+    const derived = await deriveSecrets(envId)
+    expect({
+      events: result.events.ok, rows: result.chains.events.rows.length, outside: result.outside,
+      old: await decrypt(derived.find((d) => d.name === 'OLD')!.valueEncrypted, derived.find((d) => d.name === 'OLD')!.iv),
+    }).toEqual({ events: true, rows: 3, outside: 0, old: '2' })
+  })
+
+  test('racing writes take turns instead of forking the chain', async () => {
+    const envId = await newEnv()
+    const statuses = await Promise.all(Array.from({ length: 12 }, (_, i) => setSecret(admin.token, envId, `RACE_${i}`, String(i)).then((res) => res.status)))
+    const result = await verify(envId)
+    expect({ statuses: [...new Set(statuses)], ok: result.events.ok, rows: result.chains.events.rows.map((row) => row.seq) })
+      .toEqual({ statuses: [200], ok: true, rows: Array.from({ length: 12 }, (_, i) => i + 1) })
+  })
+
+  test('reads of an unprotected environment are not recorded', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'v')
+    expect((await get(admin.token, `${envId}/secrets/X`)).status).toBe(200)
+    expect(await readKinds(envId)).toEqual([])
+  })
+
+  test('each read of a protected environment is recorded, with who, what and the IP', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'v')
+    await setSecret(admin.token, envId, 'Y', 'w')
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    const { key, tokenId } = await insertApiToken({ name: 'reader', projectId, createdBy: admin.user.id })
+    const ip = { 'cf-connecting-ip': '203.0.113.9' }
+    expect((await get(key, `${envId}/secrets/X`, ip)).status).toBe(200)
+    expect((await get(key, `${envId}/secrets/download?format=json`, ip)).status).toBe(200)
+    expect((await get(admin.token, `${envId}/secrets`)).status).toBe(200)
+    const rows = await getDb().query.secretRead.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } })
+    expect(rows.map(({ kind, names, actor, ipAddress }) => ({ kind, names, actor, ipAddress }))).toEqual([
+      { kind: 'protected', names: [], actor: `user:${admin.user.id}`, ipAddress: null },
+      { kind: 'value', names: ['X'], actor: `token:${tokenId}`, ipAddress: '203.0.113.9' },
+      { kind: 'download', names: ['X', 'Y'], actor: `token:${tokenId}`, ipAddress: '203.0.113.9' },
+      { kind: 'list', names: ['X', 'Y'], actor: `user:${admin.user.id}`, ipAddress: null },
+    ])
+    expect((await verify(envId)).reads).toEqual({ ok: true, head: { seq: 4, hash: rows[3]!.hash } })
+  })
+
+  test('a read that can\'t be recorded fails instead of returning values', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'do-not-leak')
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    await getDb().run(orm.sql.raw(`CREATE TRIGGER refuse_reads BEFORE INSERT ON secret_read BEGIN SELECT RAISE(ABORT, 'read log unavailable'); END`))
+    try {
+      const res = await get(admin.token, `${envId}/secrets/X`)
+      expect({ status: res.status, leaked: (await res.text()).includes('do-not-leak') }).toEqual({ status: 500, leaked: false })
+    } finally {
+      await getDb().run(orm.sql.raw('DROP TRIGGER refuse_reads'))
+    }
+  })
+
+  test('turning protection off is recorded, and reads after it are not', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'v')
+    const author = { userId: admin.user.id, apiTokenId: null }
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author })
+    await get(admin.token, `${envId}/secrets/X`)
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: false, author })
+    await get(admin.token, `${envId}/secrets/X`)
+    expect(await readKinds(envId)).toEqual(['protected', 'value', 'unprotected'])
+  })
+
+  test('only org admins with a login get the audit chains', async () => {
+    const envId = await newEnv()
+    const { key } = await insertApiToken({ name: 'auditor', projectId, createdBy: admin.user.id })
+    expect({
+      member: (await get(member.token, `${envId}/audit`)).status,
+      token: (await get(key, `${envId}/audit`)).status,
+      admin: (await get(admin.token, `${envId}/audit`)).status,
+    }).toEqual({ member: 403, token: 403, admin: 200 })
   })
 })

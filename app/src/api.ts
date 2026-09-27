@@ -27,7 +27,6 @@ import {
   resolveEnvironment,
   deriveSecrets,
   deriveEnvironmentSecretsAndNames,
-  encrypt,
   decrypt,
   getMemberProjectAccess,
   getAccessibleProjectIds,
@@ -37,6 +36,7 @@ import {
   ForbiddenError,
   getClaimableAutoJoinDomain,
 } from './db.ts'
+import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
 import { memoize } from './lib/memoize.ts'
 import { SECRET_NAME_REGEX, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
 
@@ -234,6 +234,20 @@ const bulkSecretsResponseSchema = z.object({
   ok: z.literal(true),
   environmentId: z.string(),
   secrets: z.array(z.string()),
+})
+
+const auditChainRowSchema = z.object({
+  seq: z.number(),
+  hash: z.string(),
+  signature: z.string(),
+  preimage: z.string(),
+})
+
+const auditResponseSchema = z.object({
+  environmentId: z.string(),
+  publicKey: z.string(),
+  events: z.object({ rows: z.array(auditChainRowSchema), outside: z.number() }),
+  reads: z.object({ rows: z.array(auditChainRowSchema) }),
 })
 
 const secretNameSchema = z.string().regex(SECRET_NAME_REGEX, 'Secret names must use letters, digits and underscores, not starting with a digit')
@@ -762,6 +776,8 @@ export const apiApp = new Spiceflow()
         selectedEnvId: auth.environmentId,
       })
 
+      // Whether each value is empty tells something about it too
+      await recordSecretRead({ request, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'list', names: derived.map((d) => d.name) })
       // Decrypt each value to check if it's empty
       const secrets = await Promise.all(derived.map(async (d) => {
         const value = await decrypt(d.valueEncrypted, d.iv)
@@ -784,13 +800,10 @@ export const apiApp = new Spiceflow()
     async handler({ request, params }) {
       const body = await request.json()
       const auth = await requireSecretsApiAuth({ request, environmentRef: params.environmentId, projectId: params.projectId })
-      const db = getDb()
-      const { encrypted, iv } = await encrypt(body.value)
-      const [row] = await db.insert(schema.secretEvent).values({
-        environmentId: auth.environmentId, name: body.name,
-        operation: 'set', valueEncrypted: encrypted, iv,
+      const [row] = await appendSecretEvents([{
+        environmentId: auth.environmentId, name: body.name, operation: 'set', value: body.value,
         userId: auth.userId, apiTokenId: auth.apiTokenId,
-      }).returning({ id: schema.secretEvent.id, name: schema.secretEvent.name })
+      }])
       return { ok: true, environmentId: auth.environmentId, id: row!.id, name: row!.name }
     },
   })
@@ -805,6 +818,7 @@ export const apiApp = new Spiceflow()
       const derived = await deriveSecrets(auth.environmentId)
       const secret = derived.find((d) => d.name === params.name)
       if (!secret) return json({ error: 'not found' }, { status: 404 })
+      await recordSecretRead({ request, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'value', names: [secret.name] })
       const value = await decrypt(secret.valueEncrypted, secret.iv)
       return { id: secret.id, name: secret.name, value, environmentId: auth.environmentId, createdAt: secret.createdAt, updatedAt: secret.updatedAt }
     },
@@ -817,11 +831,10 @@ export const apiApp = new Spiceflow()
     response: secretDeleteResponseSchema,
     async handler({ params, request }) {
       const auth = await requireSecretsApiAuth({ request, environmentRef: params.environmentId, projectId: params.projectId })
-      const db = getDb()
-      await db.insert(schema.secretEvent).values({
-        environmentId: auth.environmentId, name: params.name,
-        operation: 'delete', userId: auth.userId, apiTokenId: auth.apiTokenId,
-      })
+      await appendSecretEvents([{
+        environmentId: auth.environmentId, name: params.name, operation: 'delete',
+        userId: auth.userId, apiTokenId: auth.apiTokenId,
+      }])
       return { ok: true, name: params.name }
     },
   })
@@ -841,6 +854,7 @@ export const apiApp = new Spiceflow()
       const format = query.format || 'json'
 
       const derived = await deriveSecrets(auth.environmentId)
+      await recordSecretRead({ request, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'download', names: derived.map((d) => d.name) })
       const entries: Record<string, string> = {}
       for (const d of derived) {
         entries[d.name] = await decrypt(d.valueEncrypted, d.iv)
@@ -865,19 +879,30 @@ export const apiApp = new Spiceflow()
     async handler({ request, params }) {
       const body = await request.json()
       const auth = await requireSecretsApiAuth({ request, environmentRef: params.environmentId, projectId: params.projectId })
-      const db = getDb()
-
       const entries = Object.entries(body.secrets)
-      const encrypted = await Promise.all(entries.map(([, value]) => encrypt(value)))
-      const [firstInsert, ...restInserts] = entries.map(([name], i) =>
-        db.insert(schema.secretEvent).values({
-          environmentId: auth.environmentId, name,
-          operation: 'set', valueEncrypted: encrypted[i]!.encrypted, iv: encrypted[i]!.iv,
-          userId: auth.userId, apiTokenId: auth.apiTokenId,
-        }),
-      )
-      if (firstInsert) await db.batch([firstInsert, ...restInserts])
+      await appendSecretEvents(entries.map(([name, value]) => ({
+        environmentId: auth.environmentId, name, operation: 'set', value,
+        userId: auth.userId, apiTokenId: auth.apiTokenId,
+      })))
       return { ok: true, environmentId: auth.environmentId, secrets: entries.map(([name]) => name) }
+    },
+  })
+
+  // ── Audit ────────────────────────────────────────────────────────
+  // Both hash chains of an environment, for `sigillo audit verify` (see
+  // audit.ts). Org admins only: the read log shows who read what.
+  .route({
+    method: 'GET',
+    path: '/api/v0/projects/:projectId/environments/:environmentId/audit',
+    detail: { tags: ['Audit'], summary: 'Get the audit chains' },
+    response: auditResponseSchema,
+    async handler({ params, request }) {
+      const auth = await requireSecretsApiAuth({ request, environmentRef: params.environmentId, projectId: params.projectId })
+      if (!auth.userId) throw json({ error: 'the audit chains need an admin login, not an API token' }, { status: 403 })
+      const orgId = await getOrgIdForEnvironment(auth.environmentId)
+      const member = await requireApiOrgMember(auth.userId, orgId!)
+      if (member.role !== 'admin') throw json({ error: 'only org admins can read the audit chains' }, { status: 403 })
+      return { environmentId: auth.environmentId, ...await getAuditChains(auth.environmentId) }
     },
   })
 

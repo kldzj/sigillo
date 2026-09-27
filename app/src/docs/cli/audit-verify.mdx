@@ -1,26 +1,22 @@
 ---
 $schema: https://holocron.so/frontmatter.json
-title: "run"
-description: "Run a command with secrets injected"
-icon: lucide:play
+title: "audit verify"
+description: "Check an env's secret changes and reads against their hash chains (org admins)"
+icon: lucide:terminal
 ---
 
-Run a command with secrets injected
+Check an env's secret changes and reads against their hash chains (org admins)
 
 ## Usage
 
 ```sh
-sigillo run <...cmd>
+sigillo audit verify
 ```
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
-| `--command [cmd]` | Run a shell command string |
-| `--mount [path]` | Write secrets to a new owner-only file (must not exist), deleted when the command exits |
-| `--mount-format [fmt]` | Format for mounted file: env, env-no-quotes, json, yaml, docker, dotnet-json (default: env) |
-| `--disable-redaction` | Print child output without secret redaction |
 | `-p, --project [id]` | Project ID or name override |
 | `--env [slug]` | Env slug override (e.g. dev, prod) |
 | `-c, --config [slug]` | Env slug override |

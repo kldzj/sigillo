@@ -64,6 +64,17 @@ ENCRYPTION_KEY=<output of openssl rand -base64 32>
 
 The value must be valid base64 — `atob()` is used to decode it at runtime. If `ENCRYPTION_KEY` is omitted, the app hashes `BETTER_AUTH_SECRET` with SHA-256 and uses that 32-byte digest as the AES key.
 
+## Tamper-evident history (fork)
+
+`app/src/audit.ts` keeps two hash chains per environment: its `secret_event` rows and its `secret_read` rows (reads of a **protected** environment). Each row has `seq` (1, 2, 3...), `hash` = SHA-256 of the previous hash (hex) and the row's preimage, and `signature` = the Worker's Ed25519 signature of the hash. The signing key and the value digest key come from `BETTER_AUTH_SECRET` via HKDF. `GET /api/v0/projects/:projectId/environments/:environmentId/audit` (org admins, session only) returns every row with its preimage rebuilt from D1, and `sigillo audit verify` (`cli/zig/src/audit.zig`) checks it and keeps the last heads in `~/.sigillo/audit.json`.
+
+Rules:
+- **Only `appendSecretEvents()` writes `secret_event`.** A row inserted any other way has no `seq`, so once the environment has a chain the replay ignores it and verify reports it. Tests that need old-style rows insert them before the environment's first chained write; those join the chain in order.
+- **Never change a preimage's fields or their order.** Rows are verified by rebuilding their preimage, so any change breaks every existing row. A new field needs a new preimage version.
+- A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it.
+- Every route that returns secret values calls `recordSecretRead()` **before** the values leave, and must let it throw: a read that can't be recorded fails.
+- Changing `BETTER_AUTH_SECRET` changes the signing key. Old rows then no longer verify, and `sigillo audit verify` reports the new key.
+
 ## Auth flow
 
 1. Self-hosted app calls `POST /api/setup` on first deploy → registers with provider via dynamic client registration

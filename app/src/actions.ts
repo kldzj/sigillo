@@ -13,7 +13,6 @@
 import { ulid } from 'ulid'
 import { getSecretNameError, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
 import * as orm from 'drizzle-orm'
-import type { BatchItem } from 'drizzle-orm/batch'
 import { schema } from 'db'
 import { getActionRequest, redirect } from 'spiceflow'
 import { router } from 'spiceflow/react'
@@ -21,7 +20,7 @@ import {
   getDb, getSession,
   requireOrgMember,
   getOrgIdForProject, getOrgIdForEnvironment,
-  encrypt,
+  decrypt,
   generateApiToken,
   deriveSecrets,
   getMemberProjectAccess,
@@ -33,6 +32,7 @@ import {
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, type NewSecretEvent } from './audit.ts'
 
 async function requireSession() {
   const request = getActionRequest()
@@ -127,14 +127,9 @@ export async function deleteSecretAction({ name, environmentIds }: {
   if (envs.some((env) => env.projectId !== envs[0]!.projectId)) {
     throw new Error('All environments must belong to the same project')
   }
-  const db = getDb()
-  const queries: BatchItem<'sqlite'>[] = unique.map((envId) =>
-    db.insert(schema.secretEvent).values({
-      environmentId: envId, name, operation: 'delete', userId: session.userId,
-    }),
-  )
-  const [first, ...rest] = queries
-  if (first) await db.batch([first, ...rest])
+  await appendSecretEvents(unique.map((environmentId) => ({
+    environmentId, name, operation: 'delete', userId: session.userId, apiTokenId: null,
+  })))
 }
 
 // Save edited secrets to the current environment and optionally apply
@@ -166,51 +161,25 @@ export async function saveSecretsAction({ edits, environmentIds }: {
     }
   }
 
-  const db = getDb()
-
-  // Encrypt all values upfront so we can batch all inserts in one RPC
-  const editsWithEncrypted = await Promise.all(
-    edits.map(async (edit) => ({
-      ...edit,
-      enc: await encrypt(edit.value),
-    })),
-  )
-
-  // Build all insert statements for the current environment
-  const queries: BatchItem<'sqlite'>[] = []
-
-  for (const edit of editsWithEncrypted) {
+  const author = { userId: session.userId, apiTokenId: null }
+  const events: NewSecretEvent[] = []
+  for (const edit of edits) {
     const originalName = edit.originalName
-    const isRename = !!originalName && edit.name !== originalName
-    if (isRename) {
-      queries.push(db.insert(schema.secretEvent).values({
-        environmentId: currentEnvId, name: originalName,
-        operation: 'delete', userId: session.userId,
-      }))
+    if (originalName && edit.name !== originalName) {
+      events.push({ environmentId: currentEnvId, name: originalName, operation: 'delete', ...author })
     }
-    queries.push(db.insert(schema.secretEvent).values({
-      environmentId: currentEnvId, name: edit.name,
-      operation: 'set', valueEncrypted: edit.enc!.encrypted, iv: edit.enc!.iv,
-      userId: session.userId,
-    }))
+    events.push({ environmentId: currentEnvId, name: edit.name, operation: 'set', value: edit.value, ...author })
   }
 
   // Apply value changes to other environments
   const otherEnvIds = Array.from(new Set(environmentIds.slice(1))).filter((id) => id !== currentEnvId)
-  for (const envId of otherEnvIds) {
-    for (const edit of editsWithEncrypted) {
-      queries.push(db.insert(schema.secretEvent).values({
-        environmentId: envId, name: edit.name,
-        operation: 'set', valueEncrypted: edit.enc!.encrypted, iv: edit.enc!.iv,
-        userId: session.userId,
-      }))
+  for (const environmentId of otherEnvIds) {
+    for (const edit of edits) {
+      events.push({ environmentId, name: edit.name, operation: 'set', value: edit.value, ...author })
     }
   }
 
-  const [firstQuery, ...restQueries] = queries
-  if (firstQuery) {
-    await db.batch([firstQuery, ...restQueries])
-  }
+  await appendSecretEvents(events)
 }
 
 export async function deleteEnvAction({ id }: { id: string }) {
@@ -475,21 +444,13 @@ export async function syncMissingSecretsAction({
 
   if (toSync.length === 0) return { count: 0 }
 
-  const db = getDb()
-  const queries: BatchItem<'sqlite'>[] = toSync.map((s) =>
-    db.insert(schema.secretEvent).values({
-      environmentId: targetEnvironmentId,
-      name: s.name,
-      operation: 'set',
-      valueEncrypted: s.valueEncrypted,
-      iv: s.iv,
-      userId: session.userId,
-    }),
-  )
-
-  const [firstQuery, ...restQueries] = queries
-  if (!firstQuery) return { count: 0 }
-  await db.batch([firstQuery, ...restQueries])
+  const author = { userId: session.userId, apiTokenId: null }
+  // Copying values out of a protected environment is a read of them
+  await recordSecretRead({ request: getActionRequest(), environment: source, author, kind: 'copy', names: toSync.map((s) => s.name) })
+  const values = await Promise.all(toSync.map((s) => decrypt(s.valueEncrypted, s.iv)))
+  await appendSecretEvents(toSync.map((s, i) => ({
+    environmentId: targetEnvironmentId, name: s.name, operation: 'set', value: values[i]!, ...author,
+  })))
   return { count: toSync.length }
 }
 
@@ -597,6 +558,20 @@ export async function updateEnvironmentAccessRoleAction({ environmentId, accessR
     .where(orm.eq(schema.environment.id, environmentId))
     .limit(1)
   return { ok: true, environmentId, accessRole }
+}
+
+export async function updateEnvironmentProtectionAction({ environmentId, protect }: {
+  environmentId: string
+  protect: boolean
+}) {
+  const session = await requireSession()
+  const orgId = await getOrgIdForEnvironment(environmentId)
+  if (!orgId) throw new Error('Environment not found')
+  await requireAdminRole(session.userId, orgId)
+  await setEnvironmentProtection({
+    request: getActionRequest(), environmentId, protect, author: { userId: session.userId, apiTokenId: null },
+  })
+  return { ok: true, environmentId, protect }
 }
 
 export async function deleteOrgAction({ orgId }: { orgId: string }) {
