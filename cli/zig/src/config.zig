@@ -203,7 +203,9 @@ pub fn clearScope(allocator: std.mem.Allocator, scope_input: []const u8) !void {
     try writeConfig(allocator, &config);
 }
 
-pub const default_api_url = "https://sigillo.dev";
+// Older versions saved tokens without their api url, and those tokens
+// were issued by sigillo.dev. There is no default server anymore.
+const legacy_token_api_url = "https://sigillo.dev";
 
 // Longest-scope-wins accumulator. A saved token remembers the api_url of the
 // record it came from so it is only ever sent to the server that issued it.
@@ -263,7 +265,7 @@ fn sameApiUrl(a: []const u8, b: []const u8) bool {
 fn applyOverrides(scoped: ScopeResolution, overrides: Overrides) Resolved {
     var result = scoped.result;
     const saved_token = result.token;
-    const saved_token_api_url = scoped.token_api_url orelse default_api_url;
+    const saved_token_api_url = scoped.token_api_url orelse legacy_token_api_url;
 
     if (overrides.env.token) |value| result.token = value;
     if (overrides.env.api_url) |value| result.api_url = value;
@@ -281,10 +283,11 @@ fn applyOverrides(scoped: ScopeResolution, overrides: Overrides) Resolved {
     }
     if (overrides.flags.environment) |value| result.environment = value;
 
-    if (result.api_url == null) result.api_url = default_api_url;
+    // No api url: commands stop and ask for `sigillo login --api-url`
+    const api_url = result.api_url orelse return .{ .config = result };
 
     const token_is_saved = saved_token != null and overrides.env.token == null and overrides.flags.token == null;
-    if (token_is_saved and !sameApiUrl(result.api_url.?, saved_token_api_url)) {
+    if (token_is_saved and !sameApiUrl(api_url, saved_token_api_url)) {
         result.token = null;
         return .{ .config = result, .withheld_token_api_url = saved_token_api_url };
     }
@@ -525,13 +528,19 @@ test "saved token is only sent to the api url it was saved with" {
     const explicit = applyOverrides(scoped, .{ .env = .{ .api_url = "https://other.example", .token = "explicit" } });
     try std.testing.expectEqualStrings("explicit", explicit.config.token.?);
 
-    // Token saved without api-url is bound to the default server.
+    // A token saved without api-url came from sigillo.dev, so only goes there.
     var legacy_file: ConfigFile = .{};
     try legacy_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .token = "legacy" } });
     var legacy: ScopeResolution = .{};
     legacy.apply(&legacy_file, "/repo");
     try std.testing.expectEqualStrings("legacy", applyOverrides(legacy, .{}).config.token.?);
     try std.testing.expect(applyOverrides(legacy, .{ .env = .{ .api_url = "http://localhost:5188" } }).config.token == null);
+}
+
+test "there is no default server" {
+    // The fork has no hosted service: without a configured api url nothing
+    // is contacted, and commands ask for `sigillo login --api-url` instead.
+    try std.testing.expect(applyOverrides(.{}, .{}).config.api_url == null);
 }
 
 test "findGitMainWorktree returns null for non-git directory" {
