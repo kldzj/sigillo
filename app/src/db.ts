@@ -12,7 +12,7 @@ import * as orm from 'drizzle-orm'
 import { getDb, schema } from 'db'
 import { betterAuth } from 'better-auth/minimal'
 import { genericOAuth, deviceAuthorization, bearer } from 'better-auth/plugins'
-import { createAuthMiddleware } from 'better-auth/api'
+import { APIError, createAuthMiddleware } from 'better-auth/api'
 import { makeSignature } from 'better-auth/crypto'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 import { redirect } from 'spiceflow'
@@ -248,6 +248,14 @@ export async function getAuth(request: Request) {
     // bearer() below only accepts the signed form, which needs
     // BETTER_AUTH_SECRET, so the device flow hands the CLI that form.
     hooks: {
+      // /sign-in/social also signs in with a raw id_token, and
+      // account.id_token is stored as is, so a D1 reader could replay a recent
+      // one. Signing in only ever goes through the redirect flow.
+      before: createAuthMiddleware(async (ctx) => {
+        if (ctx.path === '/sign-in/social' && ctx.body?.idToken) {
+          throw new APIError('BAD_REQUEST', { message: 'id_token sign-in is disabled', code: 'ID_TOKEN_SIGN_IN_DISABLED' })
+        }
+      }),
       after: createAuthMiddleware(async (ctx) => {
         if (ctx.path !== '/device/token') return
         const issued = ctx.context.returned as { access_token?: unknown } | undefined

@@ -1868,6 +1868,12 @@ describe('session tokens read out of D1', () => {
     })
   })
 
+  test('an id_token copied out of D1 cannot be used to sign in', async () => {
+    // account.id_token is stored as is; /sign-in/social would verify it and sign in
+    const res = await call('/api/auth/sign-in/social', { body: { provider: 'sigillo', idToken: { token: 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln' } } })
+    expect({ status: res.status, body: await res.json() }).toEqual({ status: 400, body: { message: 'id_token sign-in is disabled', code: 'ID_TOKEN_SIGN_IN_DISABLED' } })
+  })
+
   test('the device flow hands the CLI a signed token, and its raw part alone is refused', async () => {
     const { token: approver } = await createTestUser()
     const code = await (await call('/api/auth/device/code', { body: { client_id: 'sigillo-cli' } })).json() as { device_code: string; user_code: string }
