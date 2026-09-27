@@ -32,6 +32,7 @@ pub const OrgMutationResponse = struct {
 };
 pub const OrgCreateRequest = struct {
     name: []const u8,
+    enableAutoJoin: ?bool = null,
 };
 pub const ProjectListResponseProjectsItemEnvironmentsItem = struct {
     id: []const u8,

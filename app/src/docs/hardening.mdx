@@ -43,7 +43,7 @@ Deploy with an API token instead of the browser login, and the file holds no Clo
 CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host
 ```
 
-When you create the token under **My Profile → API Tokens**, set a **TTL** so it stops working on its own, and **Client IP Address Filtering** for the machine you deploy from. A browser login, once saved, stays in the file until you remove its `cloudflare` entry.
+When you create the token under **My Profile → API Tokens**, set a **TTL** so it stops working on its own, and **Client IP Address Filtering** for the machine you deploy from. A browser login you saved before stays in the file, encrypted, and is used again unless you pass a token.
 
 ## 3. Decide who can sign in
 
@@ -65,7 +65,7 @@ Everyone can see and end their own sessions under **user menu → Sessions**: ev
 - **Project access.** On a project's **Access** tab, limit a member to selected projects. Invitations can be limited to projects too.
 - **Admin-only environments.** On the **Environments** tab, set **Min Role** to **Admin** for production. Members then can't open it, and an API token for it works only while its creator is still an admin.
 - **Protected environments.** On the **Environments** tab, set **Protected** to **On**. Every read of its values is recorded before they leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see the reads on the **Read Log** tab. Turning protection off is recorded too.
-- **API tokens.** Anyone who can open a project's environments can create tokens for them. A token belongs to one project, optionally only some of its environments, and expires after 7, 30, 90 or 365 days. The **Tokens** tab shows when each was last used, to the hour. Prefer one token per machine or pipeline, scoped to the environment it needs.
+- **API tokens.** Anyone who can open a project's environments can create tokens for them. A token belongs to one project, optionally only some of its environments, and expires after 7, 30, 90 or 365 days. The **Tokens** tab shows when each was last used, to the hour. Tokens made before expiry existed never expire and show **Never**: replace them. Prefer one token per machine or pipeline, scoped to the environment it needs.
 
 The secrets page never loads values up front: a value reaches the browser when someone reveals, downloads or copies it, and in a protected environment that is what the Read Log shows.
 
@@ -91,7 +91,7 @@ What it can't catch: the signing key comes from `BETTER_AUTH_SECRET`, so someone
 1. On any project's **Access** tab, remove them. That removes them from the organization: every project at once, the API tokens they created there, and their open invitations.
 2. Take their address off the allowlist if it's listed, and remove them from your Google Workspace.
 3. Rotate the secrets they could read. They may have copies. In protected environments, the **Read Log** shows which values they read.
-4. If they could reach the Cloudflare account, or knew the passphrase of `selfhost.json`, remove their account membership, choose a new passphrase (`self-host --change-passphrase`), and rotate the secrets of every environment. `self-host` can't rotate `BETTER_AUTH_SECRET` or `ENCRYPTION_KEY` yet.
+4. If they could reach the Cloudflare account, or knew the passphrase of `selfhost.json`, remove their account membership, choose a new passphrase (`self-host --change-passphrase`), and rotate the secrets of every environment. A new passphrase doesn't lock them out of a copy of the file they already have, so the secrets have to change. `self-host` can't rotate `BETTER_AUTH_SECRET` or `ENCRYPTION_KEY` yet.
 
 ## 7. Know what else keeps data
 

@@ -19,12 +19,14 @@ The command provisions **two Workers and their D1 databases** on your account: t
 ```diagram
 npx @kldzj/sigillo self-host
       │
-      ├──> 1. Log in to Cloudflare (reuses wrangler login when present)
-      ├──> 2. Download the latest release bundle from github.com/kldzj/sigillo
-      ├──> 3. Deploy the login provider (<name>-auth): D1, migrations, Worker
-      ├──> 4. Deploy the app (<name>): D1, migrations, Worker, static assets
-      ├──> 5. Enable both workers.dev URLs
-      └──> 6. Optionally attach a custom domain to the app
+      ├──> 1. Unlock ~/.sigillo/selfhost.json with your passphrase
+      ├──> 2. Log in to Cloudflare (reuses wrangler login when present)
+      ├──> 3. Download the latest release bundle from github.com/kldzj/sigillo
+      ├──> 4. Create the app's D1 database and apply its migrations
+      ├──> 5. Deploy the login provider (<name>-auth): D1, migrations, Worker
+      ├──> 6. Deploy the app (<name>): Worker, static assets
+      ├──> 7. Enable both workers.dev URLs
+      └──> 8. Optionally attach a custom domain to the app
 ```
 
 ## Google sign-in
@@ -42,8 +44,8 @@ The first time someone signs in to your instance, the login provider asks them t
 The command finds **credentials** in this order:
 
 1. `CLOUDFLARE_API_TOKEN` environment variable (or `--api-token`)
-2. Your existing **`wrangler login`** (refreshed automatically if expired)
-3. A login saved by a previous `self-host` run
+2. A login saved by a previous `self-host` run
+3. Your existing **`wrangler login`** (refreshed automatically if expired)
 4. Interactive: an **OAuth browser login**, or a pre-filled API token creation link you can open from any device
 
 <Aside>
@@ -68,7 +70,7 @@ New deployments get their own `ENCRYPTION_KEY`, separate from the `BETTER_AUTH_S
 
 ## Your deploy file
 
-`self-host` saves both keys in `~/.sigillo/selfhost.json` on the machine that ran it, together with the login provider's secret, the Google client and a Cloudflare login from the browser. The file is **encrypted with a passphrase** you choose on the first run, and each run asks for it once. Keep the passphrase in your password manager; the file can then stay where it is.
+`self-host` saves both keys in `~/.sigillo/selfhost.json` on the machine that ran it, together with the login provider's secret, the Google client and a Cloudflare login from the browser. The file is **encrypted with a passphrase** of at least 12 characters, chosen on the first run, and each run asks for it once. Keep the passphrase in your password manager; the file can then stay where it is.
 
 **Back up the file, and don't lose the passphrase.** A database backup cannot be decrypted without the keys, and if the worker and the file are both lost, `self-host` refuses to reuse that database.
 
@@ -96,13 +98,11 @@ By default, anyone who can sign in with Google gets an account. To let in only c
 npx @kldzj/sigillo self-host --allowed-users acme.com,ops@partner.io
 ```
 
-A new deployment asks for the list. Only verified emails match: an address matches itself, a domain matches exactly that domain, not its subdomains. Nobody else can sign up or sign in, in the browser or with the CLI, and a signed-in user taken off the list is signed out on their next request. The app and its login provider both check it.
+A new deployment run in a terminal asks for the list. With `--yes` or without a terminal, pass `--allowed-users`, or anyone with a Google account can sign in. Only verified emails match: an address matches itself, a domain matches exactly that domain, not its subdomains. Nobody else can sign up or sign in, in the browser or with the CLI, and a signed-in user taken off the list is signed out on their next request. The app and its login provider both check it.
 
 Updates keep the list saved in `~/.sigillo/selfhost.json`. Pass `--allowed-users` again to change it, or `--allowed-users ''` to let anyone in.
 
 ## Options
-
-See the full flag reference at [sigillo self-host](./cli/self-host.mdx).
 
 | Option | Description |
 |--------|-------------|
@@ -114,6 +114,8 @@ See the full flag reference at [sigillo self-host](./cli/self-host.mdx).
 | `--allowed-users <list>` | Email addresses and domains that may sign in, comma-separated; `''` lets anyone in |
 | `--domain <hostname>` | Attach a custom domain to the app (the zone must be on your account) |
 | `--skip-domain` | Skip the custom domain prompt |
+| `--bundle <path>` | Deploy a local bundle file instead of the latest release |
+| `--release-url <url>` | Download the bundle from a custom URL |
 | `--change-passphrase` | Encrypt `~/.sigillo/selfhost.json` with a new passphrase, then stop |
 | `--yes` | Accept all defaults, non-interactive |
 
@@ -121,7 +123,8 @@ Non-interactive example for **CI or agents**:
 
 ```bash
 CLOUDFLARE_API_TOKEN=xxx SIGILLO_SELFHOST_PASSPHRASE=xxx npx @kldzj/sigillo self-host --yes \
-  --google-client-id xxx.apps.googleusercontent.com --google-client-secret xxx
+  --google-client-id xxx.apps.googleusercontent.com --google-client-secret xxx \
+  --allowed-users acme.com
 ```
 
 ## Using your instance

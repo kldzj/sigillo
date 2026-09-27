@@ -146,12 +146,28 @@ writePage('index.mdx', {
   icon: 'lucide:terminal',
 }, indexBody)
 
+// self-host runs from the npm package (TypeScript), not the native binary,
+// whose help only has a stub for it: its page points to the real options.
+const npmOnly: Record<string, string> = {
+  'self-host': 'Its options, environment variables and the encrypted deploy file are described on [Self-hosting](/docs/self-hosting#options).',
+}
+
 // Per-command pages
 for (const cmd of commands) {
   const icon = iconMap[cmd.name] ?? 'lucide:terminal'
   const parts: string[] = []
 
   parts.push(cmd.description, '')
+  if (npmOnly[cmd.name]) {
+    parts.push('## Usage', '', '```sh', `npx @kldzj/sigillo ${cmd.usage}`, '```', '', npmOnly[cmd.name]!)
+    writePage(`${slug(cmd.name)}.mdx`, {
+      '$schema': 'https://holocron.so/frontmatter.json',
+      title: `"${cmd.name}"`,
+      description: `"${cmd.description}"`,
+      icon,
+    }, parts.join('\n'))
+    continue
+  }
   parts.push('## Usage', '', '```sh', `sigillo ${cmd.usage}`, '```', '')
 
   if (cmd.options.length > 0) {

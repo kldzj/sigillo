@@ -16,7 +16,7 @@ npm i -g @kldzj/sigillo
 npx @kldzj/sigillo self-host
 ```
 
-This deploys Sigillo and its own Google login to your Cloudflare account (Workers and D1). Run it again to update. See [Self-hosting](https://github.com/kldzj/sigillo#self-hosting).
+This deploys Sigillo and its own Google login to your Cloudflare account (Workers and D1). It asks who may sign in (`--allowed-users acme.com`) and for a passphrase that encrypts `~/.sigillo/selfhost.json`, the file with your deployment's keys; runs without a terminal read it from `SIGILLO_SELFHOST_PASSPHRASE`. Run it again to update. See [Self-hosting](https://github.com/kldzj/sigillo#self-hosting).
 
 ## Use it
 

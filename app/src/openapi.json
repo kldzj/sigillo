@@ -60,6 +60,9 @@
                   "name": {
                     "type": "string",
                     "minLength": 1
+                  },
+                  "enableAutoJoin": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -385,6 +388,24 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
           "404": {
             "description": "",
             "content": {
@@ -455,6 +476,24 @@
                     "id",
                     "orgId",
                     "name"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ]
                 }
               }
@@ -540,6 +579,24 @@
                   "required": [
                     "ok",
                     "id"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ]
                 }
               }
@@ -640,6 +697,24 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
           "404": {
             "description": "",
             "content": {
@@ -714,6 +789,24 @@
                     "name",
                     "slug",
                     "projectId"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ]
                 }
               }
@@ -829,6 +922,24 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
           "404": {
             "description": "",
             "content": {
@@ -899,6 +1010,24 @@
                   "required": [
                     "ok",
                     "id"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ]
                 }
               }
@@ -992,6 +1121,24 @@
             }
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
             "description": "",
             "content": {
               "application/json": {
@@ -1222,7 +1369,7 @@
                 "properties": {
                   "name": {
                     "type": "string",
-                    "minLength": 1
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
                   },
                   "value": {
                     "type": "string"
@@ -1310,7 +1457,8 @@
                   "secrets": {
                     "type": "object",
                     "propertyNames": {
-                      "type": "string"
+                      "type": "string",
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
                     },
                     "additionalProperties": {
                       "type": "string"
@@ -1548,6 +1696,138 @@
           "Secrets"
         ],
         "summary": "Download secrets"
+      }
+    },
+    "/api/v0/projects/{projectId}/environments/{environmentId}/audit": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "projectId",
+            "required": true
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "environmentId",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "environmentId": {
+                      "type": "string"
+                    },
+                    "publicKey": {
+                      "type": "string"
+                    },
+                    "events": {
+                      "type": "object",
+                      "properties": {
+                        "rows": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "seq": {
+                                "type": "number"
+                              },
+                              "hash": {
+                                "type": "string"
+                              },
+                              "signature": {
+                                "type": "string"
+                              },
+                              "preimage": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "seq",
+                              "hash",
+                              "signature",
+                              "preimage"
+                            ]
+                          }
+                        },
+                        "outside": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "rows",
+                        "outside"
+                      ]
+                    },
+                    "reads": {
+                      "type": "object",
+                      "properties": {
+                        "rows": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "seq": {
+                                "type": "number"
+                              },
+                              "hash": {
+                                "type": "string"
+                              },
+                              "signature": {
+                                "type": "string"
+                              },
+                              "preimage": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "seq",
+                              "hash",
+                              "signature",
+                              "preimage"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "rows"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "environmentId",
+                    "publicKey",
+                    "events",
+                    "reads"
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Audit"
+        ],
+        "summary": "Get the audit chains"
       }
     },
     "/api/v0/me": {

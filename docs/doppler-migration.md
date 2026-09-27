@@ -10,14 +10,10 @@ the process environment.
 
 ```bash
 doppler login
-sigillo login
-```
-
-If you are migrating into a self-hosted Sigillo instance, pass your API URL to Sigillo commands:
-
-```bash
 sigillo login --api-url <sigillo-api-url>
 ```
+
+Sigillo has no default server: pass your instance's URL once, and later commands reuse it.
 
 ## 2. Create a Sigillo organization
 
