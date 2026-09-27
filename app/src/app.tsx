@@ -26,6 +26,7 @@ import {
   getProjectMemberAccess,
   listUserSessions,
 } from './db.ts'
+import { recordSecretRead } from './audit.ts'
 import { apiApp } from './api.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
 import { cn, loginErrorMessage } from 'sigillo-app/src/lib/utils'
@@ -373,6 +374,7 @@ export const app = new Spiceflow({ tracer })
         })
         for (const u of users) userMap.set(u.id, u)
       }
+      await recordSecretRead({ request, environment: environments.find((e) => e.id === selectedEnvId)!, author: { userId: session.userId, apiTokenId: null }, kind: 'page', names: derived.map((d) => d.name) })
       secrets = await Promise.all(derived.map(async (d) => ({
         id: d.id, name: d.name,
         value: await decrypt(d.valueEncrypted, d.iv),
@@ -500,6 +502,10 @@ export const app = new Spiceflow({ tracer })
       }))
     }
 
+    if (matchedEnv && !locked) {
+      const names = [...new Set(events.filter((evt) => evt.valueEncrypted).map((evt) => evt.name))]
+      await recordSecretRead({ request, environment: matchedEnv, author: { userId: session.userId, apiTokenId: null }, kind: 'event-log', names })
+    }
     // Decrypt values for "set" events so the client can show/hide them
     const eventsWithValues = await Promise.all(events.map(async (evt) => {
       let value: string | null = null
@@ -523,6 +529,73 @@ export const app = new Spiceflow({ tracer })
     return (
       <div className="flex flex-col gap-3 w-full">
         <EventLogTable />
+      </div>
+    )
+  })
+
+  // ── Read Log page ──────────────────────────────────────────────
+  // Reads of a protected environment's values, for org admins
+  .get('/dash/projects/:projectId/read-log', async ({ params, redirect }) => {
+    const db = getDb()
+    const environments = await db.query.environment.findMany({
+      where: { projectId: params.projectId },
+      orderBy: { createdAt: 'asc' },
+    })
+    const firstEnvSlug = environments[0]?.slug || '_'
+    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}/read-log`)
+  })
+
+  .loader('/dash/projects/:projectId/envs/:envSlug/read-log', async ({ params, request, redirect }) => {
+    const db = getDb()
+    const { projectId, envSlug } = params
+    const session = await requirePageSession(request)
+
+    const environments = await db.query.environment.findMany({ where: { projectId }, orderBy: { createdAt: 'asc' } })
+    const matchedEnv = environments.find((e) => e.slug === envSlug)
+    if (!matchedEnv && environments[0]) {
+      throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/read-log`)
+    }
+
+    const access = await getProjectMemberAccess(session.userId, projectId)
+    const isAdmin = access?.role === 'admin'
+    let reads: { id: string; seq: number; kind: string; names: string[]; ipAddress: string | null; createdAt: number; who: string }[] = []
+    if (matchedEnv && isAdmin) {
+      const rows = await db.query.secretRead.findMany({
+        where: { environmentId: matchedEnv.id },
+        orderBy: { seq: 'desc' },
+        limit: 500,
+      })
+      // actor is 'user:<id>' or 'token:<id>'
+      const ids = (prefix: string) => [...new Set(rows.filter((r) => r.actor.startsWith(prefix)).map((r) => r.actor.slice(prefix.length)))]
+      const [users, tokens] = await Promise.all([
+        db.query.user.findMany({ where: { id: { in: ids('user:') } }, columns: { id: true, name: true } }),
+        db.query.apiToken.findMany({ where: { id: { in: ids('token:') } }, columns: { id: true, name: true } }),
+      ])
+      const names = new Map<string, string>([
+        ...users.map((u) => [`user:${u.id}`, u.name] as const),
+        ...tokens.map((t) => [`token:${t.id}`, `${t.name} (token)`] as const),
+      ])
+      reads = rows.map((r) => ({
+        id: r.id, seq: r.seq, kind: r.kind, names: r.names, ipAddress: r.ipAddress, createdAt: r.createdAt,
+        who: names.get(r.actor) ?? (r.actor.startsWith('token:') ? 'Deleted token' : 'Deleted user'),
+      }))
+    }
+
+    return {
+      reads,
+      selectedEnvId: matchedEnv?.id ?? null,
+      isProtected: matchedEnv?.protected ?? false,
+      isAdmin,
+      projectId,
+    }
+  })
+
+  .page('/dash/projects/:projectId/envs/:envSlug/read-log', async () => {
+    const { ReadLogTable } = await import('sigillo-app/src/components/read-log-table')
+
+    return (
+      <div className="flex flex-col gap-3 w-full">
+        <ReadLogTable />
       </div>
     )
   })
@@ -795,8 +868,11 @@ function TabBar({
   const eventLogHref = envSlug
     ? router.href('/dash/projects/:projectId/envs/:envSlug/event-log', { projectId, envSlug })
     : router.href('/dash/projects/:projectId/event-log', { projectId })
+  const readLogHref = envSlug
+    ? router.href('/dash/projects/:projectId/envs/:envSlug/read-log', { projectId, envSlug })
+    : router.href('/dash/projects/:projectId/read-log', { projectId })
   const tabs = [
-    { label: 'Secrets', href: secretsHref, active: pathname === base || (pathname.startsWith(`${base}/envs`) && !pathname.endsWith('/event-log')) },
+    { label: 'Secrets', href: secretsHref, active: pathname === base || (pathname.startsWith(`${base}/envs`) && !pathname.endsWith('/event-log') && !pathname.endsWith('/read-log')) },
     { label: 'Environments', href: router.href('/dash/projects/:projectId/environments', { projectId }), active: pathname === `${base}/environments` },
     { label: 'Tokens', href: router.href('/dash/projects/:projectId/tokens', { projectId }), active: pathname === `${base}/tokens` },
     { label: 'Access', href: router.href('/dash/projects/:projectId/access', { projectId }), active: pathname === `${base}/access` },
@@ -804,6 +880,11 @@ function TabBar({
       label: 'Event Log',
       href: eventLogHref,
       active: pathname === `${base}/event-log` || pathname.endsWith('/event-log'),
+    },
+    {
+      label: 'Read Log',
+      href: readLogHref,
+      active: pathname === `${base}/read-log` || pathname.endsWith('/read-log'),
     },
     { label: 'Settings', href: router.href('/dash/projects/:projectId/settings', { projectId }), active: pathname === `${base}/settings` },
   ] as const

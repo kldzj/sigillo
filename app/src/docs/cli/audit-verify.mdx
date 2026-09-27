@@ -1,0 +1,31 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: "audit verify"
+description: "Check an env's secret changes and reads against their hash chains (org admins)"
+icon: lucide:terminal
+---
+
+Check an env's secret changes and reads against their hash chains (org admins)
+
+## Usage
+
+```sh
+sigillo audit verify
+```
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `-p, --project [id]` | Project ID or name override |
+| `--env [slug]` | Env slug override (e.g. dev, prod) |
+| `-c, --config [slug]` | Env slug override |
+
+## Global Options
+
+| Option | Description |
+|--------|-------------|
+| `-h, --help` | Display this message |
+| `-v, --version` | Display version number |
+| `--token [token]` | Auth token override |
+| `--api-url [url]` | API URL of your Sigillo instance |

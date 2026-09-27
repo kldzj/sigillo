@@ -470,6 +470,20 @@ describe('sigillo cli e2e', () => {
     expect(result.stdout.startsWith('*'.repeat(cliContext.secretValue.length))).toBe(true)
     expect(result.stdout.length).toBe(cliContext.secretValue.length + 25_000_000)
   }, 180_000)
+
+  test('audit verify checks both chains and keeps their heads as a witness', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'sigillo-cli-audit-'))
+    const context = { ...cliContext, env: { ...cliContext.env, HOME: home, APPDATA: home } }
+    const first = await runCli({ args: ['audit', 'verify'], context })
+    const second = await runCli({ args: ['audit', 'verify'], context })
+    const witness = JSON.parse(readFileSync(join(home, '.sigillo', 'audit.json'), 'utf8'))
+    rmSync(home, { recursive: true, force: true })
+    expect({ first: first.status, second: second.status, keys: Object.keys(witness) }).toEqual({
+      first: 0, second: 0, keys: [`${cliContext.apiUrl} ${cliContext.environmentId}`],
+    })
+    expect(first.stdout).toContain('First check of this env')
+    expect(second.stdout).toMatch(/^✔ changes: \d+ rows, intact\n✔ reads: 0 rows, intact\n$/)
+  }, 60_000)
 })
 
 describe('sigillo login', () => {

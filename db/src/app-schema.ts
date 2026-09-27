@@ -150,6 +150,8 @@ export const environment = sqliteCore.sqliteTable('environment', {
   // 'member' = everyone, 'admin' = only admins can read/write secrets.
   // Use this to restrict production environments to admins only.
   accessRole: sqliteCore.text('access_role', { enum: ['admin', 'member'] }).notNull().default('member'),
+  // Protected environments record every read of their values in secret_read.
+  protected: sqliteCore.integer('protected', { mode: 'boolean' }).notNull().default(false),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
   updatedAt: epochMs('updated_at').notNull().$defaultFn(() => Date.now()),
 }, (table) => [
@@ -178,8 +180,40 @@ export const secretEvent = sqliteCore.sqliteTable('secret_event', {
   userId: sqliteCore.text('user_id').references(() => user.id, { onDelete: 'set null' }),
   apiTokenId: sqliteCore.text('api_token_id').references(() => apiToken.id, { onDelete: 'set null' }),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+  // Hash chain per environment (app/src/audit.ts): seq numbers the rows 1, 2,
+  // 3..., hash covers the row and the previous hash, signature is the
+  // Worker's Ed25519 signature of it. actor is the author as written
+  // ('user:<id>' or 'token:<id>'), which stays when user_id goes null.
+  // Rows from before the chain have no seq until their environment's next write.
+  actor: sqliteCore.text('actor'),
+  seq: sqliteCore.integer('seq'),
+  hash: sqliteCore.text('hash'),
+  signature: sqliteCore.text('signature'),
 }, (table) => [
   sqliteCore.index('secret_event_env_name_idx').on(table.environmentId, table.name, table.createdAt),
+  sqliteCore.uniqueIndex('secret_event_env_seq_unique').on(table.environmentId, table.seq),
+])
+
+// Every read of a protected environment's values, written before the values
+// leave the server. A hash chain per environment like secret_event's. Also
+// records protection being turned on and off, so a gap in the log shows.
+export const SECRET_READ_KINDS = ['list', 'value', 'download', 'page', 'event-log', 'copy', 'protected', 'unprotected'] as const
+
+export const secretRead = sqliteCore.sqliteTable('secret_read', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  environmentId: sqliteCore.text('environment_id').notNull().references(() => environment.id, { onDelete: 'cascade' }),
+  // 'user:<id>' or 'token:<id>', no foreign key, so it never changes
+  actor: sqliteCore.text('actor').notNull(),
+  kind: sqliteCore.text('kind', { enum: SECRET_READ_KINDS }).notNull(),
+  // Names of the secrets whose values were returned
+  names: sqliteCore.text('names', { mode: 'json' }).$type<string[]>().notNull(),
+  ipAddress: sqliteCore.text('ip_address'),
+  createdAt: epochMs('created_at').notNull(),
+  seq: sqliteCore.integer('seq').notNull(),
+  hash: sqliteCore.text('hash').notNull(),
+  signature: sqliteCore.text('signature').notNull(),
+}, (table) => [
+  sqliteCore.uniqueIndex('secret_read_env_seq_unique').on(table.environmentId, table.seq),
 ])
 
 // ── API tokens ──────────────────────────────────────────────────────
@@ -280,7 +314,7 @@ export const deviceCode = sqliteCore.sqliteTable('device_code', {
 // ── Relations (v2 API) ──────────────────────────────────────────────
 
 export const relations = defineRelations(
-  { user, session, account, verification, org, orgMember, orgInvitation, project, environment, secretEvent, apiToken, apiTokenEnvironment, deviceCode, oauthDomain, memberAccess },
+  { user, session, account, verification, org, orgMember, orgInvitation, project, environment, secretEvent, secretRead, apiToken, apiTokenEnvironment, deviceCode, oauthDomain, memberAccess },
   (r) => ({
     user: {
       sessions: r.many.session(),
@@ -323,7 +357,11 @@ export const relations = defineRelations(
     environment: {
       project: r.one.project({ from: r.environment.projectId, to: r.project.id }),
       secretEvents: r.many.secretEvent(),
+      secretReads: r.many.secretRead(),
       apiTokenEnvironments: r.many.apiTokenEnvironment(),
+    },
+    secretRead: {
+      environment: r.one.environment({ from: r.secretRead.environmentId, to: r.environment.id }),
     },
     secretEvent: {
       environment: r.one.environment({ from: r.secretEvent.environmentId, to: r.environment.id }),

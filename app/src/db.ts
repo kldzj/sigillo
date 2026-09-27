@@ -598,6 +598,7 @@ type ResolvedEnvironment = {
   name: string
   slug: string
   accessRole: string
+  protected: boolean
   createdAt: number
   updatedAt: number
   orgId: string | null
@@ -656,7 +657,7 @@ export async function getUserEnvironmentAccess({ userId, environmentRef, project
   const access = await getMemberAccess({ userId, orgId: env.orgId })
   const error = getEnvironmentAccessError(access, env)
   if (error || !access) throw new ForbiddenError(error ?? 'forbidden')
-  return { id: env.id, projectId: env.projectId, orgId: env.orgId, role: access.role }
+  return { id: env.id, projectId: env.projectId, orgId: env.orgId, role: access.role, protected: env.protected }
 }
 
 export async function getOrgIdForEnvironment(environmentId: string, projectId?: string | null) {
@@ -692,13 +693,18 @@ type SecretEventRow = {
   iv: string | null
   userId: string | null
   createdAt: number
+  seq: number | null
 }
 
 // Replay an append-only event log (ordered by createdAt asc) into the current
 // set of secrets. Last "set" per name wins; "delete" removes it. Rows missing
 // a value/iv are dropped. Pure — no DB access, so it can run on rows fetched
 // from any query or batch.
-function replaySecretEvents(events: SecretEventRow[]): DerivedSecret[] {
+// Once an environment's events are chained (see audit.ts), the chain's order
+// counts, and a row without seq was added around the chain: it is ignored.
+function replaySecretEvents(allEvents: SecretEventRow[]): DerivedSecret[] {
+  const chained = allEvents.filter((evt) => evt.seq !== null)
+  const events = chained.length ? chained.sort((a, b) => a.seq! - b.seq!) : allEvents
   const state = new Map<string, {
     id: string
     name: string
@@ -858,7 +864,7 @@ export async function requireSecretsApiAuth(
     environmentRef: string
     projectId?: string | null
   },
-): Promise<SecretsAuth & { environmentId: string }> {
+): Promise<SecretsAuth & { environmentId: string; protected: boolean }> {
   const apiToken = await getRequestApiToken(request)
   if (apiToken) {
     const env = await resolveEnvironment(environmentRef, apiToken.projectId)
@@ -872,7 +878,7 @@ export async function requireSecretsApiAuth(
       const creator = env.orgId ? await getMemberAccess({ userId: apiToken.createdBy, orgId: env.orgId }) : null
       if (creator?.role !== 'admin') throw forbiddenResponse('admin access required for this environment')
     }
-    return { userId: null, apiTokenId: apiToken.tokenId, environmentId: env.id }
+    return { userId: null, apiTokenId: apiToken.tokenId, environmentId: env.id, protected: env.protected }
   }
 
   // Session auth path — works with both cookies and BetterAuth bearer tokens
@@ -882,7 +888,7 @@ export async function requireSecretsApiAuth(
   try {
     const env = await getUserEnvironmentAccess({ userId: session.userId, environmentRef, projectId })
     if (!env) throw new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } })
-    return { userId: session.userId, apiTokenId: null, environmentId: env.id }
+    return { userId: session.userId, apiTokenId: null, environmentId: env.id, protected: env.protected }
   } catch (error) {
     if (error instanceof ForbiddenError) throw forbiddenResponse(error.message)
     throw error

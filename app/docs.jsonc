@@ -81,6 +81,11 @@
             "pages": ["docs/cli/environments", "docs/cli/environments-create", "docs/cli/environments-get", "docs/cli/environments-rename", "docs/cli/environments-delete"]
           },
           {
+            "group": "Audit",
+            "icon": "lucide:shield-check",
+            "pages": ["docs/cli/audit-verify"]
+          },
+          {
             "group": "Self-hosting",
             "icon": "lucide:server",
             "pages": ["docs/cli/self-host"]
