@@ -64,8 +64,15 @@ jobs:
           name: dist
           path: cli/dist/
 
+  # The publish job ships the app inside the self-host bundle, so the app
+  # typecheck and test suite must pass before anything reaches npm. Same
+  # condition as publish: PRs get app-ci.yml on its own when the app changes.
+  test:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/app-ci.yml
+
   publish:
-    needs: [build]
+    needs: [build, test]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
