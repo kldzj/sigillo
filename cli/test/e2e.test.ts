@@ -155,23 +155,30 @@ describe('sigillo cli e2e', () => {
   }, 60_000)
 
   test('environment commands accept env slugs', async () => {
-    const get = await runCli({ args: ['environments', 'get', cliContext.extraEnvironmentSlug], context: cliContext })
-    expect(get.status).toBe(0)
-    expect(get.stdout).toContain(`id: "${cliContext.extraEnvironmentId}"`)
-    expect(get.stdout).toContain(`slug: "${cliContext.extraEnvironmentSlug}"`)
+    // Its own env, since it gets deleted: later tests still use the shared ones
+    const slug = `slug-e2e-${Date.now()}`
+    const environment = await apiRequest({ method: 'POST', path: `/api/v0/projects/${cliContext.projectId}/environments`, context: cliContext, body: {
+      name: 'Slug E2E',
+      slug,
+    } })
 
-    const renamedSlug = `${cliContext.extraEnvironmentSlug}-renamed`
+    const get = await runCli({ args: ['environments', 'get', slug], context: cliContext })
+    expect(get.status).toBe(0)
+    expect(get.stdout).toContain(`id: "${environment.id}"`)
+    expect(get.stdout).toContain(`slug: "${slug}"`)
+
+    const renamedSlug = `${slug}-renamed`
     const rename = await runCli({
-      args: ['environments', 'rename', cliContext.extraEnvironmentSlug, '--slug', renamedSlug],
+      args: ['environments', 'rename', slug, '--slug', renamedSlug],
       context: cliContext,
     })
     expect(rename.status).toBe(0)
-    expect(rename.stdout).toContain(`id: "${cliContext.extraEnvironmentId}"`)
+    expect(rename.stdout).toContain(`id: "${environment.id}"`)
     expect(rename.stdout).toContain(`slug: "${renamedSlug}"`)
 
     const deleted = await runCli({ args: ['environments', 'delete', renamedSlug], context: cliContext })
     expect(deleted.status).toBe(0)
-    expect(deleted.stdout).toContain(`id: "${cliContext.extraEnvironmentId}"`)
+    expect(deleted.stdout).toContain(`id: "${environment.id}"`)
   }, 60_000)
 
   test('secrets set reads value from piped stdin and strips trailing newline', async () => {

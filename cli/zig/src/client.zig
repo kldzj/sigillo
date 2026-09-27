@@ -96,8 +96,9 @@ pub fn parseJsonResult(comptime T: type, args: RequestArgs) !JsonResult(T) {
     };
 }
 
+// Unset optional fields are left out: the API accepts a missing field, not null
 fn jsonBody(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{ .emit_null_optional_fields = false })});
 }
 
 pub fn parseError(allocator: std.mem.Allocator, body: []const u8) ?[]const u8 {
