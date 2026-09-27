@@ -1,5 +1,5 @@
 ---
-'sigillo': patch
+'@kldzj/sigillo': patch
 ---
 
 The CLI never sends your saved token to another server, and `run --mount` is safer.
