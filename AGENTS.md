@@ -73,6 +73,7 @@ Rules:
 - **Never change a preimage's fields or their order.** Rows are verified by rebuilding their preimage, so any change breaks every existing row. A new field needs a new preimage version.
 - A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it.
 - Every route that returns secret values calls `recordSecretRead()` **before** the values leave, and must let it throw: a read that can't be recorded fails.
+- Pages send secret names, never values. The web UI fetches a value when someone reveals, downloads or copies it, through `readSecretValues()` / `readEventValue()`, so the read log shows who looked at which value, not who opened a page.
 - Changing `BETTER_AUTH_SECRET` changes the signing key. Old rows then no longer verify, and `sigillo audit verify` reports the new key.
 
 ## Auth flow

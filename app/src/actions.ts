@@ -32,7 +32,7 @@ import {
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
-import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, type NewSecretEvent } from './audit.ts'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
 
 async function requireSession() {
   const request = getActionRequest()
@@ -132,14 +132,33 @@ export async function deleteSecretAction({ name, environmentIds }: {
   })))
 }
 
+// Values the web UI reveals, downloads or copies. Recorded as reads.
+export async function revealSecretsAction({ environmentId, names, download }: {
+  environmentId: string
+  names: string[] | null
+  download?: boolean
+}) {
+  const session = await requireSession()
+  return readSecretValues({
+    request: getActionRequest(), userId: session.userId, environmentId, names, kind: download ? 'download' : 'value',
+  })
+}
+
+export async function revealEventValueAction({ eventId }: { eventId: string }) {
+  const session = await requireSession()
+  return readEventValue({ request: getActionRequest(), userId: session.userId, eventId })
+}
+
 // Save edited secrets to the current environment and optionally apply
 // the same changes to additional environments. Each edit appends a "set"
 // event to the log. Renames are handled as delete old name + set new name.
-export async function saveSecretsAction({ edits, environmentIds }: {
-  edits: { name: string; originalName?: string; value: string }[]
+// A rename without a value keeps the current one, which the browser may never
+// have loaded; copying it to other environments is recorded as a read.
+export async function saveSecretsAction({ edits: requested, environmentIds }: {
+  edits: { name: string; originalName?: string; value?: string }[]
   environmentIds: string[]
 }) {
-  if (edits.length === 0 || environmentIds.length === 0) return
+  if (requested.length === 0 || environmentIds.length === 0) return
   const session = await requireSession()
   const currentEnvId = environmentIds[0]!
   const envs = await Promise.all(
@@ -151,14 +170,29 @@ export async function saveSecretsAction({ edits, environmentIds }: {
 
   // New and renamed names must be valid. An invalid name is accepted only
   // when it is unchanged AND already exists here (legacy secrets stay editable).
-  if (edits.some((edit) => getSecretNameError(edit.name))) {
+  if (requested.some((edit) => getSecretNameError(edit.name))) {
     const existingNames = new Set((await deriveSecrets(currentEnvId)).map((s) => s.name))
-    for (const edit of edits) {
+    for (const edit of requested) {
       const nameError = getSecretNameError(edit.name)
       if (!nameError) continue
       if (edit.name === edit.originalName && existingNames.has(edit.name)) continue
       throw new Error(nameError)
     }
+  }
+
+  const kept = requested.filter((edit) => edit.value === undefined)
+  const current = kept.length ? await deriveSecrets(currentEnvId) : []
+  const edits = await Promise.all(requested.map(async (edit) => {
+    if (edit.value !== undefined) return { ...edit, value: edit.value }
+    const secret = current.find((s) => s.name === (edit.originalName ?? edit.name))
+    if (!secret) throw new Error(`${edit.originalName ?? edit.name} no longer exists`)
+    return { ...edit, value: await decrypt(secret.valueEncrypted, secret.iv) }
+  }))
+  if (kept.length && environmentIds.some((id) => id !== currentEnvId)) {
+    await recordSecretRead({
+      request: getActionRequest(), environment: envs.find((env) => env.id === currentEnvId)!,
+      author: { userId: session.userId, apiTokenId: null }, kind: 'copy', names: kept.map((edit) => edit.originalName ?? edit.name),
+    })
   }
 
   const author = { userId: session.userId, apiTokenId: null }

@@ -19,14 +19,12 @@ import {
   requirePageOrgMember,
   getOrgIdForProject,
   deriveEnvironmentSecretsAndNames,
-  decrypt,
   autoJoinOrgsByDomain,
   getAccessibleProjectIds,
   getEnvironmentAccessError,
   getProjectMemberAccess,
   listUserSessions,
 } from './db.ts'
-import { recordSecretRead } from './audit.ts'
 import { apiApp } from './api.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
 import { cn, loginErrorMessage } from 'sigillo-app/src/lib/utils'
@@ -356,7 +354,8 @@ export const app = new Spiceflow({ tracer })
     const readableEnvIds = environments.filter((e) => !getEnvironmentAccessError(access, e)).map((e) => e.id)
     const locked = !!selectedEnvId && !readableEnvIds.includes(selectedEnvId)
 
-    let secrets: { id: string; name: string; value: string; createdAt: number; updatedAt: number; createdBy: { id: string; name: string } | null }[] = []
+    // Names only: values are fetched when revealed (see readSecretValues)
+    let secrets: { id: string; name: string; createdAt: number; updatedAt: number; createdBy: { id: string; name: string } | null }[] = []
     // One D1 batch derives the selected env's secrets AND the union of names
     // across all readable envs, instead of a separate names round-trip.
     const { secrets: derived, allNames: allSecretNames } = await deriveEnvironmentSecretsAndNames({
@@ -374,13 +373,11 @@ export const app = new Spiceflow({ tracer })
         })
         for (const u of users) userMap.set(u.id, u)
       }
-      await recordSecretRead({ request, environment: environments.find((e) => e.id === selectedEnvId)!, author: { userId: session.userId, apiTokenId: null }, kind: 'page', names: derived.map((d) => d.name) })
-      secrets = await Promise.all(derived.map(async (d) => ({
+      secrets = derived.map((d) => ({
         id: d.id, name: d.name,
-        value: await decrypt(d.valueEncrypted, d.iv),
         createdAt: d.createdAt, updatedAt: d.updatedAt,
         createdBy: d.userId ? (userMap.get(d.userId) ?? null) : null,
-      })))
+      }))
     }
 
     const cookieHeader = request.headers.get('cookie') ?? ''
@@ -502,21 +499,11 @@ export const app = new Spiceflow({ tracer })
       }))
     }
 
-    if (matchedEnv && !locked) {
-      const names = [...new Set(events.filter((evt) => evt.valueEncrypted).map((evt) => evt.name))]
-      await recordSecretRead({ request, environment: matchedEnv, author: { userId: session.userId, apiTokenId: null }, kind: 'event-log', names })
-    }
-    // Decrypt values for "set" events so the client can show/hide them
-    const eventsWithValues = await Promise.all(events.map(async (evt) => {
-      let value: string | null = null
-      if (evt.operation === 'set' && evt.valueEncrypted && evt.iv) {
-        value = await decrypt(evt.valueEncrypted, evt.iv)
-      }
-      return { ...evt, value, valueEncrypted: undefined, iv: undefined }
-    }))
+    // No values: an old value is fetched when revealed (see readEventValue)
+    const eventsWithoutValues = events.map(({ valueEncrypted, iv, ...evt }) => ({ ...evt, hasValue: evt.operation === 'set' && !!valueEncrypted && !!iv }))
 
     return {
-      events: eventsWithValues,
+      events: eventsWithoutValues,
       selectedEnvId,
       locked,
       projectId,

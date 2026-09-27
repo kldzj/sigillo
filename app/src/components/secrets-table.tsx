@@ -1,5 +1,6 @@
 // Secrets table with editable keys/values like Doppler.
-// Values hidden by default (password inputs). Eye icon to reveal.
+// The page loads names only. A value is fetched when revealed (eye icon, or
+// "Show all secrets"), which protected environments record in the read log.
 // Editing a key or value, filling a missing key, or drafting a new secret
 // marks the table dirty. A single "Save N secrets" flow handles all of it.
 // Import from .env via a dialog with a textarea, and export current secrets
@@ -9,7 +10,7 @@
 
 import { EyeIcon, EyeOffIcon, TrashIcon, UploadIcon, PlusIcon, KeyIcon, CheckIcon, DownloadIcon, CopyIcon, ArrowDownToLineIcon } from "lucide-react";
 import { EmptyState } from "sigillo-app/src/components/ui/empty-state";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { z } from "zod";
 import { parseFormData } from "spiceflow";
 import { cn, renderEnvFile } from "sigillo-app/src/lib/utils";
@@ -38,6 +39,7 @@ import { parseEnv } from "sigillo-app/src/lib/parse-env";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
 import {
   deleteSecretAction,
+  revealSecretsAction,
   saveSecretsAction,
   syncMissingSecretsAction,
 } from "../actions.ts";
@@ -55,7 +57,8 @@ function SecretValueCell({
   onToggle,
   isDirty,
 }: {
-  value: string;
+  // Undefined until fetched
+  value: string | undefined;
   editedValue: string | undefined;
   onValueChange: (value: string) => void;
   visible: boolean;
@@ -63,6 +66,7 @@ function SecretValueCell({
   isDirty?: boolean;
 }) {
   const displayValue = editedValue ?? value;
+  const loading = visible && displayValue === undefined;
 
   return (
     <div className="flex w-full min-w-0 items-center gap-1.5">
@@ -72,13 +76,13 @@ function SecretValueCell({
         autoComplete="off"
         data-1p-ignore
         data-lpignore="true"
-        value={visible ? displayValue : "••••••••••••"}
+        value={loading ? "Loading…" : visible ? displayValue : "••••••••••••"}
         onChange={(e) => {
-          if (visible) {
+          if (visible && !loading) {
             onValueChange(e.target.value);
           }
         }}
-        readOnly={!visible}
+        readOnly={!visible || loading}
         onFocus={(e) => {
           if (!visible) {
             e.target.blur()
@@ -124,6 +128,30 @@ export function SecretsTable({
 
   // Per-row visibility overrides (only used when allVisible is false)
   const [rowVisible, setRowVisible] = useState<Record<string, boolean>>({});
+  // Fetched values by secret id: a save gives a secret a new id, so a changed
+  // value is fetched again
+  const [values, setValues] = useState<Record<string, string>>({});
+
+  // Ids being fetched, so a re-render doesn't fetch (and record) them twice
+  const fetching = useRef(new Set<string>());
+
+  const loadValues = useCallback(async (targets: { id: string; name: string }[]) => {
+    const missing = targets.filter((secret) => values[secret.id] === undefined && !fetching.current.has(secret.id));
+    if (!environmentId || missing.length === 0) return;
+    for (const secret of missing) fetching.current.add(secret.id);
+    try {
+      const fetched = await revealSecretsAction({ environmentId, names: missing.map((secret) => secret.name) });
+      setValues((prev) => ({ ...prev, ...Object.fromEntries(missing.map((secret) => [secret.id, fetched[secret.name] ?? ""])) }));
+    } catch (e: any) {
+      alert(e?.message || "Failed to load values");
+    } finally {
+      for (const secret of missing) fetching.current.delete(secret.id);
+    }
+  }, [environmentId, values]);
+
+  useEffect(() => {
+    if (allVisible) void loadValues(secrets);
+  }, [allVisible, secrets, loadValues]);
 
   // Track edits per secret id
   const [edits, setEdits] = useState<Record<string, { name?: string; value?: string }>>({});
@@ -165,10 +193,11 @@ export function SecretsTable({
   const pendingEdits = [
     ...dirtySecrets.map((secret) => {
       const edit = edits[secret.id]!;
+      // No value: a rename keeps the current one on the server
       return {
         originalName: secret.name,
         name: edit.name !== undefined ? edit.name : secret.name,
-        value: edit.value !== undefined ? edit.value : secret.value,
+        value: edit.value,
       };
     }),
     ...dirtyMissingKeys.map((name) => ({
@@ -183,15 +212,19 @@ export function SecretsTable({
 
   const totalDirtyCount = pendingEdits.length;
 
-  const currentEnvEntries: Array<[string, string]> = [
-    ...secrets.map((secret): [string, string] => [
-      edits[secret.id]?.name ?? secret.name,
-      edits[secret.id]?.value ?? secret.value,
-    ]),
-    ...dirtyMissingKeys.map((name): [string, string] => [name, missingEdits[name]!]),
-    ...dirtyNewSecrets.map((secret): [string, string] => [secret.name, secret.value]),
-  ];
-  const envFileText = renderEnvFile(currentEnvEntries);
+  // The .env of this environment with unsaved edits applied. Fetches every
+  // value, recorded as a download.
+  const buildEnvFile = useCallback(async () => {
+    const fetched = await revealSecretsAction({ environmentId, names: null, download: true });
+    return renderEnvFile([
+      ...secrets.map((secret): [string, string] => [
+        edits[secret.id]?.name ?? secret.name,
+        edits[secret.id]?.value ?? fetched[secret.name] ?? "",
+      ]),
+      ...dirtyMissingKeys.map((name): [string, string] => [name, missingEdits[name]!]),
+      ...dirtyNewSecrets.map((secret): [string, string] => [secret.name, secret.value]),
+    ]);
+  }, [environmentId, secrets, edits, dirtyMissingKeys, missingEdits, dirtyNewSecrets]);
 
   const handleImportText = useCallback(async (text: string) => {
     const parsed = parseEnv(text);
@@ -222,23 +255,34 @@ export function SecretsTable({
     setNewSecrets((prev) => prev.filter((secret) => secret.id !== id));
   }, []);
 
-  const handleDownloadEnv = useCallback(() => {
-    const blob = new Blob([envFileText], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `.env.${environments.find((env) => env.id === environmentId)?.slug ?? "env"}`;
-    link.click();
-    URL.revokeObjectURL(url);
-  }, [envFileText, environmentId, environments]);
+  const handleDownloadEnv = useCallback(async () => {
+    try {
+      const blob = new Blob([await buildEnvFile()], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `.env.${environments.find((env) => env.id === environmentId)?.slug ?? "env"}`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error: any) {
+      alert(error?.message || "Failed to download .env");
+    }
+  }, [buildEnvFile, environmentId, environments]);
 
   const handleCopyEnv = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(envFileText);
+      // A pending ClipboardItem keeps the click's permission to write while
+      // the values load; writeText after an await would lose it in Safari
+      const text = buildEnvFile();
+      if (typeof ClipboardItem !== "undefined") {
+        await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then((t) => new Blob([t], { type: "text/plain" })) })]);
+      } else {
+        await navigator.clipboard.writeText(await text);
+      }
     } catch (error: any) {
       alert(error?.message || "Failed to copy .env contents");
     }
-  }, [envFileText]);
+  }, [buildEnvFile]);
 
   // Empty state (only show when no secrets AND no missing keys from other envs)
   if (secrets.length === 0 && missingKeys.length === 0 && newSecrets.length === 0) {
@@ -308,11 +352,14 @@ export function SecretsTable({
                   </TableCell>
                   <TableCell className="min-w-0 overflow-hidden">
                     <SecretValueCell
-                      value={secret.value}
+                      value={values[secret.id]}
                       editedValue={edits[secret.id]?.value}
                       onValueChange={(v) => setEdit(secret.id, "value", v)}
                       visible={isVisible}
-                      onToggle={() => setRowVisible((prev) => ({ ...prev, [secret.id]: !isVisible }))}
+                      onToggle={() => {
+                        if (!isVisible) void loadValues([secret]);
+                        setRowVisible((prev) => ({ ...prev, [secret.id]: !isVisible }));
+                      }}
                       isDirty={isDirty}
                     />
                   </TableCell>
@@ -446,7 +493,7 @@ export function SecretsTable({
             Import .env
           </Button>
           <Button
-            onClick={handleDownloadEnv}
+            onClick={() => void handleDownloadEnv()}
             size="xs"
             variant="ghost"
           >

@@ -17,7 +17,7 @@ import * as orm from 'drizzle-orm'
 import type { BatchItem } from 'drizzle-orm/batch'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
-import { encrypt, decrypt } from './db.ts'
+import { encrypt, decrypt, deriveSecrets, getUserEnvironmentAccess } from './db.ts'
 
 const ZERO_HASH = '0'.repeat(64)
 const encoder = new TextEncoder()
@@ -306,6 +306,40 @@ export async function setEnvironmentProtection({ request, environmentId, protect
     readRow({ request, environmentId, author, kind: protect ? 'protected' : 'unprotected', names: [] }),
     [db.update(schema.environment).set({ protected: protect, updatedAt: Date.now() }).where(orm.eq(schema.environment.id, environmentId))],
   )
+}
+
+// ── Values for the web UI ───────────────────────────────────────────
+// Pages send names only. A value reaches the browser when someone reveals,
+// downloads or copies it, and that is what the read log records.
+
+export async function readSecretValues({ request, userId, environmentId, names, kind }: {
+  request: Request
+  userId: string
+  environmentId: string
+  // null for all of them
+  names: string[] | null
+  kind: 'value' | 'download'
+}): Promise<Record<string, string>> {
+  const env = await getUserEnvironmentAccess({ userId, environmentRef: environmentId })
+  if (!env) throw new Error('Environment not found')
+  const secrets = (await deriveSecrets(env.id)).filter((secret) => !names || names.includes(secret.name))
+  await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null }, kind, names: secrets.map((secret) => secret.name) })
+  return Object.fromEntries(await Promise.all(secrets.map(async (secret) => [secret.name, await decrypt(secret.valueEncrypted, secret.iv)] as const)))
+}
+
+// An old value from the event log
+export async function readEventValue({ request, userId, eventId }: {
+  request: Request
+  userId: string
+  eventId: string
+}): Promise<string | null> {
+  const event = await getDb().query.secretEvent.findFirst({ where: { id: eventId } })
+  if (!event) throw new Error('Event not found')
+  const env = await getUserEnvironmentAccess({ userId, environmentRef: event.environmentId })
+  if (!env) throw new Error('Environment not found')
+  if (!event.valueEncrypted || !event.iv) return null
+  await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null }, kind: 'event-log', names: [event.name] })
+  return decrypt(event.valueEncrypted, event.iv)
 }
 
 // ── Verifying ───────────────────────────────────────────────────────
