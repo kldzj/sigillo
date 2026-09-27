@@ -3974,8 +3974,8 @@ pub fn main() !void {
 // tests can check what was actually sent.
 const OneShotServer = struct {
     server: std.net.Server,
-    head: [4096]u8 = undefined,
-    head_len: usize = 0,
+    received: [4096]u8 = undefined,
+    received_len: usize = 0,
 
     fn init() !OneShotServer {
         const address = try std.net.Address.parseIp("127.0.0.1", 0);
@@ -3985,14 +3985,59 @@ const OneShotServer = struct {
     fn serve(self: *OneShotServer, response: []const u8) void {
         const conn = self.server.accept() catch return;
         defer conn.stream.close();
-        self.head_len = conn.stream.read(&self.head) catch 0;
+        // The body can arrive after the head, so read until the whole request is in
+        while (self.received_len < self.received.len and !self.requestComplete()) {
+            const n = conn.stream.read(self.received[self.received_len..]) catch break;
+            if (n == 0) break;
+            self.received_len += n;
+        }
         conn.stream.writeAll(response) catch {};
+    }
+
+    fn requestComplete(self: *OneShotServer) bool {
+        const received = self.received[0..self.received_len];
+        const head_end = std.mem.indexOf(u8, received, "\r\n\r\n") orelse return false;
+        var body_len: usize = 0;
+        var lines = std.mem.splitSequence(u8, received[0..head_end], "\r\n");
+        while (lines.next()) |line| {
+            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                body_len = std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length:".len..], " "), 10) catch 0;
+            }
+        }
+        return received.len >= head_end + 4 + body_len;
+    }
+
+    fn request(self: *OneShotServer) []const u8 {
+        return self.received[0..self.received_len];
     }
 
     fn baseUrl(self: *OneShotServer, allocator: std.mem.Allocator) ![]const u8 {
         return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.listen_address.getPort()});
     }
 };
+
+test "requests leave unset optional fields out of the JSON body" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var server = try OneShotServer.init();
+    defer server.server.deinit();
+
+    // The API rejects `"name":null` with a 422, so renaming only the slug failed
+    const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}" });
+    const result = client.updateEnvironment(.{
+        .allocator = allocator,
+        .api_url = try server.baseUrl(allocator),
+        .token = "tok123",
+        .project_id = "proj",
+        .environment_id = "env",
+        .slug = "new-slug",
+    });
+    thread.join();
+    _ = try result;
+    try std.testing.expect(std.mem.endsWith(u8, server.request(), "\r\n\r\n{\"slug\":\"new-slug\"}"));
+}
 
 test "requests with a token send it as a bearer header" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
@@ -4007,7 +4052,7 @@ test "requests with a token send it as a bearer header" {
     thread.join();
     const res = try result;
     try std.testing.expectEqual(@as(u16, 200), res.status);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(server.head[0..server.head_len], "authorization: Bearer tok123\r\n") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(server.request(), "authorization: Bearer tok123\r\n") != null);
 }
 
 test "requests with a token never follow a redirect" {
