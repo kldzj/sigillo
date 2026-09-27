@@ -3814,3 +3814,59 @@ pub fn main() !void {
         std.process.exit(1);
     };
 }
+
+// Answers one HTTP request on a loopback port and keeps its head, so client
+// tests can check what was actually sent.
+const OneShotServer = struct {
+    server: std.net.Server,
+    head: [4096]u8 = undefined,
+    head_len: usize = 0,
+
+    fn init() !OneShotServer {
+        const address = try std.net.Address.parseIp("127.0.0.1", 0);
+        return .{ .server = try address.listen(.{ .reuse_address = true }) };
+    }
+
+    fn serve(self: *OneShotServer, response: []const u8) void {
+        const conn = self.server.accept() catch return;
+        defer conn.stream.close();
+        self.head_len = conn.stream.read(&self.head) catch 0;
+        conn.stream.writeAll(response) catch {};
+    }
+
+    fn baseUrl(self: *OneShotServer, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.listen_address.getPort()});
+    }
+};
+
+test "requests with a token send it as a bearer header" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var server = try OneShotServer.init();
+    defer server.server.deinit();
+
+    const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}" });
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.baseUrl(allocator), .path = "/api/v0/me", .token = "tok123" });
+    thread.join();
+    const res = try result;
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(server.head[0..server.head_len], "authorization: Bearer tok123\r\n") != null);
+}
+
+test "requests with a token never follow a redirect" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var server = try OneShotServer.init();
+    defer server.server.deinit();
+
+    // Following it would make a second request with the token (here to a
+    // closed port). The redirect is reported instead.
+    const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/elsewhere\r\ncontent-length: 0\r\nconnection: close\r\n\r\n" });
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.baseUrl(allocator), .path = "/api/v0/me", .token = "tok123" });
+    thread.join();
+    try std.testing.expectError(error.ApiUrlRedirected, result);
+}
