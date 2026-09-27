@@ -19,7 +19,7 @@ import { loginErrorMessage } from 'sigillo-app/src/lib/utils.ts'
 // BetterAuth's built-in /api/auth/error endpoint redirects to /?error=...&error_description=...
 // in production mode (no customizeDefaultErrorPage set), so the root route and /error
 // route both need to handle these query params and show a human-readable error page.
-function ErrorScreen({ error, errorDescription }: { error: string; errorDescription: string | null }) {
+function ErrorScreen({ error, errorDescription, backUrl }: { error: string; errorDescription: string | null; backUrl: string | null }) {
   // A refusal by ALLOWED_USERS gets its explanation instead of a code
   const refusal = error.toLowerCase() === 'user_not_allowed' ? loginErrorMessage(error) : null
   return (
@@ -43,19 +43,23 @@ function ErrorScreen({ error, errorDescription }: { error: string; errorDescript
           )}
         </div>
 
-        <p className="mt-4 text-sm leading-6 text-muted-foreground">
-          Try signing in again. If this keeps happening, contact the administrator
-          of the app that redirected you here.
-        </p>
+        {!refusal && (
+          <p className="mt-4 text-sm leading-6 text-muted-foreground">
+            Try signing in again. If this keeps happening, contact the administrator
+            of the app that redirected you here.
+          </p>
+        )}
 
-        <div className="mt-6 flex gap-3">
-          <a
-            href="/"
-            className="inline-flex items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-sm hover:bg-primary/90"
-          >
-            Go back
-          </a>
-        </div>
+        {backUrl && (
+          <div className="mt-6 flex gap-3">
+            <a
+              href={backUrl}
+              className="inline-flex items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-sm hover:bg-primary/90"
+            >
+              Back to sign-in
+            </a>
+          </div>
+        )}
       </section>
     </main>
   )
@@ -187,13 +191,36 @@ async function resolvePostLogoutRedirect(args: {
   return allowed ? requestedUrl.toString() : fallback
 }
 
+// The login page of the app a sign-in started from, for the error page's
+// button. Taken from the client's registered redirect URI, never from the
+// query, so the button can only lead back to that app.
+async function appLoginUrl(clientId: string | null): Promise<string | null> {
+  if (!clientId) return null
+  const client = await getDb().query.oauthClient.findFirst({
+    where: { clientId },
+    columns: { redirectUris: true },
+  })
+  const redirectUri = client?.redirectUris[0]
+  if (!redirectUri) return null
+  try {
+    return new URL('/login', redirectUri).toString()
+  } catch {
+    return null
+  }
+}
+
 // Starts the Google sign-in redirect. Uses returnHeaders so we get both the
 // redirect URL and the Set-Cookie headers (state cookie for CSRF). A bare
 // Response.redirect() drops those cookies → state_mismatch on the callback.
+// A refused or failed sign-in lands on /error with the app's client_id, so
+// the page can send the user back to that app instead of this worker's root.
 async function startGoogleSignIn(request: Request, callbackUrl: URL) {
   const auth = getAuth()
+  const errorUrl = new URL('/error', callbackUrl.origin)
+  const clientId = callbackUrl.searchParams.get('client_id')
+  if (clientId) errorUrl.searchParams.set('client_id', clientId)
   const { headers: responseHeaders, response } = await auth.api.signInSocial({
-    body: { provider: 'google', callbackURL: callbackUrl.href },
+    body: { provider: 'google', callbackURL: callbackUrl.href, errorCallbackURL: errorUrl.href },
     headers: request.headers,
     returnHeaders: true,
   })
@@ -467,7 +494,8 @@ export const app = new Spiceflow()
     const error = url.searchParams.get('error')
     const errorDescription = url.searchParams.get('error_description')
     if (!error) return Response.redirect(new URL('/', url.origin).toString(), 302)
-    return <ErrorScreen error={error} errorDescription={errorDescription} />
+    const backUrl = await appLoginUrl(url.searchParams.get('client_id'))
+    return <ErrorScreen error={error} errorDescription={errorDescription} backUrl={backUrl} />
   })
 
   // ── Health check ──────────────────────────────────────────────
