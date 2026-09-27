@@ -197,6 +197,10 @@ export const apiToken = sqliteCore.sqliteTable('api_token', {
   hashedKey: sqliteCore.text('hashed_key').notNull().unique(),
   createdBy: sqliteCore.text('created_by').notNull().references(() => user.id, { onDelete: 'cascade' }),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+  // Null only for tokens made before expiry existed: those never expire
+  expiresAt: epochMs('expires_at'),
+  // Written at most once an hour, so a busy CI token isn't a D1 write per request
+  lastUsedAt: epochMs('last_used_at'),
 }, (table) => [
   sqliteCore.index('api_token_project_id_idx').on(table.projectId),
   sqliteCore.index('api_token_hashed_key_idx').on(table.hashedKey),

@@ -551,6 +551,8 @@ export const app = new Spiceflow({ tracer })
           .filter((name): name is string => Boolean(name)),
         createdBy: t.creator?.name ?? '—',
         createdAt: t.createdAt,
+        expiresAt: t.expiresAt,
+        lastUsedAt: t.lastUsedAt,
       })),
     }
   })

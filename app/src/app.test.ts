@@ -35,11 +35,13 @@ async function insertApiToken({
   projectId,
   createdBy,
   environmentIds,
+  expiresAt,
 }: {
   name: string
   projectId: string
   createdBy: string
   environmentIds?: string[]
+  expiresAt?: number
 }) {
   const { key, hashedKey, prefix } = await generateApiToken()
   const db = getDb()
@@ -49,6 +51,7 @@ async function insertApiToken({
     prefix,
     hashedKey,
     createdBy,
+    expiresAt,
   }).returning({ id: schema.apiToken.id })
   if (environmentIds?.length) {
     await db.insert(schema.apiTokenEnvironment).values(
@@ -624,6 +627,41 @@ describe('api tokens', () => {
       params: { pid: projectId, eid: devEnvId, name: 'TOKEN_TEST' },
     }))
     expect(result.value).toBe('secret-value')
+  })
+
+  test('an expired token gets 401 API token expired, one still valid keeps working', async () => {
+    const user = await createTestUser({ name: 'ExpiryUser' })
+    const expired = await insertApiToken({ name: 'expired', projectId, createdBy: user.user.id, expiresAt: Date.now() - 1000 })
+    const valid = await insertApiToken({ name: 'valid', projectId, createdBy: user.user.id, expiresAt: Date.now() + 86_400_000 })
+    const read = (key: string) => app.handle(new Request(
+      `http://e.ly/api/v0/projects/${projectId}/environments/${devEnvId}/secrets/TOKEN_TEST`,
+      { headers: { authorization: `Bearer ${key}` } },
+    ))
+    const expiredRes = await read(expired.key)
+    expect({ expired: { status: expiredRes.status, body: await expiredRes.json() }, valid: (await read(valid.key)).status })
+      .toEqual({ expired: { status: 401, body: { error: 'API token expired' } }, valid: 200 })
+  })
+
+  test('last use is recorded, at most once an hour', async () => {
+    const user = await createTestUser({ name: 'LastUsedUser' })
+    const { key, tokenId } = await insertApiToken({ name: 'last-used', projectId, createdBy: user.user.id })
+    const read = async () => assertOk(await authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets/:name', {
+      params: { pid: projectId, eid: devEnvId, name: 'TOKEN_TEST' },
+    }))
+    const lastUsedAt = async () => (await getDb().query.apiToken.findFirst({ where: { id: tokenId }, columns: { lastUsedAt: true } }))!.lastUsedAt
+    await read()
+    const first = await lastUsedAt()
+    await read()
+    const second = await lastUsedAt()
+    // Two hours later, the next use writes again
+    await getDb().update(schema.apiToken).set({ lastUsedAt: Date.now() - 2 * 3_600_000 }).where(orm.eq(schema.apiToken.id, tokenId))
+    await read()
+    const third = await lastUsedAt()
+    expect({
+      recorded: first !== null,
+      unchangedWithinHour: second === first,
+      rewrittenLater: third !== null && third > Date.now() - 60_000,
+    }).toEqual({ recorded: true, unchangedWithinHour: true, rewrittenLater: true })
   })
 
   // Regression: secret_event.api_token_id was ON DELETE CASCADE, so deleting
@@ -1821,6 +1859,8 @@ describe('formatTime', () => {
     expect(formatTime({ ts: now - 5 * 60_000, now, timeZone: 'UTC' })).toMatchInlineSnapshot(`"5m ago"`)
     expect(formatTime({ ts: now - 3 * 3_600_000, now, timeZone: 'UTC' })).toMatchInlineSnapshot(`"3h ago"`)
     expect(formatTime({ ts: now - 3 * 86_400_000, now, timeZone: 'UTC' })).toMatchInlineSnapshot(`"Jul 28, 2026"`)
+    // A future time (a token's expiry) is a date, not "just now"
+    expect(formatTime({ ts: now + 90 * 86_400_000, now, timeZone: 'UTC' })).toBe(formatAbsoluteDate({ ts: now + 90 * 86_400_000, timeZone: 'UTC' }))
   })
 
   test('a bucket boundary crossing between SSR and hydration changes the text', () => {

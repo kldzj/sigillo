@@ -1,7 +1,8 @@
 // Tokens management page — table of API tokens with create/delete.
 // Each token is scoped to a project and optionally to an env allowlist
-// (zero rows = all envs). The full key is only shown once at creation
-// (never stored), so the create dialog has a "copy key" step before closing.
+// (zero rows = all envs), and expires after a lifetime picked at creation.
+// The full key is only shown once at creation (never stored), so the
+// create dialog has a "copy key" step before closing.
 
 "use client"
 
@@ -22,7 +23,7 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
-import { cn } from "sigillo-app/src/lib/utils"
+import { cn, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS } from "sigillo-app/src/lib/utils"
 import { createTokenAction, deleteTokenAction } from "../actions.ts"
 
 
@@ -76,11 +77,13 @@ function TokensTable() {
     <Frame className="w-full">
       <Table className="table-fixed">
         <colgroup>
-          <col className="w-1/4" />
-          <col className="w-1/4" />
           <col className="w-1/5" />
-          <col className="w-32" />
-          <col className="w-16" />
+          <col className="w-1/5" />
+          <col className="w-1/6" />
+          <col className="w-28" />
+          <col className="w-28" />
+          <col className="w-28" />
+          <col className="w-12" />
         </colgroup>
         <TableHeader>
           <TableRow className="hover:bg-transparent">
@@ -88,6 +91,8 @@ function TokensTable() {
             <TableHead>Key</TableHead>
             <TableHead>Scope</TableHead>
             <TableHead>Created</TableHead>
+            <TableHead>Expires</TableHead>
+            <TableHead>Last used</TableHead>
             <TableHead />
           </TableRow>
         </TableHeader>
@@ -112,6 +117,19 @@ function TokensTable() {
                   ts={token.createdAt}
                   className="text-muted-foreground text-xs tabular-nums"
                 />
+              </TableCell>
+              <TableCell>
+                <TokenExpiry expiresAt={token.expiresAt} />
+              </TableCell>
+              <TableCell>
+                {token.lastUsedAt === null ? (
+                  <span className="text-muted-foreground text-xs">Never</span>
+                ) : (
+                  <TimeAgo
+                    ts={token.lastUsedAt}
+                    className="text-muted-foreground text-xs tabular-nums"
+                  />
+                )}
               </TableCell>
               <TableCell className="p-0">
                 <button
@@ -138,6 +156,17 @@ function TokensTable() {
   )
 }
 
+// Tokens made before expiry existed have none; they are flagged, not hidden
+function TokenExpiry({ expiresAt }: { expiresAt: number | null }) {
+  if (expiresAt === null) {
+    return <span className="text-warning text-xs" title="Made before tokens expired. Replace it with one that expires.">Never</span>
+  }
+  if (expiresAt <= Date.now()) {
+    return <span className="text-destructive text-xs">Expired</span>
+  }
+  return <TimeAgo ts={expiresAt} className="text-muted-foreground text-xs tabular-nums" />
+}
+
 const tokenSchema = z.object({ name: z.string().min(1, "Name is required") })
 const tokenFields = tokenSchema.keyof().enum
 
@@ -158,6 +187,7 @@ function CreateTokenDialog({
   const [error, setError] = useState<string | null>(null)
   const [scope, setScope] = useState<"all" | "selected">("all")
   const [checked, setChecked] = useState<Record<string, boolean>>({})
+  const [expiresInDays, setExpiresInDays] = useState<number>(DEFAULT_TOKEN_EXPIRY_DAYS)
 
   function handleOpenChange(nextOpen: boolean) {
     if (!nextOpen) {
@@ -166,6 +196,7 @@ function CreateTokenDialog({
       setError(null)
       setScope("all")
       setChecked({})
+      setExpiresInDays(DEFAULT_TOKEN_EXPIRY_DAYS)
     }
     onOpenChange(nextOpen)
   }
@@ -248,6 +279,7 @@ function CreateTokenDialog({
                 name: name.trim(),
                 projectId,
                 environmentIds,
+                expiresInDays,
               })
               setCreatedKey(result.key)
             } catch (e: any) {
@@ -334,6 +366,29 @@ function CreateTokenDialog({
                   })}
                 </div>
               )}
+            </div>
+          </div>
+          <div className="mt-3">
+            <p className="text-sm font-medium mb-2">Expires in</p>
+            <div className="grid grid-cols-4 gap-1.5">
+              {TOKEN_EXPIRY_DAYS.map((days) => (
+                <label
+                  key={days}
+                  className={cn(
+                    "flex items-center justify-center gap-2 rounded-md px-3 py-2 cursor-pointer transition-colors text-sm font-medium",
+                    expiresInDays === days ? "bg-primary/5" : "hover:bg-muted/50",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name="token-expiry"
+                    checked={expiresInDays === days}
+                    onChange={() => setExpiresInDays(days)}
+                    className="accent-primary"
+                  />
+                  {days === 365 ? "1 year" : `${days} days`}
+                </label>
+              ))}
             </div>
           </div>
           <DialogFooter variant="bare" className="mt-4">

@@ -11,7 +11,7 @@
 'use server'
 
 import { ulid } from 'ulid'
-import { getSecretNameError } from './lib/utils.ts'
+import { getSecretNameError, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
 import * as orm from 'drizzle-orm'
 import type { BatchItem } from 'drizzle-orm/batch'
 import { schema } from 'db'
@@ -372,13 +372,17 @@ export async function removeOrgMemberAction({ memberId }: { memberId: string }) 
 
 // ── API Token actions ───────────────────────────────────────────────
 
-export async function createTokenAction({ name, projectId, environmentIds }: {
+export async function createTokenAction({ name, projectId, environmentIds, expiresInDays }: {
   name: string
   projectId: string
   environmentIds?: string[]
+  expiresInDays: number
 }) {
   if (!name) throw new Error('Name is required')
   if (!projectId) throw new Error('Project is required')
+  if (!TOKEN_EXPIRY_DAYS.some((days) => days === expiresInDays)) {
+    throw new Error(`Expiry must be one of ${TOKEN_EXPIRY_DAYS.join(', ')} days`)
+  }
   const session = await requireSession()
   const uniqueEnvIds = Array.from(new Set(environmentIds ?? []))
   await requireTokenScopeAccess({ userId: session.userId, projectId, environmentIds: uniqueEnvIds })
@@ -394,6 +398,7 @@ export async function createTokenAction({ name, projectId, environmentIds }: {
       prefix,
       hashedKey,
       createdBy: session.userId,
+      expiresAt: Date.now() + expiresInDays * 86_400_000,
     }),
     ...uniqueEnvIds.map((environmentId) =>
       db.insert(schema.apiTokenEnvironment).values({ tokenId, environmentId }),
