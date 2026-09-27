@@ -323,7 +323,7 @@ fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
         error.NoHomeDir;
 }
 
-fn getEnvVarOptional(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
+pub fn getEnvVarOptional(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
     return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => err,
