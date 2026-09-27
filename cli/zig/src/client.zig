@@ -1,6 +1,7 @@
 // Typed HTTP client for the Sigillo API used by the Zig CLI.
 
 const std = @import("std");
+const color = @import("color.zig");
 pub const api = @import("generated/sigillo-api.zig");
 
 // Instead of std.http's zig/<version>, so the Sessions page can tell the CLI
@@ -30,7 +31,18 @@ pub const RequestArgs = struct {
     accept: []const u8 = "application/json",
 };
 
+// A protected environment answers 403 STEP_UP_REQUIRED until its user
+// approves the read with a passkey in the browser. The request is then made
+// once more, for every command that reads values.
 pub fn request(args: RequestArgs) !ApiResult {
+    const result = try send(args);
+    if (args.token == null or result.status != 403) return result;
+    const environment_ids = stepUpEnvironments(args.allocator, result.body) orelse return result;
+    if (!try approveInBrowser(args, environment_ids)) return result;
+    return send(args);
+}
+
+fn send(args: RequestArgs) !ApiResult {
     const url = try std.fmt.allocPrint(args.allocator, "{s}{s}", .{ args.base_url, args.path });
     defer args.allocator.free(url);
 
@@ -541,4 +553,60 @@ pub fn downloadSecrets(args: DownloadSecretsArgs) !ApiResult {
         .token = args.token,
         .accept = "*/*",
     });
+}
+
+// ── Step-up ─────────────────────────────────────────────────────────
+
+// How often the CLI asks whether the read was approved
+pub var step_up_poll_ms: u64 = 2000;
+
+fn stepUpEnvironments(allocator: std.mem.Allocator, body: []const u8) ?[]const []const u8 {
+    const Denied = struct { code: []const u8 = "", environmentIds: []const []const u8 = &.{} };
+    const parsed = std.json.parseFromSliceLeaky(Denied, allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    if (!std.mem.eql(u8, parsed.code, "STEP_UP_REQUIRED") or parsed.environmentIds.len == 0) return null;
+    return parsed.environmentIds;
+}
+
+// Opens a request for this login, shows where to approve it and the code to
+// type there (never part of the link), and waits for the approval
+fn approveInBrowser(args: RequestArgs, environment_ids: []const []const u8) !bool {
+    const stderr = std.fs.File.stderr().deprecatedWriter();
+    const opened = try send(.{
+        .allocator = args.allocator,
+        .method = .POST,
+        .base_url = args.base_url,
+        .path = "/api/v0/step-up",
+        .token = args.token,
+        .json_body = try jsonBody(args.allocator, .{ .environmentIds = environment_ids }),
+    });
+    const Opened = struct { id: []const u8, userCode: []const u8, approveUrl: []const u8, expiresAt: i64 };
+    const request_info = (if (opened.status == 200) std.json.parseFromSliceLeaky(Opened, args.allocator, opened.body, .{ .ignore_unknown_fields = true }) catch null else null) orelse {
+        const message = parseError(args.allocator, opened.body) orelse "unknown error";
+        try color.err(stderr, "error");
+        try stderr.print(": could not ask for an approval ({d}): {s}\n", .{ opened.status, message });
+        return false;
+    };
+
+    try stderr.writeAll("This environment is protected: approve the read with your passkey.\n  Open ");
+    try color.cyan(stderr, request_info.approveUrl);
+    try stderr.writeAll(" and enter ");
+    try color.bold(stderr, request_info.userCode);
+    try stderr.writeAll("\n");
+    try color.dim(stderr, "Waiting for your approval...\n");
+
+    const status_path = try std.fmt.allocPrint(args.allocator, "/api/v0/step-up/{s}", .{request_info.id});
+    while (std.time.milliTimestamp() < request_info.expiresAt) {
+        std.Thread.sleep(step_up_poll_ms * std.time.ns_per_ms);
+        const polled = try send(.{ .allocator = args.allocator, .method = .GET, .base_url = args.base_url, .path = status_path, .token = args.token });
+        const status = if (polled.status == 200) jsonString(args.allocator, polled.body, "status") orelse "" else "";
+        if (std.mem.eql(u8, status, "approved")) {
+            try color.green(stderr, "✔");
+            try stderr.writeAll(" Approved for 15 minutes\n");
+            return true;
+        }
+        if (!std.mem.eql(u8, status, "pending")) break;
+    }
+    try color.err(stderr, "error");
+    try stderr.writeAll(": the approval expired: run the command again\n");
+    return false;
 }

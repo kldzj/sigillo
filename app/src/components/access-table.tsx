@@ -5,7 +5,7 @@
 
 import { useState } from "react"
 import { TrashIcon, PencilIcon } from "lucide-react"
-import { removeOrgMemberAction, updateOrgMemberRoleAction, updateMemberAccessAction } from "sigillo-app/src/actions"
+import { removeOrgMemberAction, updateOrgMemberRoleAction, updateMemberAccessAction, removeMemberPasskeysAction } from "sigillo-app/src/actions"
 import { InviteButton } from "sigillo-app/src/components/invite-dialog"
 import { Button } from "sigillo-app/src/components/ui/button"
 import { Frame } from "sigillo-app/src/components/ui/frame"
@@ -47,7 +47,7 @@ export function AccessPage() {
 }
 
 export function AccessTable() {
-  const { role, currentUserId, members, orgProjects } = useLoaderData('/dash/projects/:projectId/access')
+  const { role, currentUserId, members, orgProjects, passkeyCounts } = useLoaderData('/dash/projects/:projectId/access')
   const canManage = role === 'admin'
   const [roleOverrides, setRoleOverrides] = useState<Record<string, Member["role"]>>({})
   const [pendingRoleId, setPendingRoleId] = useState<string | null>(null)
@@ -114,6 +114,7 @@ export function AccessTable() {
               <TableHead className="w-28">Role</TableHead>
               <TableHead className="w-28">Projects</TableHead>
               <TableHead className="w-28">Joined</TableHead>
+              {canManage ? <TableHead className="w-28">Passkeys</TableHead> : null}
               {canManage ? <TableHead className="w-12" /> : null}
             </TableRow>
           </TableHeader>
@@ -184,6 +185,28 @@ export function AccessTable() {
                     />
                   </TableCell>
                   {canManage ? (
+                    <TableCell>
+                      <span className="flex items-center gap-2 text-xs tabular-nums">
+                        {passkeyCounts[member.user?.id ?? ""] ?? 0}
+                        {(passkeyCounts[member.user?.id ?? ""] ?? 0) > 0 && (
+                          <button
+                            className="text-muted-foreground hover:text-destructive cursor-pointer"
+                            onClick={async () => {
+                              if (!confirm(`Remove every passkey of ${member.user?.name || "this member"}? They add new ones after signing in again.`)) return
+                              try {
+                                await removeMemberPasskeysAction({ memberId: member.id })
+                              } catch (e) {
+                                setError(e instanceof Error ? e.message : "Failed to remove the passkeys")
+                              }
+                            }}
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </span>
+                    </TableCell>
+                  ) : null}
+                  {canManage ? (
                     <TableCell className="p-0">
                       <Button
                         aria-label={isCurrentUser ? "Remove yourself" : "Remove user"}
@@ -209,12 +232,53 @@ export function AccessTable() {
         </Table>
       </Frame>
 
+      {canManage ? <PasskeyChanges /> : null}
+
       <ManageAccessDialog
         member={editingMember}
         orgProjects={orgProjects}
         open={!!editingMember}
         onClose={() => setEditingMemberId(null)}
       />
+    </div>
+  )
+}
+
+// ── Passkey changes ───────────────────────────────────────────────────
+// Every passkey a member added or removed, or an admin removed, for admins
+
+function PasskeyChanges() {
+  const { passkeyEvents } = useLoaderData('/dash/projects/:projectId/access')
+  if (passkeyEvents.length === 0) return null
+  return (
+    <div className="flex flex-col gap-2 mt-4">
+      <h2 className="text-sm font-semibold">Passkey changes</h2>
+      <Frame className="w-full overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="w-32">Time</TableHead>
+              <TableHead>Member</TableHead>
+              <TableHead className="w-24">Change</TableHead>
+              <TableHead>Passkey</TableHead>
+              <TableHead>By</TableHead>
+              <TableHead className="w-32">IP address</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {passkeyEvents.map((event) => (
+              <TableRow key={event.id}>
+                <TableCell><TimeAgo ts={event.createdAt} className="text-muted-foreground text-xs tabular-nums" /></TableCell>
+                <TableCell className="text-sm">{event.member}</TableCell>
+                <TableCell className="text-sm">{event.action === "added" ? "Added" : "Removed"}</TableCell>
+                <TableCell className="text-sm">{event.passkeyName || "—"}</TableCell>
+                <TableCell className="text-sm">{event.by}</TableCell>
+                <TableCell><code className="text-xs text-muted-foreground mono-sm">{event.ipAddress ?? "—"}</code></TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </Frame>
     </div>
   )
 }

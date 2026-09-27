@@ -167,9 +167,21 @@ sigillo secrets get DATABASE_URL -c dev | sigillo secrets set DATABASE_URL -c pr
 
 The same pattern works for any secret copy, between environments, or when seeding a new environment from an existing one.
 
-### Reads of protected environments are recorded
+### Protected environments need the user's passkey
 
-In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` is recorded in its Read Log with your login, the secret names and your IP address, and fails if it can't be recorded. Read only what the task needs.
+In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` needs a passkey approval, and is recorded in its Read Log with your login, the secret names and your IP address. Read only what the task needs.
+
+Without an approval, the command prints a link and a code on stderr, then waits up to 10 minutes:
+
+```
+This environment is protected: approve the read with your passkey.
+  Open https://<instance>/approve and enter BCDF-GHJK
+Waiting for your approval...
+```
+
+Show the user the link and the code right away, and tell them what the command reads. Never open the page or try to approve it yourself: only the user's passkey can. Once they approve, the command continues, and the login can read that environment for 15 minutes. If it prints `the approval expired`, ask before running it again.
+
+An API token gets `only a machine token can read it`. Don't work around it: tell the user an org admin can create a machine token on the **Tokens** tab.
 
 ### Never read `.env` files or `~/.sigillo/*`
 
@@ -252,7 +264,7 @@ After setup, `sigillo run` in any subdirectory uses that project + environment a
   run: npx @kldzj/sigillo run -- pnpm build
 ```
 
-API tokens expire after the 7 to 365 days chosen when they were created (90 by default), so CI needs a new one before then.
+API tokens expire after the 7 to 365 days chosen when they were created (90 by default), so CI needs a new one before then. A protected environment needs a machine token, which an org admin creates with **Machine token** checked, and which expires after 90 days at most.
 
 ### Redaction details
 

@@ -131,6 +131,7 @@ export const app = new Spiceflow({ tracer })
   // ── Layout: Standalone pages (login, device, invite, new-org) ──
   .layout('/login', async ({ children, request }) => <AppShell request={request}>{children}</AppShell>)
   .layout('/device', async ({ children, request }) => <AppShell request={request}>{children}</AppShell>)
+  .layout('/approve', async ({ children, request }) => <AppShell request={request}>{children}</AppShell>)
   .layout('/invite/*', async ({ children, request }) => <AppShell request={request}>{children}</AppShell>)
 
   .loader('/dash/*', async ({ request }) => {
@@ -465,12 +466,34 @@ export const app = new Spiceflow({ tracer })
       }),
     ])
 
+    // Admins see who has passkeys, and every passkey added or removed
+    const userIds = members.map((member) => member.userId)
+    const [passkeys, events] = role === 'admin'
+      ? await Promise.all([
+        db.query.passkey.findMany({ where: { userId: { in: userIds } }, columns: { userId: true } }),
+        db.query.passkeyEvent.findMany({ where: { userId: { in: userIds } }, orderBy: { createdAt: 'desc' }, limit: 50 }),
+      ])
+      : [[], []]
+    const nameOf = (userId: string) => members.find((member) => member.userId === userId)?.user?.name ?? 'Former member'
+    const passkeyCounts = Object.fromEntries(userIds.map((userId) => [userId, passkeys.filter((p) => p.userId === userId).length]))
+    const passkeyEvents = events.map((event) => ({
+      id: event.id,
+      member: nameOf(event.userId),
+      action: event.action,
+      passkeyName: event.passkeyName,
+      by: event.actor === 'self-host' ? 'self-host' : event.actor === `user:${event.userId}` ? 'themselves' : nameOf(event.actor.replace(/^user:/, '')),
+      ipAddress: event.ipAddress,
+      createdAt: event.createdAt,
+    }))
+
     return {
       orgId,
       role,
       currentUserId: session.userId,
       members,
       orgProjects,
+      passkeyCounts,
+      passkeyEvents,
     }
   })
 
@@ -620,6 +643,40 @@ export const app = new Spiceflow({ tracer })
     )
   })
 
+  // ── Your passkeys ──────────────────────────────────────────────────
+  .loader('/dash/passkeys', async ({ request }) => {
+    const session = await requirePageSession(request)
+    const passkeys = await getDb().query.passkey.findMany({
+      where: { userId: session.userId },
+      columns: { id: true, name: true, backedUp: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    })
+    return {
+      passkeys: passkeys.map((p) => ({ ...p, createdAt: p.createdAt ?? 0 })),
+      // The first passkey needs a sign-in from the last 5 minutes
+      freshSignIn: Date.now() - session.sessionCreatedAt < 5 * 60 * 1000,
+    }
+  })
+
+  .page('/dash/passkeys', async () => {
+    const { PasskeysPage } = await import('sigillo-app/src/components/passkeys-page')
+    return (
+      <div className="flex flex-col gap-3 w-full">
+        <PasskeysPage />
+      </div>
+    )
+  })
+
+  // ── Approving a CLI read ───────────────────────────────────────────
+  // The CLI prints this page and a code; the code is typed here, never part
+  // of a link, so a link someone sends you approves nothing.
+  .page('/approve', async ({ request }) => {
+    const session = await getSession(request)
+    if (!session) return Response.redirect(new URL('/login', request.url).toString(), 302)
+    const { ApprovePage } = await import('sigillo-app/src/components/approve-page')
+    return <ContentFrame><ApprovePage /></ContentFrame>
+  })
+
   // ── Your sessions ──────────────────────────────────────────────────
   .loader('/dash/sessions', async ({ request }) => {
     return { sessions: await listUserSessions(request) }
@@ -635,9 +692,11 @@ export const app = new Spiceflow({ tracer })
   })
 
   // ── Tokens page ────────────────────────────────────────────────────
-  .loader('/dash/projects/:projectId/tokens', async ({ params }) => {
+  .loader('/dash/projects/:projectId/tokens', async ({ params, request }) => {
     const db = getDb()
     const { projectId } = params
+    const session = await requirePageSession(request)
+    const access = await getProjectMemberAccess(session.userId, projectId)
 
     const tokens = await db.query.apiToken.findMany({
       where: { projectId },
@@ -650,6 +709,7 @@ export const app = new Spiceflow({ tracer })
 
     return {
       projectId,
+      isAdmin: access?.role === 'admin',
       tokens: tokens.map((t) => ({
         id: t.id,
         name: t.name,
@@ -661,6 +721,8 @@ export const app = new Spiceflow({ tracer })
         createdAt: t.createdAt,
         expiresAt: t.expiresAt,
         lastUsedAt: t.lastUsedAt,
+        lastUsedIp: t.lastUsedIp,
+        protectedAccess: t.protectedAccess,
       })),
     }
   })

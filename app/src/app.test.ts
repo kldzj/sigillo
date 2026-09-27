@@ -19,6 +19,9 @@ import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNa
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
+import { createSoftAuthenticator } from './soft-authenticator.js'
+import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval } from './step-up.js'
+import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
@@ -38,12 +41,15 @@ async function insertApiToken({
   createdBy,
   environmentIds,
   expiresAt,
+  protectedAccess,
 }: {
   name: string
   projectId: string
   createdBy: string
   environmentIds?: string[]
   expiresAt?: number
+  // A machine token, which may read protected environments
+  protectedAccess?: boolean
 }) {
   const { key, hashedKey, prefix } = await generateApiToken()
   const db = getDb()
@@ -54,6 +60,7 @@ async function insertApiToken({
     hashedKey,
     createdBy,
     expiresAt,
+    protectedAccess,
   }).returning({ id: schema.apiToken.id })
   if (environmentIds?.length) {
     await db.insert(schema.apiTokenEnvironment).values(
@@ -73,6 +80,17 @@ async function createTestUser(overrides?: { email?: string; name?: string }) {
   // Signed like the session cookie and the CLI's token; bearer() refuses raw tokens
   const { secret } = await auth.$context
   return { user: res.user, token: `${res.token!}.${await makeSignature(res.token!, secret)}` }
+}
+
+// The session behind a test token (signed: <token>.<signature>)
+async function sessionIdOf(token: string) {
+  return (await getDb().query.session.findFirst({ where: { token: token.split('.')[0]! }, columns: { id: true } }))!.id
+}
+
+// A passkey approval for reading, without the ceremony
+async function grantRead(token: string, environmentIds: string[], expiresAt = Date.now() + 60_000) {
+  const session = (await getDb().query.session.findFirst({ where: { token: token.split('.')[0]! }, columns: { id: true, userId: true } }))!
+  await getDb().insert(schema.stepUpGrant).values({ userId: session.userId, sessionId: session.id, environmentIds, expiresAt })
 }
 
 /** Throw if Error, return the success result */
@@ -643,26 +661,30 @@ describe('api tokens', () => {
       .toEqual({ expired: { status: 401, body: { error: 'API token expired' } }, valid: 200 })
   })
 
-  test('last use is recorded, at most once an hour', async () => {
+  test('last use and its IP are recorded, at most once an hour', async () => {
     const user = await createTestUser({ name: 'LastUsedUser' })
     const { key, tokenId } = await insertApiToken({ name: 'last-used', projectId, createdBy: user.user.id })
-    const read = async () => assertOk(await authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets/:name', {
+    const read = async (ip: string) => assertOk(await createSpiceflowFetch(app, {
+      headers: { authorization: `Bearer ${key}`, 'cf-connecting-ip': ip },
+    })('/api/v0/projects/:pid/environments/:eid/secrets/:name', {
       params: { pid: projectId, eid: devEnvId, name: 'TOKEN_TEST' },
     }))
-    const lastUsedAt = async () => (await getDb().query.apiToken.findFirst({ where: { id: tokenId }, columns: { lastUsedAt: true } }))!.lastUsedAt
-    await read()
-    const first = await lastUsedAt()
-    await read()
-    const second = await lastUsedAt()
+    const lastUse = async () => (await getDb().query.apiToken.findFirst({ where: { id: tokenId }, columns: { lastUsedAt: true, lastUsedIp: true } }))!
+    await read('203.0.113.1')
+    const first = await lastUse()
+    await read('203.0.113.2')
+    const second = await lastUse()
     // Two hours later, the next use writes again
     await getDb().update(schema.apiToken).set({ lastUsedAt: Date.now() - 2 * 3_600_000 }).where(orm.eq(schema.apiToken.id, tokenId))
-    await read()
-    const third = await lastUsedAt()
+    await read('203.0.113.3')
+    const third = await lastUse()
     expect({
-      recorded: first !== null,
-      unchangedWithinHour: second === first,
-      rewrittenLater: third !== null && third > Date.now() - 60_000,
-    }).toEqual({ recorded: true, unchangedWithinHour: true, rewrittenLater: true })
+      recorded: first.lastUsedAt !== null,
+      firstIp: first.lastUsedIp,
+      unchangedWithinHour: second.lastUsedAt === first.lastUsedAt && second.lastUsedIp === first.lastUsedIp,
+      rewrittenLater: third.lastUsedAt !== null && third.lastUsedAt > Date.now() - 60_000,
+      laterIp: third.lastUsedIp,
+    }).toEqual({ recorded: true, firstIp: '203.0.113.1', unchangedWithinHour: true, rewrittenLater: true, laterIp: '203.0.113.3' })
   })
 
   // Regression: secret_event.api_token_id was ON DELETE CASCADE, so deleting
@@ -2318,7 +2340,8 @@ describe('tamper-evident history', () => {
     await setSecret(admin.token, envId, 'X', 'v')
     await setSecret(admin.token, envId, 'Y', 'w')
     await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
-    const { key, tokenId } = await insertApiToken({ name: 'reader', projectId, createdBy: admin.user.id })
+    const { key, tokenId } = await insertApiToken({ name: 'reader', projectId, createdBy: admin.user.id, protectedAccess: true })
+    await grantRead(admin.token, [envId])
     const ip = { 'cf-connecting-ip': '203.0.113.9' }
     expect((await get(key, `${envId}/secrets/X`, ip)).status).toBe(200)
     expect((await get(key, `${envId}/secrets/download?format=json`, ip)).status).toBe(200)
@@ -2337,6 +2360,7 @@ describe('tamper-evident history', () => {
     const envId = await newEnv()
     await setSecret(admin.token, envId, 'X', 'do-not-leak')
     await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    await grantRead(admin.token, [envId])
     await getDb().run(orm.sql.raw(`CREATE TRIGGER refuse_reads BEFORE INSERT ON secret_read BEGIN SELECT RAISE(ABORT, 'read log unavailable'); END`))
     try {
       const res = await get(admin.token, `${envId}/secrets/X`)
@@ -2349,8 +2373,9 @@ describe('tamper-evident history', () => {
   test('turning protection off is recorded, and reads after it are not', async () => {
     const envId = await newEnv()
     await setSecret(admin.token, envId, 'X', 'v')
-    const author = { userId: admin.user.id, apiTokenId: null }
+    const author = { userId: admin.user.id, apiTokenId: null, sessionId: await sessionIdOf(admin.token) }
     await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author })
+    await grantRead(admin.token, [envId])
     await get(admin.token, `${envId}/secrets/X`)
     await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: false, author })
     await get(admin.token, `${envId}/secrets/X`)
@@ -2362,9 +2387,11 @@ describe('tamper-evident history', () => {
     for (const [name, value] of [['X', 'x1'], ['X', 'x2'], ['Y', 'y']] as const) await setSecret(admin.token, envId, name, value)
     await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
     const request = new Request('http://e.ly', { headers: { 'cf-connecting-ip': '203.0.113.5' } })
-    const revealed = await readSecretValues({ request, userId: admin.user.id, environmentId: envId, names: ['X'], kind: 'value' })
-    const downloaded = await readSecretValues({ request, userId: admin.user.id, environmentId: envId, names: null, kind: 'download' })
-    const old = await readEventValue({ request, userId: admin.user.id, eventId: (await eventRow(envId, 1)).id })
+    const sessionId = await sessionIdOf(admin.token)
+    await grantRead(admin.token, [envId])
+    const revealed = await readSecretValues({ request, userId: admin.user.id, sessionId, environmentId: envId, names: ['X'], kind: 'value' })
+    const downloaded = await readSecretValues({ request, userId: admin.user.id, sessionId, environmentId: envId, names: null, kind: 'download' })
+    const old = await readEventValue({ request, userId: admin.user.id, sessionId, eventId: (await eventRow(envId, 1)).id })
     const rows = await getDb().query.secretRead.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } })
     expect({ revealed, downloaded, old, reads: rows.map(({ kind, names, ipAddress }) => ({ kind, names, ipAddress })) }).toEqual({
       revealed: { X: 'x2' },
@@ -2385,8 +2412,9 @@ describe('tamper-evident history', () => {
     await getDb().update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, envId))
     await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
     const request = new Request('http://e.ly')
-    const value = await readSecretValues({ request, userId: member.user.id, environmentId: envId, names: null, kind: 'value' }).catch((error: Error) => error.message)
-    const old = await readEventValue({ request, userId: member.user.id, eventId: (await eventRow(envId, 1)).id }).catch((error: Error) => error.message)
+    const sessionId = await sessionIdOf(member.token)
+    const value = await readSecretValues({ request, userId: member.user.id, sessionId, environmentId: envId, names: null, kind: 'value' }).catch((error: Error) => error.message)
+    const old = await readEventValue({ request, userId: member.user.id, sessionId, eventId: (await eventRow(envId, 1)).id }).catch((error: Error) => error.message)
     expect({ value, old, reads: await readKinds(envId) }).toEqual({
       value: 'admin access required for this environment', old: 'admin access required for this environment', reads: ['protected'],
     })
@@ -2445,5 +2473,313 @@ describe('remembered environment', () => {
     const res = await get(`/dash/projects/${projectId}/envs/preview/event-log`)
     expect({ status: res.status, cookie: res.headers.getSetCookie().find((c) => c.startsWith('sigillo-env-')) })
       .toEqual({ status: 200, cookie: `sigillo-env-${projectId}=preview; Path=/dash; Max-Age=31536000; SameSite=Lax; HttpOnly` })
+  })
+})
+
+describe('passkeys', () => {
+  const origin = 'http://e.ly'
+  const rpID = 'e.ly'
+  const call = (path: string, token: string, init: { body?: unknown; cookie?: string } = {}) => app.handle(new Request(`${origin}${path}`, {
+    method: init.body === undefined ? 'GET' : 'POST',
+    headers: {
+      authorization: `Bearer ${token}`, origin, 'content-type': 'application/json',
+      ...(init.cookie ? { cookie: init.cookie } : {}),
+    },
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  }))
+  // Adds a passkey through better-auth's plugin, like the settings page will
+  const addPasskey = async (token: string) => {
+    const authenticator = await createSoftAuthenticator({ rpID, origin })
+    const optionsRes = await call('/api/auth/passkey/generate-register-options', token)
+    const cookie = optionsRes.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ')
+    const options = await optionsRes.json() as { challenge: string }
+    const res = await call('/api/auth/passkey/verify-registration', token, { body: { response: await authenticator.register(options), name: 'Test key' }, cookie })
+    return { authenticator, status: res.status }
+  }
+
+  test('a passkey is added through the plugin, and cannot sign anyone in', async () => {
+    const { user, token } = await createTestUser()
+    const { status } = await addPasskey(token)
+    const rows = await getDb().query.passkey.findMany({ where: { userId: user.id } })
+    expect({
+      status,
+      rows: rows.map(({ name, deviceType }) => ({ name, deviceType })),
+      signInOptions: (await call('/api/auth/passkey/generate-authenticate-options', token)).status,
+      signIn: (await call('/api/auth/passkey/verify-authentication', token, { body: {} })).status,
+    }).toEqual({ status: 200, rows: [{ name: 'Test key', deviceType: 'singleDevice' }], signInOptions: 404, signIn: 404 })
+  })
+
+  test('an approval needs a user-verified signature of the challenge by one of your own passkeys', async () => {
+    const alice = await createTestUser()
+    const bob = await createTestUser()
+    const { authenticator } = await addPasskey(alice.token)
+    await addPasskey(bob.token)
+    const verify = async (userId: string, sign: (options: { challenge: string }) => Promise<AuthenticationResponseJSON>) => {
+      const options = await passkeyChallenge({ userId, rpID })
+      return verifyPasskey({ userId, response: await sign(options), expectedChallenge: options.challenge, origin, rpID })
+    }
+    const before = (await getDb().query.passkey.findFirst({ where: { userId: alice.user.id } }))!.counter
+    expect({
+      verified: await verify(alice.user.id, (o) => authenticator.authenticate(o)),
+      counterAdvanced: (await getDb().query.passkey.findFirst({ where: { userId: alice.user.id } }))!.counter > before,
+      withoutUserVerification: await verify(alice.user.id, (o) => authenticator.authenticate(o, { userVerified: false })),
+      otherChallenge: await verify(alice.user.id, () => authenticator.authenticate({ challenge: 'c29tZXRoaW5nIGVsc2U' })),
+      otherOrigin: await verify(alice.user.id, (o) => authenticator.authenticate(o, { origin: 'https://evil.example' })),
+      someoneElsesUser: await verify(bob.user.id, (o) => authenticator.authenticate(o)),
+    }).toEqual({ verified: true, counterAdvanced: true, withoutUserVerification: false, otherChallenge: false, otherOrigin: false, someoneElsesUser: false })
+  })
+})
+
+describe('step-up', () => {
+  const origin = 'http://e.ly'
+  let admin: Awaited<ReturnType<typeof createTestUser>>
+  let projectId: string
+  let protectedEnv: string
+  let otherEnv: string
+
+  beforeAll(async () => {
+    admin = await createTestUser({ name: 'Step-up Admin' })
+    const af = authedFetch(admin.token)
+    const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Step-up Org' } }))
+    projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Step-up Project', orgId: org.id } })).id
+    const envs = assertOk(await af('/api/v0/projects/:projectId/environments', { params: { projectId } })).environments
+    protectedEnv = envs.find((e) => e.slug === 'prod')!.id
+    otherEnv = envs.find((e) => e.slug === 'preview')!.id
+    for (const envId of [protectedEnv, otherEnv]) {
+      assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', { method: 'PUT', params: { pid: projectId, eid: envId }, body: { secrets: { KEY: 'v' } } }))
+      await setEnvironmentProtection({ request: new Request(origin), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    }
+  })
+
+  const call = (token: string, path: string, init: { method?: string; body?: unknown } = {}) => app.handle(new Request(`${origin}${path}`, {
+    method: init.method ?? (init.body === undefined ? 'GET' : 'POST'),
+    headers: { authorization: `Bearer ${token}`, origin, 'content-type': 'application/json' },
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  }))
+  // Every API route that returns values or what they look like
+  const reads = (envId: string) => [
+    `/api/v0/projects/${projectId}/environments/${envId}/secrets`,
+    `/api/v0/projects/${projectId}/environments/${envId}/secrets/KEY`,
+    `/api/v0/projects/${projectId}/environments/${envId}/secrets/download?format=json`,
+  ]
+  const statuses = async (token: string, envId: string) => Promise.all(reads(envId).map(async (path) => (await call(token, path)).status))
+  // A second login of the same user, like another machine
+  const secondSession = async () => {
+    const auth = await getTestAuth()
+    const res = await auth.api.signInEmail({ body: { email: admin.user.email, password: 'test-password-123' } })
+    return `${res.token}.${await makeSignature(res.token, (await auth.$context).secret)}`
+  }
+
+  test('a session reads a protected environment only with a live grant for it', async () => {
+    const user = await createTestUser()
+    await getDb().insert(schema.orgMember).values({ orgId: (await getDb().query.project.findFirst({ where: { id: projectId } }))!.orgId, userId: user.user.id, role: 'admin' })
+    const without = await call(user.token, reads(protectedEnv)[1]!)
+    const denied = { status: without.status, body: await without.json() }
+    const none = await statuses(user.token, protectedEnv)
+    await grantRead(user.token, [otherEnv])
+    const wrongEnv = await statuses(user.token, protectedEnv)
+    await grantRead(user.token, [protectedEnv], Date.now() - 1)
+    const expired = await statuses(user.token, protectedEnv)
+    await grantRead(user.token, [protectedEnv])
+    const granted = await statuses(user.token, protectedEnv)
+    expect({ denied, none, wrongEnv, expired, granted }).toEqual({
+      denied: { status: 403, body: { error: 'this environment is protected: approve the read with your passkey', code: 'STEP_UP_REQUIRED', environmentIds: [protectedEnv] } },
+      none: [403, 403, 403], wrongEnv: [403, 403, 403], expired: [403, 403, 403], granted: [200, 200, 200],
+    })
+  })
+
+  test('a grant belongs to the session that asked, not to other logins of the same user', async () => {
+    const other = await secondSession()
+    await grantRead(other, [protectedEnv])
+    const mine = await secondSession()
+    expect({ other: await statuses(other, protectedEnv), mine: await statuses(mine, protectedEnv) }).toEqual({ other: [200, 200, 200], mine: [403, 403, 403] })
+  })
+
+  test('only a machine token reads a protected environment, and unprotected ones need nothing', async () => {
+    const plain = await insertApiToken({ name: 'plain', projectId, createdBy: admin.user.id })
+    const machine = await insertApiToken({ name: 'machine', projectId, createdBy: admin.user.id, protectedAccess: true })
+    const dev = assertOk(await authedFetch(admin.token)('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'dev' } })).id
+    assertOk(await authedFetch(admin.token)('/api/v0/projects/:pid/environments/:eid/secrets', { method: 'PUT', params: { pid: projectId, eid: dev }, body: { secrets: { KEY: 'v' } } }))
+    const plainRes = await call(plain.key, reads(protectedEnv)[1]!)
+    expect({
+      plain: await statuses(plain.key, protectedEnv),
+      plainBody: (await plainRes.json() as { code: string }).code,
+      machine: await statuses(machine.key, protectedEnv),
+      unprotected: await statuses(plain.key, dev),
+    }).toEqual({ plain: [403, 403, 403], plainBody: 'MACHINE_TOKEN_REQUIRED', machine: [200, 200, 200], unprotected: [200, 200, 200] })
+  })
+
+  test('the web reads go through the same gate', async () => {
+    const session = await secondSession()
+    const sessionId = await sessionIdOf(session)
+    const request = new Request(origin)
+    const eventId = (await getDb().query.secretEvent.findFirst({ where: { environmentId: protectedEnv } }))!.id
+    const attempt = (read: () => Promise<unknown>) => read().then(() => 'read', (e) => e instanceof StepUpRequiredError ? 'step-up' : String(e))
+    const before = {
+      value: await attempt(() => readSecretValues({ request, userId: admin.user.id, sessionId, environmentId: protectedEnv, names: null, kind: 'value' })),
+      event: await attempt(() => readEventValue({ request, userId: admin.user.id, sessionId, eventId })),
+    }
+    await grantRead(session, [protectedEnv])
+    const after = {
+      value: await attempt(() => readSecretValues({ request, userId: admin.user.id, sessionId, environmentId: protectedEnv, names: null, kind: 'value' })),
+      event: await attempt(() => readEventValue({ request, userId: admin.user.id, sessionId, eventId })),
+    }
+    expect({ before, after }).toEqual({ before: { value: 'step-up', event: 'step-up' }, after: { value: 'read', event: 'read' } })
+  })
+
+  test('the CLI asks, its user approves on /approve with a passkey, and then the CLI reads', async () => {
+    const cli = await secondSession()
+    const authenticator = await createSoftAuthenticator({ rpID: 'e.ly', origin })
+    // The browser session, fresh enough for a first passkey
+    const optionsRes = await call(admin.token, '/api/auth/passkey/generate-register-options')
+    const cookie = optionsRes.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ')
+    const regOptions = await optionsRes.json() as { challenge: string }
+    const added = await app.handle(new Request(`${origin}/api/auth/passkey/verify-registration`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${admin.token}`, origin, 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ response: await authenticator.register(regOptions), name: 'Laptop' }),
+    }))
+    expect(added.status).toBe(200)
+
+    const asked = await call(cli, '/api/v0/step-up', { body: { environmentIds: [protectedEnv] } })
+    const request = await asked.json() as { id: string; userCode: string; approveUrl: string }
+    const statusOf = async (token: string) => { const res = await call(token, `/api/v0/step-up/${request.id}`); return res.status === 200 ? (await res.json() as { status: string }).status : res.status }
+    const stranger = await createTestUser()
+    const beforeApproval = { status: await statusOf(cli), read: (await call(cli, reads(protectedEnv)[1]!)).status }
+    const found = await findStepUpRequest({ userId: admin.user.id, userCode: request.userCode.toLowerCase() })
+    const options = await approvalOptions({ request: new Request(origin), requestId: request.id, userId: admin.user.id })
+    const approved = await approveStepUpRequest({ request: new Request(origin), requestId: request.id, userId: admin.user.id, response: await authenticator.authenticate(options) })
+    expect({
+      asked: asked.status,
+      approveUrl: request.approveUrl,
+      codeInLink: request.approveUrl.includes(request.userCode),
+      beforeApproval,
+      strangerFinds: await findStepUpRequest({ userId: stranger.user.id, userCode: request.userCode }),
+      found: found && { environments: found.environments.map((e) => e.name) },
+      approved,
+      afterApproval: { status: await statusOf(cli), read: (await call(cli, reads(protectedEnv)[1]!)).status },
+      browserStillNeedsItsOwn: (await call(admin.token, reads(protectedEnv)[1]!)).status,
+      othersCannotPoll: await statusOf(admin.token),
+      approvedTwice: await approveStepUpRequest({ request: new Request(origin), requestId: request.id, userId: admin.user.id, response: await authenticator.authenticate(options) }),
+    }).toEqual({
+      asked: 200,
+      approveUrl: 'http://e.ly/approve',
+      codeInLink: false,
+      beforeApproval: { status: 'pending', read: 403 },
+      strangerFinds: null,
+      found: { environments: ['Prod'] },
+      approved: true,
+      afterApproval: { status: 'approved', read: 200 },
+      browserStillNeedsItsOwn: 403,
+      othersCannotPoll: 404,
+      approvedTwice: false,
+    })
+  })
+
+  test('only an admin makes a machine token, for 90 days at most, with an approval for each protected environment it covers', async () => {
+    // A login without grants from the other tests
+    const sessionId = await sessionIdOf(await secondSession())
+    const token = (await getDb().query.session.findFirst({ where: { id: sessionId }, columns: { token: true } }))!.token
+    const dev = assertOk(await authedFetch(admin.token)('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'dev' } })).id
+    const member = await createTestUser({ name: 'Step-up Member' })
+    const { orgId } = (await getDb().query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } }))!
+    await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    const outcome = async (args: Partial<Parameters<typeof requireMachineTokenApproval>[0]>) => {
+      try {
+        await requireMachineTokenApproval({ userId: admin.user.id, sessionId, projectId, environmentIds: [], expiresInDays: 90, ...args })
+        return 'ok'
+      } catch (error) {
+        return error instanceof StepUpRequiredError ? { stepUp: error.environmentIds.sort() } : (error as Error).message
+      }
+    }
+    const before = {
+      member: await outcome({ userId: member.user.id, sessionId: await sessionIdOf(member.token) }),
+      year: await outcome({ expiresInDays: 365 }),
+      all: await outcome({}),
+      unprotectedOnly: await outcome({ environmentIds: [dev] }),
+      mixed: await outcome({ environmentIds: [dev, protectedEnv] }),
+    }
+    await grantRead(token, [protectedEnv])
+    const oneApproved = await outcome({})
+    await grantRead(token, [otherEnv])
+    expect({ ...before, oneApproved, bothApproved: await outcome({}) }).toEqual({
+      member: 'Only admins can make a machine token',
+      year: 'A machine token expires after 90 days at most',
+      all: { stepUp: [otherEnv, protectedEnv].sort() },
+      unprotectedOnly: 'ok',
+      mixed: { stepUp: [protectedEnv] },
+      oneApproved: { stepUp: [otherEnv] },
+      bothApproved: 'ok',
+    })
+  })
+
+  test('turning protection off takes a passkey approval, turning it on does not', async () => {
+    const token = await secondSession()
+    const author = { userId: admin.user.id, apiTokenId: null, sessionId: await sessionIdOf(token) }
+    const slug = `unprotect-${Date.now()}`
+    const envId = assertOk(await authedFetch(admin.token)('/api/v0/projects/:projectId/environments', { method: 'POST', params: { projectId }, body: { name: slug, slug } })).id
+    const toggle = async (protect: boolean) => {
+      try {
+        await setEnvironmentProtection({ request: new Request(origin), environmentId: envId, protect, author })
+        return 'ok'
+      } catch (error) {
+        return error instanceof StepUpRequiredError ? 'step-up' : (error as Error).message
+      }
+    }
+    const isProtected = async () => (await getDb().query.environment.findFirst({ where: { id: envId }, columns: { protected: true } }))!.protected
+    const on = await toggle(true)
+    const offWithoutApproval = await toggle(false)
+    const stillProtected = await isProtected()
+    await grantRead(token, [envId])
+    const offWithApproval = await toggle(false)
+    expect({ on, offWithoutApproval, stillProtected, offWithApproval, nowProtected: await isProtected() })
+      .toEqual({ on: 'ok', offWithoutApproval: 'step-up', stillProtected: true, offWithApproval: 'ok', nowProtected: false })
+  })
+
+  test('API tokens cannot ask for an approval', async () => {
+    const machine = await insertApiToken({ name: 'asker', projectId, createdBy: admin.user.id, protectedAccess: true })
+    expect((await call(machine.key, '/api/v0/step-up', { body: { environmentIds: [protectedEnv] } })).status).toBe(403)
+  })
+
+  test('a first passkey needs a fresh sign-in, and another one an approval with the first', async () => {
+    const user = await createTestUser()
+    const authenticator = await createSoftAuthenticator({ rpID: 'e.ly', origin })
+    const add = async () => {
+      const optionsRes = await call(user.token, '/api/auth/passkey/generate-register-options')
+      const cookie = optionsRes.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ')
+      const second = await createSoftAuthenticator({ rpID: 'e.ly', origin })
+      const res = await app.handle(new Request(`${origin}/api/auth/passkey/verify-registration`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${user.token}`, origin, 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ response: await (authenticator.credentialId && (await getDb().query.passkey.findFirst({ where: { userId: user.user.id } })) ? second : authenticator).register(await optionsRes.json() as { challenge: string }) }),
+      }))
+      return res.status
+    }
+    const sessionId = await sessionIdOf(user.token)
+    await getDb().update(schema.session).set({ createdAt: Date.now() - 10 * 60 * 1000 }).where(orm.eq(schema.session.id, sessionId))
+    const staleFirst = await add()
+    await getDb().update(schema.session).set({ createdAt: Date.now() }).where(orm.eq(schema.session.id, sessionId))
+    const freshFirst = await add()
+    const secondWithout = await add()
+    const request = await createStepUpRequest({ request: new Request(origin), userId: user.user.id, sessionId, environmentIds: [], withCode: false, purpose: 'passkeys' })
+    const options = await approvalOptions({ request: new Request(origin), requestId: request.id, userId: user.user.id })
+    await approveStepUpRequest({ request: new Request(origin), requestId: request.id, userId: user.user.id, response: await authenticator.authenticate(options) })
+    const secondApproved = await add()
+    const events = await getDb().query.passkeyEvent.findMany({ where: { userId: user.user.id } })
+    expect({ staleFirst, freshFirst, secondWithout, secondApproved, logged: events.map((e) => e.action) })
+      .toEqual({ staleFirst: 403, freshFirst: 200, secondWithout: 403, secondApproved: 200, logged: ['added', 'added'] })
+  })
+
+  test('values are only decrypted where the gate has run: a new call site fails here', () => {
+    const sources = import.meta.glob(['./**/*.ts', './**/*.tsx', '!./**/*.test.ts', '!./soft-authenticator.ts'], { query: '?raw', import: 'default', eager: true }) as Record<string, string>
+    const calls: Record<string, number> = {}
+    for (const [file, source] of Object.entries(sources)) {
+      const code = source.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n')
+      const count = code.match(/(?<!function |[\w.])decrypt\(/g)?.length ?? 0
+      if (count) calls[file] = count
+    }
+    // Each one follows recordSecretRead, or keeps the value on the server:
+    // the audit digest, and a rename within one environment
+    expect(calls).toEqual({ './actions.ts': 2, './api.ts': 3, './audit.ts': 3 })
   })
 })

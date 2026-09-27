@@ -11,6 +11,7 @@ import { AdminOnlyEnvironment, EmptyState } from "sigillo-app/src/components/ui/
 import { useState } from "react";
 import { router, useLoaderData } from "spiceflow/react";
 import { revealEventValueAction } from "../actions.ts";
+import { withStepUp } from "./step-up.ts";
 import { Badge } from "sigillo-app/src/components/ui/badge";
 import { Spinner } from "sigillo-app/src/components/ui/spinner";
 import { Frame } from "sigillo-app/src/components/ui/frame";
@@ -50,8 +51,10 @@ export function EventLogTable() {
     setVisibleValues((prev) => ({ ...prev, [id]: show }));
     if (!show || id in values) return;
     try {
-      const value = await revealEventValueAction({ eventId: id });
-      setValues((prev) => ({ ...prev, [id]: value }));
+      // A protected environment asks for the passkey first
+      const result = await withStepUp(() => revealEventValueAction({ eventId: id }));
+      if (result) setValues((prev) => ({ ...prev, [id]: result.value }));
+      else setVisibleValues((prev) => ({ ...prev, [id]: false }));
     } catch (e: any) {
       setVisibleValues((prev) => ({ ...prev, [id]: false }));
       alert(e?.message || "Failed to load the value");

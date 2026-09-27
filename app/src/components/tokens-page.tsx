@@ -2,7 +2,10 @@
 // Each token is scoped to a project and optionally to an env allowlist
 // (zero rows = all envs), and expires after a lifetime picked at creation.
 // The full key is only shown once at creation (never stored), so the
-// create dialog has a "copy key" step before closing.
+// create dialog has a "copy key" step before closing. Admins can make a
+// machine token, which reads protected environments without a passkey: it
+// takes their own passkey approval for those environments first, and expires
+// after 90 days at most.
 
 "use client"
 
@@ -13,6 +16,7 @@ import { useLoaderData } from "spiceflow/react"
 import { KeyIcon, TrashIcon, PlusIcon, CopyIcon, CheckIcon } from "lucide-react"
 import { EmptyState } from "sigillo-app/src/components/ui/empty-state"
 import { Button } from "sigillo-app/src/components/ui/button"
+import { Badge } from "sigillo-app/src/components/ui/badge"
 import { Frame } from "sigillo-app/src/components/ui/frame"
 import { Input } from "sigillo-app/src/components/ui/input"
 import {
@@ -23,12 +27,13 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
-import { cn, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS } from "sigillo-app/src/lib/utils"
+import { cn, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS } from "sigillo-app/src/lib/utils"
 import { createTokenAction, deleteTokenAction } from "../actions.ts"
+import { withStepUp } from "./step-up.ts"
 
 
 export function TokensPage() {
-  const { projectName, projectId, environments, tokens } = useLoaderData('/dash/projects/:projectId/tokens')
+  const { projectName, projectId, environments, tokens, isAdmin } = useLoaderData('/dash/projects/:projectId/tokens')
   const [createOpen, setCreateOpen] = useState(false)
 
   return (
@@ -61,6 +66,7 @@ export function TokensPage() {
         onOpenChange={setCreateOpen}
         projectId={projectId}
         environments={environments}
+        isAdmin={isAdmin}
       />
     </>
   )
@@ -100,7 +106,12 @@ function TokensTable() {
           {tokens.map((token) => (
             <TableRow key={token.id}>
               <TableCell>
-                <span className="text-sm font-medium">{token.name}</span>
+                <span className="flex items-center gap-2 text-sm font-medium">
+                  <span className="truncate">{token.name}</span>
+                  {token.protectedAccess && (
+                    <Badge variant="secondary" title="Reads protected environments without a passkey">Machine</Badge>
+                  )}
+                </span>
               </TableCell>
               <TableCell>
                 <code className="text-xs text-muted-foreground mono-sm">
@@ -125,10 +136,17 @@ function TokensTable() {
                 {token.lastUsedAt === null ? (
                   <span className="text-muted-foreground text-xs">Never</span>
                 ) : (
-                  <TimeAgo
-                    ts={token.lastUsedAt}
-                    className="text-muted-foreground text-xs tabular-nums"
-                  />
+                  <span className="flex flex-col">
+                    <TimeAgo
+                      ts={token.lastUsedAt}
+                      className="text-muted-foreground text-xs tabular-nums"
+                    />
+                    {token.lastUsedIp && (
+                      <span className="text-muted-foreground text-xs mono-sm truncate" title={token.lastUsedIp}>
+                        {token.lastUsedIp}
+                      </span>
+                    )}
+                  </span>
                 )}
               </TableCell>
               <TableCell className="p-0">
@@ -175,11 +193,13 @@ function CreateTokenDialog({
   onOpenChange,
   projectId,
   environments,
+  isAdmin,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   projectId: string
   environments: { id: string; name: string; slug: string }[]
+  isAdmin: boolean
 }) {
   const [creating, setCreating] = useState(false)
   const [createdKey, setCreatedKey] = useState<string | null>(null)
@@ -188,6 +208,7 @@ function CreateTokenDialog({
   const [scope, setScope] = useState<"all" | "selected">("all")
   const [checked, setChecked] = useState<Record<string, boolean>>({})
   const [expiresInDays, setExpiresInDays] = useState<number>(DEFAULT_TOKEN_EXPIRY_DAYS)
+  const [machine, setMachine] = useState(false)
 
   function handleOpenChange(nextOpen: boolean) {
     if (!nextOpen) {
@@ -197,6 +218,7 @@ function CreateTokenDialog({
       setScope("all")
       setChecked({})
       setExpiresInDays(DEFAULT_TOKEN_EXPIRY_DAYS)
+      setMachine(false)
     }
     onOpenChange(nextOpen)
   }
@@ -239,7 +261,9 @@ function CreateTokenDialog({
               </Button>
             </div>
             <p className="text-xs text-muted-foreground mt-2">
-              Store this key securely. It grants access to secrets in this project.
+              {machine
+                ? "Store this key securely. It reads this project's protected environments without a passkey."
+                : "Store this key securely. It grants access to secrets in this project."}
             </p>
             <DialogFooter variant="bare" className="mt-4">
               <Button variant="outline" onClick={() => handleOpenChange(false)}>
@@ -275,13 +299,16 @@ function CreateTokenDialog({
             setCreating(true)
             setError(null)
             try {
-              const result = await createTokenAction({
+              // A machine token asks for your passkey for the protected
+              // environments it will read
+              const result = await withStepUp(() => createTokenAction({
                 name: name.trim(),
                 projectId,
                 environmentIds,
                 expiresInDays,
-              })
-              setCreatedKey(result.key)
+                protectedAccess: machine,
+              }))
+              if (result) setCreatedKey(result.key)
             } catch (e: any) {
               setError(e?.message || "Failed to create token")
             } finally {
@@ -377,12 +404,14 @@ function CreateTokenDialog({
                   className={cn(
                     "flex items-center justify-center gap-2 rounded-md px-3 py-2 cursor-pointer transition-colors text-sm font-medium",
                     expiresInDays === days ? "bg-primary/5" : "hover:bg-muted/50",
+                    machine && days > MACHINE_TOKEN_MAX_DAYS && "opacity-50 cursor-not-allowed",
                   )}
                 >
                   <input
                     type="radio"
                     name="token-expiry"
                     checked={expiresInDays === days}
+                    disabled={machine && days > MACHINE_TOKEN_MAX_DAYS}
                     onChange={() => setExpiresInDays(days)}
                     className="accent-primary"
                   />
@@ -391,6 +420,26 @@ function CreateTokenDialog({
               ))}
             </div>
           </div>
+          {isAdmin && (
+            <label className="mt-3 flex items-start gap-3 rounded-md px-3 py-2 cursor-pointer hover:bg-muted/50 transition-colors">
+              <input
+                type="checkbox"
+                checked={machine}
+                onChange={(e) => {
+                  setMachine(e.target.checked)
+                  if (e.target.checked && expiresInDays > MACHINE_TOKEN_MAX_DAYS) setExpiresInDays(MACHINE_TOKEN_MAX_DAYS)
+                }}
+                className="accent-primary mt-0.5"
+              />
+              <span className="flex flex-col gap-0.5">
+                <span className="text-sm font-medium">Machine token</span>
+                <span className="text-xs text-muted-foreground">
+                  Reads protected environments without a passkey, for CI and servers. Needs your passkey
+                  now, and expires after {MACHINE_TOKEN_MAX_DAYS} days at most.
+                </span>
+              </span>
+            </label>
+          )}
           <DialogFooter variant="bare" className="mt-4">
             <DialogClose render={<Button variant="outline" />}>
               Cancel

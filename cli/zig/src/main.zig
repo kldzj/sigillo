@@ -4109,6 +4109,97 @@ const OneShotServer = struct {
     }
 };
 
+// Answers one request per scripted response, in order, and keeps each
+// request's first line and the step-up request's body
+const ScriptedServer = struct {
+    inner: OneShotServer,
+    lines: [8][160]u8 = undefined,
+    line_lens: [8]usize = .{0} ** 8,
+    step_up_body: [512]u8 = undefined,
+    step_up_body_len: usize = 0,
+
+    fn init() !ScriptedServer {
+        return .{ .inner = try OneShotServer.init() };
+    }
+
+    fn serve(self: *ScriptedServer, responses: []const []const u8) void {
+        for (responses, 0..) |response, i| {
+            self.inner.received_len = 0;
+            self.inner.serve(response);
+            const received = self.inner.request();
+            const end = std.mem.indexOf(u8, received, "\r\n") orelse received.len;
+            const n = @min(end, self.lines[i].len);
+            @memcpy(self.lines[i][0..n], received[0..n]);
+            self.line_lens[i] = n;
+            if (std.mem.startsWith(u8, received, "POST /api/v0/step-up ")) {
+                const body_start = (std.mem.indexOf(u8, received, "\r\n\r\n") orelse received.len) + 4;
+                const body = received[@min(body_start, received.len)..];
+                const m = @min(body.len, self.step_up_body.len);
+                @memcpy(self.step_up_body[0..m], body[0..m]);
+                self.step_up_body_len = m;
+            }
+        }
+    }
+
+    fn line(self: *ScriptedServer, i: usize) []const u8 {
+        return self.lines[i][0..self.line_lens[i]];
+    }
+};
+
+fn httpResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "HTTP/1.1 {d} X\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ status, body.len, body });
+}
+
+test "a protected environment asks for an approval, waits for it, and reads again" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    client.step_up_poll_ms = 1;
+    defer client.step_up_poll_ms = 2000;
+    var server = try ScriptedServer.init();
+    defer server.inner.server.deinit();
+
+    const created = try std.fmt.allocPrint(allocator, "{{\"id\":\"req1\",\"userCode\":\"BCDF-GHJK\",\"approveUrl\":\"http://127.0.0.1/approve\",\"expiresAt\":{d}}}", .{std.time.milliTimestamp() + 60_000});
+    const responses = [_][]const u8{
+        try httpResponse(allocator, 403, "{\"error\":\"this environment is protected\",\"code\":\"STEP_UP_REQUIRED\",\"environmentIds\":[\"env1\"]}"),
+        try httpResponse(allocator, 200, created),
+        try httpResponse(allocator, 200, "{\"status\":\"pending\"}"),
+        try httpResponse(allocator, 200, "{\"status\":\"approved\"}"),
+        try httpResponse(allocator, 200, "{\"value\":\"the-secret\"}"),
+    };
+    const thread = try std.Thread.spawn(.{}, ScriptedServer.serve, .{ &server, &responses });
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.inner.baseUrl(allocator), .path = "/api/v0/projects/p/environments/e/secrets/KEY", .token = "tok123" });
+    // Wakes the server if the client made fewer requests than scripted
+    std.posix.shutdown(server.inner.server.stream.handle, .both) catch {};
+    thread.join();
+    const res = try result;
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqualStrings("{\"value\":\"the-secret\"}", res.body);
+    try std.testing.expectEqualStrings("GET /api/v0/projects/p/environments/e/secrets/KEY HTTP/1.1", server.line(0));
+    try std.testing.expectEqualStrings("POST /api/v0/step-up HTTP/1.1", server.line(1));
+    try std.testing.expectEqualStrings("GET /api/v0/step-up/req1 HTTP/1.1", server.line(2));
+    try std.testing.expectEqualStrings("GET /api/v0/step-up/req1 HTTP/1.1", server.line(3));
+    try std.testing.expectEqualStrings("GET /api/v0/projects/p/environments/e/secrets/KEY HTTP/1.1", server.line(4));
+    try std.testing.expectEqualStrings("{\"environmentIds\":[\"env1\"]}", server.step_up_body[0..server.step_up_body_len]);
+}
+
+test "a refusal that no approval fixes is returned as it is" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var server = try OneShotServer.init();
+    defer server.server.deinit();
+
+    const response = try httpResponse(allocator, 403, "{\"error\":\"only a machine token can read it\",\"code\":\"MACHINE_TOKEN_REQUIRED\",\"environmentIds\":[\"env1\"]}");
+    const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, response });
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.baseUrl(allocator), .path = "/api/v0/me", .token = "sig_abc" });
+    thread.join();
+    const res = try result;
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+}
+
 test "requests leave unset optional fields out of the JSON body" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

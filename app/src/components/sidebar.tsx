@@ -1,7 +1,7 @@
 // Sidebar for the app shell — desktop aside + mobile drawer (vaul).
 // Top: org switcher dropdown (like team-switcher)
 // Middle: project list
-// Bottom: user section with avatar, email, sessions, logout
+// Bottom: user section with avatar, email, sessions, passkeys, logout
 //
 // SidebarContent is the shared inner UI used by both the desktop <aside> and
 // the mobile Drawer, so the project list / org switcher / user footer are
@@ -22,6 +22,7 @@ import {
   BuildingIcon,
   LogOutIcon,
   MonitorSmartphoneIcon,
+  KeyRoundIcon,
   CheckIcon,
   MenuIcon,
 } from "lucide-react";
@@ -220,6 +221,10 @@ function SidebarContent({
             <DropdownMenuLinkItem href={router.href('/dash/sessions')} onClick={onNavigate}>
               <MonitorSmartphoneIcon className="size-4 text-muted-foreground" />
               Sessions
+            </DropdownMenuLinkItem>
+            <DropdownMenuLinkItem href={router.href('/dash/passkeys')} onClick={onNavigate}>
+              <KeyRoundIcon className="size-4 text-muted-foreground" />
+              Passkeys
             </DropdownMenuLinkItem>
             {/*
               Full navigation to the server route, not authClient.signOut().

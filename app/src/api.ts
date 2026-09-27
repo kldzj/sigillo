@@ -18,6 +18,7 @@ import {
   getDb,
   getDataCenter,
   requireApiSession,
+  getRequestOrigin,
   requireApiOrgMember,
   requireSecretsApiAuth,
   getRequestApiToken,
@@ -37,6 +38,7 @@ import {
   getClaimableAutoJoinDomain,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
+import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus } from './step-up.ts'
 import { memoize } from './lib/memoize.ts'
 import { SECRET_NAME_REGEX, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
 
@@ -403,6 +405,13 @@ function renderDownloadedSecrets(
 
 export const apiApp = new Spiceflow()
   .use(openapi({ path: '/api/v0/openapi.json' }))
+
+  // A read of a protected environment that needs a passkey approval or a
+  // machine token: 403 with a code the CLI acts on
+  .onError(({ error }) => {
+    if (!(error instanceof StepUpRequiredError)) return
+    return json({ error: error.message, code: error.code, environmentIds: error.environmentIds }, { status: 403 })
+  })
 
   // ── Orgs ────────────────────────────────────────────────────────
   .route({
@@ -885,6 +894,38 @@ export const apiApp = new Spiceflow()
         userId: auth.userId, apiTokenId: auth.apiTokenId,
       })))
       return { ok: true, environmentId: auth.environmentId, secrets: entries.map(([name]) => name) }
+    },
+  })
+
+  // ── Step-up ──────────────────────────────────────────────────────
+  // A read of a protected environment without a passkey approval gets 403
+  // STEP_UP_REQUIRED. The CLI then opens a request here, shows its code and
+  // /approve, and polls until its user approves it with a passkey.
+  .route({
+    method: 'POST',
+    path: '/api/v0/step-up',
+    detail: { tags: ['Step-up'], summary: 'Ask to read protected environments' },
+    request: z.object({ environmentIds: z.array(z.string()).min(1) }),
+    response: z.object({ id: z.string(), userCode: z.string(), approveUrl: z.string(), expiresAt: z.number() }),
+    async handler({ request }) {
+      const body = await request.json()
+      if (await getRequestApiToken(request)) throw json({ error: 'API tokens cannot be approved: use a machine token' }, { status: 403 })
+      const session = await requireApiSession(request)
+      const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds: body.environmentIds, withCode: true })
+      return { id: row.id, userCode: row.userCode!, approveUrl: new URL('/approve', getRequestOrigin(request)).toString(), expiresAt: row.expiresAt }
+    },
+  })
+
+  .route({
+    method: 'GET',
+    path: '/api/v0/step-up/:id',
+    detail: { tags: ['Step-up'], summary: 'Check a step-up request' },
+    response: { 200: z.object({ status: z.enum(['pending', 'approved', 'expired']) }), 404: errorResponseSchema },
+    async handler({ params, request }) {
+      const session = await requireApiSession(request)
+      const status = await stepUpRequestStatus({ requestId: params.id, sessionId: session.sessionId })
+      if (!status) return json({ error: 'not found' }, { status: 404 })
+      return { status }
     },
   })
 

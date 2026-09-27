@@ -33,6 +33,10 @@ import {
   endOtherUserSessions,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
+import {
+  StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent, requireMachineTokenApproval,
+} from './step-up.ts'
+import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 
 async function requireSession() {
   const request = getActionRequest()
@@ -132,6 +136,19 @@ export async function deleteSecretAction({ name, environmentIds }: {
   })))
 }
 
+// A read of a protected environment without a passkey approval: the browser
+// asks for one (startStepUpAction) and tries again
+type StepUp = { stepUp: { environmentIds: string[] } }
+
+async function stepUpOr<T>(read: () => Promise<T>): Promise<T | StepUp> {
+  try {
+    return await read()
+  } catch (error) {
+    if (error instanceof StepUpRequiredError) return { stepUp: { environmentIds: error.environmentIds } }
+    throw error
+  }
+}
+
 // Values the web UI reveals, downloads or copies. Recorded as reads.
 export async function revealSecretsAction({ environmentId, names, download }: {
   environmentId: string
@@ -139,14 +156,90 @@ export async function revealSecretsAction({ environmentId, names, download }: {
   download?: boolean
 }) {
   const session = await requireSession()
-  return readSecretValues({
-    request: getActionRequest(), userId: session.userId, environmentId, names, kind: download ? 'download' : 'value',
-  })
+  return stepUpOr(async () => ({
+    values: await readSecretValues({
+      request: getActionRequest(), userId: session.userId, sessionId: session.sessionId,
+      environmentId, names, kind: download ? 'download' : 'value',
+    }),
+  }))
 }
 
 export async function revealEventValueAction({ eventId }: { eventId: string }) {
   const session = await requireSession()
-  return readEventValue({ request: getActionRequest(), userId: session.userId, eventId })
+  return stepUpOr(async () => ({
+    value: await readEventValue({ request: getActionRequest(), userId: session.userId, sessionId: session.sessionId, eventId }),
+  }))
+}
+
+// ── Step-up in the browser ──────────────────────────────────────────
+
+// Asks this browser session's own approval: the passkey challenge to sign
+export async function startStepUpAction({ environmentIds }: { environmentIds: string[] }) {
+  const session = await requireSession()
+  const request = getActionRequest()
+  const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds, withCode: false })
+  try {
+    return { requestId: row.id, options: await approvalOptions({ request, requestId: row.id, userId: session.userId }) }
+  } catch (error) {
+    if (error instanceof NoPasskeyError) return { noPasskey: true as const }
+    throw error
+  }
+}
+
+export async function finishStepUpAction({ requestId, response }: { requestId: string; response: AuthenticationResponseJSON }) {
+  const session = await requireSession()
+  return { approved: await approveStepUpRequest({ request: getActionRequest(), requestId, userId: session.userId, response }) }
+}
+
+// ── Passkeys ────────────────────────────────────────────────────────
+
+// Adding another passkey needs an approval with an existing one first
+export async function startPasskeysApprovalAction() {
+  const session = await requireSession()
+  const request = getActionRequest()
+  const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds: [], withCode: false, purpose: 'passkeys' })
+  return { requestId: row.id, options: await approvalOptions({ request, requestId: row.id, userId: session.userId }) }
+}
+
+export async function removePasskeyAction({ passkeyId }: { passkeyId: string }) {
+  const session = await requireSession()
+  const db = getDb()
+  const passkey = await db.query.passkey.findFirst({ where: { id: passkeyId, userId: session.userId }, columns: { id: true, name: true } })
+  if (!passkey) throw new Error('Passkey not found')
+  await db.delete(schema.passkey).where(orm.eq(schema.passkey.id, passkey.id))
+  await logPasskeyEvent({ request: getActionRequest(), userId: session.userId, actor: `user:${session.userId}`, action: 'removed', passkeyName: passkey.name })
+}
+
+// An org admin removes a member's passkeys, for a member who lost them: the
+// member then adds new ones after a fresh sign-in
+export async function removeMemberPasskeysAction({ memberId }: { memberId: string }) {
+  const session = await requireSession()
+  const db = getDb()
+  const member = await db.query.orgMember.findFirst({ where: { id: memberId }, columns: { orgId: true, userId: true } })
+  if (!member) throw new Error('Member not found')
+  await requireAdminRole(session.userId, member.orgId)
+  const passkeys = await db.query.passkey.findMany({ where: { userId: member.userId }, columns: { id: true, name: true } })
+  if (passkeys.length === 0) return
+  await db.delete(schema.passkey).where(orm.eq(schema.passkey.userId, member.userId))
+  for (const passkey of passkeys) {
+    await logPasskeyEvent({ request: getActionRequest(), userId: member.userId, actor: `user:${session.userId}`, action: 'removed', passkeyName: passkey.name })
+  }
+}
+
+// /approve: a CLI request of the signed-in user, found by the code typed there
+export async function findApprovalAction({ userCode }: { userCode: string }) {
+  const session = await requireSession()
+  return findStepUpRequest({ userId: session.userId, userCode })
+}
+
+export async function approvalOptionsAction({ requestId }: { requestId: string }) {
+  const session = await requireSession()
+  try {
+    return { options: await approvalOptions({ request: getActionRequest(), requestId, userId: session.userId }) }
+  } catch (error) {
+    if (error instanceof NoPasskeyError) return { noPasskey: true as const }
+    throw error
+  }
 }
 
 // Save edited secrets to the current environment and optionally apply
@@ -154,7 +247,14 @@ export async function revealEventValueAction({ eventId }: { eventId: string }) {
 // event to the log. Renames are handled as delete old name + set new name.
 // A rename without a value keeps the current one, which the browser may never
 // have loaded; copying it to other environments is recorded as a read.
-export async function saveSecretsAction({ edits: requested, environmentIds }: {
+export async function saveSecretsAction(args: {
+  edits: { name: string; originalName?: string; value?: string }[]
+  environmentIds: string[]
+}) {
+  return stepUpOr(() => saveSecrets(args))
+}
+
+async function saveSecrets({ edits: requested, environmentIds }: {
   edits: { name: string; originalName?: string; value?: string }[]
   environmentIds: string[]
 }) {
@@ -191,7 +291,7 @@ export async function saveSecretsAction({ edits: requested, environmentIds }: {
   if (kept.length && environmentIds.some((id) => id !== currentEnvId)) {
     await recordSecretRead({
       request: getActionRequest(), environment: envs.find((env) => env.id === currentEnvId)!,
-      author: { userId: session.userId, apiTokenId: null }, kind: 'copy', names: kept.map((edit) => edit.originalName ?? edit.name),
+      author: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId }, kind: 'copy', names: kept.map((edit) => edit.originalName ?? edit.name),
     })
   }
 
@@ -390,11 +490,23 @@ export async function endOtherSessionsAction() {
 
 // ── API Token actions ───────────────────────────────────────────────
 
-export async function createTokenAction({ name, projectId, environmentIds, expiresInDays }: {
+export async function createTokenAction(args: {
   name: string
   projectId: string
   environmentIds?: string[]
   expiresInDays: number
+  // A machine token, which reads protected environments without a passkey
+  protectedAccess?: boolean
+}) {
+  return stepUpOr(() => createToken(args))
+}
+
+async function createToken({ name, projectId, environmentIds, expiresInDays, protectedAccess = false }: {
+  name: string
+  projectId: string
+  environmentIds?: string[]
+  expiresInDays: number
+  protectedAccess?: boolean
 }) {
   if (!name) throw new Error('Name is required')
   if (!projectId) throw new Error('Project is required')
@@ -405,6 +517,10 @@ export async function createTokenAction({ name, projectId, environmentIds, expir
   const uniqueEnvIds = Array.from(new Set(environmentIds ?? []))
   await requireTokenScopeAccess({ userId: session.userId, projectId, environmentIds: uniqueEnvIds })
   const db = getDb()
+
+  if (protectedAccess) {
+    await requireMachineTokenApproval({ userId: session.userId, sessionId: session.sessionId, projectId, environmentIds: uniqueEnvIds, expiresInDays })
+  }
 
   const { key, hashedKey, prefix } = await generateApiToken()
   const tokenId = ulid()
@@ -417,6 +533,7 @@ export async function createTokenAction({ name, projectId, environmentIds, expir
       hashedKey,
       createdBy: session.userId,
       expiresAt: Date.now() + expiresInDays * 86_400_000,
+      protectedAccess,
     }),
     ...uniqueEnvIds.map((environmentId) =>
       db.insert(schema.apiTokenEnvironment).values({ tokenId, environmentId }),
@@ -445,7 +562,15 @@ export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
   await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
 }
 
-export async function syncMissingSecretsAction({
+export async function syncMissingSecretsAction(args: {
+  sourceEnvironmentId: string
+  targetEnvironmentId: string
+  names: string[]
+}) {
+  return stepUpOr(() => syncMissingSecrets(args))
+}
+
+async function syncMissingSecrets({
   sourceEnvironmentId,
   targetEnvironmentId,
   names,
@@ -480,7 +605,7 @@ export async function syncMissingSecretsAction({
 
   const author = { userId: session.userId, apiTokenId: null }
   // Copying values out of a protected environment is a read of them
-  await recordSecretRead({ request: getActionRequest(), environment: source, author, kind: 'copy', names: toSync.map((s) => s.name) })
+  await recordSecretRead({ request: getActionRequest(), environment: source, author: { ...author, sessionId: session.sessionId }, kind: 'copy', names: toSync.map((s) => s.name) })
   const values = await Promise.all(toSync.map((s) => decrypt(s.valueEncrypted, s.iv)))
   await appendSecretEvents(toSync.map((s, i) => ({
     environmentId: targetEnvironmentId, name: s.name, operation: 'set', value: values[i]!, ...author,
@@ -598,14 +723,16 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
   environmentId: string
   protect: boolean
 }) {
-  const session = await requireSession()
-  const orgId = await getOrgIdForEnvironment(environmentId)
-  if (!orgId) throw new Error('Environment not found')
-  await requireAdminRole(session.userId, orgId)
-  await setEnvironmentProtection({
-    request: getActionRequest(), environmentId, protect, author: { userId: session.userId, apiTokenId: null },
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const orgId = await getOrgIdForEnvironment(environmentId)
+    if (!orgId) throw new Error('Environment not found')
+    await requireAdminRole(session.userId, orgId)
+    await setEnvironmentProtection({
+      request: getActionRequest(), environmentId, protect, author: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId },
+    })
+    return { ok: true, environmentId, protect }
   })
-  return { ok: true, environmentId, protect }
 }
 
 export async function deleteOrgAction({ orgId }: { orgId: string }) {

@@ -62,6 +62,82 @@ export const account = sqliteCore.sqliteTable('account', {
   sqliteCore.index('account_user_id_idx').on(table.userId),
 ])
 
+// ── Step-up (app/src/step-up.ts) ────────────────────────────────────
+// A person reads a protected environment only with a grant: a passkey
+// approval for one session and some environments, for 15 minutes. The
+// browser asks for one on the spot; the CLI opens a request that the user
+// approves on /approve by typing its code.
+export const stepUpRequest = sqliteCore.sqliteTable('step_up_request', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  // The session that asked, and that gets the grant
+  sessionId: sqliteCore.text('session_id').notNull().references(() => session.id, { onDelete: 'cascade' }),
+  // read: reading environmentIds; passkeys: adding another passkey
+  purpose: sqliteCore.text('purpose', { enum: ['read', 'passkeys'] }).notNull().default('read'),
+  environmentIds: sqliteCore.text('environment_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  // Typed on /approve for a CLI request, never part of a link; null when the browser asks for itself
+  userCode: sqliteCore.text('user_code'),
+  // The WebAuthn challenge of the approval in progress
+  challenge: sqliteCore.text('challenge'),
+  status: sqliteCore.text('status', { enum: ['pending', 'approved'] }).notNull().default('pending'),
+  ipAddress: sqliteCore.text('ip_address'),
+  country: sqliteCore.text('country'),
+  userAgent: sqliteCore.text('user_agent'),
+  createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+  expiresAt: epochMs('expires_at').notNull(),
+}, (table) => [
+  sqliteCore.uniqueIndex('step_up_request_user_code_unique').on(table.userCode),
+  sqliteCore.index('step_up_request_user_id_idx').on(table.userId),
+])
+
+export const stepUpGrant = sqliteCore.sqliteTable('step_up_grant', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  // Ends with the session it was approved for
+  sessionId: sqliteCore.text('session_id').notNull().references(() => session.id, { onDelete: 'cascade' }),
+  purpose: sqliteCore.text('purpose', { enum: ['read', 'passkeys'] }).notNull().default('read'),
+  environmentIds: sqliteCore.text('environment_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+  expiresAt: epochMs('expires_at').notNull(),
+}, (table) => [
+  sqliteCore.index('step_up_grant_session_id_idx').on(table.sessionId),
+])
+
+// Every passkey added or removed, shown to the admins of the user's orgs.
+// No foreign keys: the history outlives the passkey and the people.
+export const passkeyEvent = sqliteCore.sqliteTable('passkey_event', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  userId: sqliteCore.text('user_id').notNull(),
+  // Who did it: the user, an org admin, or 'self-host' for the recovery command
+  actor: sqliteCore.text('actor').notNull(),
+  action: sqliteCore.text('action', { enum: ['added', 'removed'] }).notNull(),
+  passkeyName: sqliteCore.text('passkey_name'),
+  ipAddress: sqliteCore.text('ip_address'),
+  createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+}, (table) => [
+  sqliteCore.index('passkey_event_user_id_idx').on(table.userId),
+])
+
+// Passkeys, added and managed through better-auth's passkey plugin. They
+// approve reads of protected environments (app/src/step-up.ts) and never
+// sign anyone in.
+export const passkey = sqliteCore.sqliteTable('passkey', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  name: sqliteCore.text('name'),
+  publicKey: sqliteCore.text('public_key').notNull(),
+  userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  credentialID: sqliteCore.text('credential_id').notNull(),
+  counter: sqliteCore.integer('counter').notNull(),
+  deviceType: sqliteCore.text('device_type').notNull(),
+  backedUp: sqliteCore.integer('backed_up', { mode: 'boolean' }).notNull(),
+  transports: sqliteCore.text('transports'),
+  createdAt: epochMs('created_at'),
+  aaguid: sqliteCore.text('aaguid'),
+}, (table) => [
+  sqliteCore.index('passkey_user_id_idx').on(table.userId),
+  sqliteCore.index('passkey_credential_id_idx').on(table.credentialID),
+])
+
 export const verification = sqliteCore.sqliteTable('verification', {
   id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
   identifier: sqliteCore.text('identifier').notNull(),
@@ -238,6 +314,11 @@ export const apiToken = sqliteCore.sqliteTable('api_token', {
   expiresAt: epochMs('expires_at'),
   // Written at most once an hour, so a busy CI token isn't a D1 write per request
   lastUsedAt: epochMs('last_used_at'),
+  lastUsedIp: sqliteCore.text('last_used_ip'),
+  // A machine token may read protected environments without a passkey, since
+  // a pod or a CI job can't approve anything. Made by an org admin with a
+  // passkey approval, and it must expire.
+  protectedAccess: sqliteCore.integer('protected_access', { mode: 'boolean' }).notNull().default(false),
 }, (table) => [
   sqliteCore.index('api_token_project_id_idx').on(table.projectId),
   sqliteCore.index('api_token_hashed_key_idx').on(table.hashedKey),
@@ -316,11 +397,12 @@ export const deviceCode = sqliteCore.sqliteTable('device_code', {
 // ── Relations (v2 API) ──────────────────────────────────────────────
 
 export const relations = defineRelations(
-  { user, session, account, verification, org, orgMember, orgInvitation, project, environment, secretEvent, secretRead, apiToken, apiTokenEnvironment, deviceCode, oauthDomain, memberAccess },
+  { user, session, account, verification, passkey, passkeyEvent, stepUpRequest, stepUpGrant, org, orgMember, orgInvitation, project, environment, secretEvent, secretRead, apiToken, apiTokenEnvironment, deviceCode, oauthDomain, memberAccess },
   (r) => ({
     user: {
       sessions: r.many.session(),
       accounts: r.many.account(),
+      passkeys: r.many.passkey(),
       orgs: r.many.org({
         from: r.user.id.through(r.orgMember.userId),
         to: r.org.id.through(r.orgMember.orgId),
@@ -333,6 +415,9 @@ export const relations = defineRelations(
       user: r.one.user({ from: r.account.userId, to: r.user.id }),
     },
     verification: {},
+    passkey: {
+      user: r.one.user({ from: r.passkey.userId, to: r.user.id }),
+    },
     org: {
       members: r.many.orgMember(),
       invitations: r.many.orgInvitation(),

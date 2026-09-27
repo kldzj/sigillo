@@ -60,6 +60,7 @@ cli
   .option('--google-client-secret [secret]', z.string().optional().describe('Google OAuth client secret for the login provider'))
   .option('--allowed-users [list]', z.string().optional().describe('Email addresses and domains that may sign in, comma-separated (empty: anyone)'))
   .option('--change-passphrase', 'Encrypt ~/.sigillo/selfhost.json with a new passphrase, then stop')
+  .option('--reset-passkeys [email]', z.string().optional().describe('Remove every passkey of this user, for a sole admin who lost theirs, then stop'))
   .option('--yes', 'Accept all defaults (non-interactive)')
   .example('npx @kldzj/sigillo self-host')
   .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
@@ -84,6 +85,10 @@ cli
         },
       })
       if (warning) clack.log.warn(warning)
+      if (options.resetPasskeys) {
+        await resetPasskeys(options)
+        return
+      }
       if (options.changePassphrase) {
         if (!interactive()) throw new Error('--change-passphrase needs a terminal')
         changeStatePassphrase(await askNewPassphrase())
@@ -98,6 +103,45 @@ cli
       releaseLock()
     }
   })
+
+// Recovery for a sole admin who lost every passkey: whoever controls the
+// Cloudflare account controls the instance anyway, so the passkeys are
+// removed in D1 directly, and the removal is logged like any other
+async function resetPasskeys(options: SelfHostOptions) {
+  const email = options.resetPasskeys!.trim()
+  const deployments = Object.values(readState().deployments ?? {})
+    .filter((d) => (!options.account || d.accountId === options.account) && (!options.name || d.workerName === options.name))
+  if (deployments.length === 0) throw new Error('No saved deployment matches: pass --name, or run self-host from the machine that deployed it')
+  if (deployments.length > 1) throw new Error('Several deployments are saved: pass --name')
+  const deployment = deployments[0]!
+  const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
+  const database = { accountId: deployment.accountId, databaseId: deployment.databaseId }
+  const [found] = await client.d1Query({
+    ...database,
+    sql: 'SELECT count(*) AS n FROM passkey p JOIN user u ON u.id = p.user_id WHERE lower(u.email) = lower(?)',
+    params: [email],
+  })
+  const count = Number(found?.results[0]?.n ?? 0)
+  if (count === 0) {
+    clack.outro(`${email} has no passkeys on ${deployment.workerName}`)
+    return
+  }
+  if (interactive() && !options.yes) {
+    const sure = await clack.confirm({ message: `Remove ${count} passkey${count === 1 ? '' : 's'} of ${email} on ${deployment.workerName}?` })
+    if (clack.isCancel(sure) || !sure) process.exit(0)
+  }
+  await client.d1Query({
+    ...database,
+    sql: "INSERT INTO passkey_event (id, user_id, actor, action, passkey_name, created_at) SELECT lower(hex(randomblob(16))), p.user_id, 'self-host', 'removed', p.name, ? FROM passkey p JOIN user u ON u.id = p.user_id WHERE lower(u.email) = lower(?)",
+    params: [String(Date.now()), email],
+  })
+  await client.d1Query({
+    ...database,
+    sql: 'DELETE FROM passkey WHERE user_id IN (SELECT id FROM user WHERE lower(email) = lower(?))',
+    params: [email],
+  })
+  clack.outro(`Removed ${count} passkey${count === 1 ? '' : 's'} of ${email}. They add new ones after signing in again.`)
+}
 
 async function askPassphrase(): Promise<string> {
   const passphrase = await clack.password({ message: 'Passphrase for ~/.sigillo/selfhost.json' })
@@ -130,6 +174,7 @@ interface SelfHostOptions {
   googleClientSecret?: string
   allowedUsers?: string
   changePassphrase?: boolean
+  resetPasskeys?: string
   yes?: boolean
 }
 

@@ -12,6 +12,8 @@ import * as orm from 'drizzle-orm'
 import { getDb, schema } from 'db'
 import { betterAuth } from 'better-auth/minimal'
 import { genericOAuth, deviceAuthorization, bearer } from 'better-auth/plugins'
+import { passkey } from '@better-auth/passkey'
+import { canAddPasskey, logPasskeyEvent } from './step-up.ts'
 import { APIError, createAuthMiddleware } from 'better-auth/api'
 import { makeSignature } from 'better-auth/crypto'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
@@ -266,8 +268,22 @@ export async function getAuth(request: Request) {
         if (ctx.path === '/sign-in/social' && ctx.body?.idToken) {
           throw new APIError('BAD_REQUEST', { message: 'id_token sign-in is disabled', code: 'ID_TOKEN_SIGN_IN_DISABLED' })
         }
+        // Adding a passkey could also start a new session; passkeys sign nobody in
+        if (ctx.path === '/passkey/verify-registration' && ctx.body?.createSession) {
+          throw new APIError('BAD_REQUEST', { message: 'passkeys do not sign in', code: 'PASSKEY_SIGN_IN_DISABLED' })
+        }
       }),
       after: createAuthMiddleware(async (ctx) => {
+        if (ctx.path === '/passkey/verify-registration') {
+          const added = ctx.context.returned as { userId?: unknown; name?: unknown } | undefined
+          if (typeof added?.userId === 'string') {
+            await logPasskeyEvent({
+              request: ctx.request ?? null, userId: added.userId, actor: `user:${added.userId}`, action: 'added',
+              passkeyName: typeof added.name === 'string' ? added.name : null,
+            })
+          }
+          return
+        }
         if (ctx.path !== '/device/token') return
         const issued = ctx.context.returned as { access_token?: unknown } | undefined
         if (typeof issued?.access_token !== 'string') return
@@ -318,7 +334,34 @@ export async function getAuth(request: Request) {
       }),
       deviceAuthorization({ verificationUri: '/device', schema: {} }),
       bearer({ requireSignature: true }),
-
+      // Passkeys approve reads of protected environments. A passkey is bound
+      // to this hostname, and user verification (Touch ID, a PIN) is required.
+      passkey({
+        rpID: host.split(':')[0] ?? host,
+        rpName: 'Sigillo',
+        origin: getRequestOrigin(request),
+        authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
+        // Adding a passkey needs a Google sign-in from the last 5 minutes, or an
+        // approval with an existing passkey. Checked here, inside the endpoint,
+        // where the session is known, and before the passkey is stored.
+        registration: {
+          afterVerification: async ({ ctx }) => {
+            const current = ctx.context.session
+            if (!current || !await canAddPasskey({
+              userId: current.user.id, sessionId: current.session.id, sessionCreatedAt: new Date(current.session.createdAt).getTime(),
+            })) {
+              throw new APIError('FORBIDDEN', { message: 'approve with an existing passkey, or sign in again for your first one', code: 'PASSKEY_APPROVAL_REQUIRED' })
+            }
+          },
+        },
+      }),
+    ],
+    // Signing in always goes through Google: the plugin's passkey sign-in is
+    // off. Listing, renaming and removing go through our own actions, which
+    // log every removal for org admins.
+    disabledPaths: [
+      '/passkey/generate-authenticate-options', '/passkey/verify-authentication',
+      '/passkey/list-user-passkeys', '/passkey/update-passkey', '/passkey/delete-passkey',
     ],
   })
 }
@@ -331,7 +374,7 @@ export function getDataCenter(request: Request & { cf?: { colo?: string } }): st
 
 // ── Session helpers ─────────────────────────────────────────────────
 
-type Session = { userId: string; user: { id: string; name: string; email: string; emailVerified: boolean } }
+type Session = { userId: string; sessionId: string; sessionCreatedAt: number; user: { id: string; name: string; email: string; emailVerified: boolean } }
 
 // Spiceflow passes the SAME request instance to every matched loader/layout in
 // a single navigation (verified against the framework source). Several loaders
@@ -361,7 +404,12 @@ async function resolveSession(request: Request): Promise<Session | null> {
   const session = await auth.api.getSession({ headers: request.headers })
   // A session made before its user left the allowlist ends with it
   if (!session || !isAllowed(session.user)) return null
-  return { userId: session.user.id, user: { id: session.user.id, name: session.user.name, email: session.user.email, emailVerified: session.user.emailVerified } }
+  return {
+    userId: session.user.id,
+    sessionId: session.session.id,
+    sessionCreatedAt: new Date(session.session.createdAt).getTime(),
+    user: { id: session.user.id, name: session.user.name, email: session.user.email, emailVerified: session.user.emailVerified },
+  }
 }
 
 // ── Your sessions ───────────────────────────────────────────────────
@@ -418,7 +466,7 @@ export async function requirePageSession(request: Request): Promise<Session> {
 // unique). Otherwise any verified colleague could create a second org for
 // the same domain and silently enroll everyone who signs in next.
 export async function getClaimableAutoJoinDomain({ session, orgId }: {
-  session: Session
+  session: Pick<Session, 'userId' | 'user'>
   /** the org being updated, which may keep its own claim */
   orgId?: string
 }): Promise<string | Error> {
@@ -430,7 +478,7 @@ export async function getClaimableAutoJoinDomain({ session, orgId }: {
   return domain
 }
 
-export async function autoJoinOrgsByDomain(session: Session): Promise<void> {
+export async function autoJoinOrgsByDomain(session: Pick<Session, 'userId' | 'user'>): Promise<void> {
   if (!session.user.emailVerified) return
   const domain = getEmailDomain(session.user.email)
   if (!domain || COMMON_EMAIL_DOMAINS.has(domain)) return
@@ -817,8 +865,8 @@ function forbiddenResponse(msg = 'forbidden'): Response {
 }
 
 export type SecretsAuth = (
-  | { userId: string; apiTokenId: null }
-  | { userId: null; apiTokenId: string }
+  | { userId: string; apiTokenId: null; sessionId: string }
+  | { userId: null; apiTokenId: string; sessionId: null }
 )
 
 // Environments of a project the caller may read, with the same rules as
@@ -878,7 +926,7 @@ export async function requireSecretsApiAuth(
       const creator = env.orgId ? await getMemberAccess({ userId: apiToken.createdBy, orgId: env.orgId }) : null
       if (creator?.role !== 'admin') throw forbiddenResponse('admin access required for this environment')
     }
-    return { userId: null, apiTokenId: apiToken.tokenId, environmentId: env.id, protected: env.protected }
+    return { userId: null, apiTokenId: apiToken.tokenId, sessionId: null, environmentId: env.id, protected: env.protected }
   }
 
   // Session auth path — works with both cookies and BetterAuth bearer tokens
@@ -888,7 +936,7 @@ export async function requireSecretsApiAuth(
   try {
     const env = await getUserEnvironmentAccess({ userId: session.userId, environmentRef, projectId })
     if (!env) throw new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } })
-    return { userId: session.userId, apiTokenId: null, environmentId: env.id, protected: env.protected }
+    return { userId: session.userId, apiTokenId: null, sessionId: session.sessionId, environmentId: env.id, protected: env.protected }
   } catch (error) {
     if (error instanceof ForbiddenError) throw forbiddenResponse(error.message)
     throw error
@@ -916,7 +964,7 @@ export async function generateApiToken(): Promise<{ key: string; hashedKey: stri
   return { key, hashedKey, prefix }
 }
 
-export async function verifyApiToken(key: string): Promise<{
+export async function verifyApiToken(key: string, ipAddress: string | null = null): Promise<{
   tokenId: string
   projectId: string
   createdBy: string
@@ -937,7 +985,7 @@ export async function verifyApiToken(key: string): Promise<{
     })
   }
   if (token.lastUsedAt === null || now - token.lastUsedAt > 3_600_000) {
-    await db.update(schema.apiToken).set({ lastUsedAt: now }).where(orm.eq(schema.apiToken.id, token.id))
+    await db.update(schema.apiToken).set({ lastUsedAt: now, lastUsedIp: ipAddress }).where(orm.eq(schema.apiToken.id, token.id))
   }
   return {
     tokenId: token.id,
@@ -961,7 +1009,7 @@ export async function getRequestApiToken(request: Request): Promise<{
   const authHeader = request.headers.get('authorization')
   const bearer = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null
   if (!bearer?.startsWith('sig_')) return null
-  const token = await verifyApiToken(bearer)
+  const token = await verifyApiToken(bearer, request.headers.get('cf-connecting-ip'))
   if (!token) throw unauthorizedResponse('invalid or revoked API token')
   return token
 }

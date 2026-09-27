@@ -22,6 +22,7 @@ import { Frame } from "sigillo-app/src/components/ui/frame";
 import { Input } from "sigillo-app/src/components/ui/input";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
 import { createEnvAction, deleteEnvAction, renameEnvAction, updateEnvironmentAccessRoleAction, updateEnvironmentProtectionAction } from "../actions.ts";
+import { withStepUp } from "./step-up.ts";
 import { NativeSelect } from "sigillo-app/src/components/ui/native-select";
 import {
   Table,
@@ -198,7 +199,8 @@ export function EnvironmentsTable() {
       ),
     },
     {
-      // Protected environments record every read of their values (Read Log tab)
+      // Protected environments need a passkey to read, and record every read of
+      // their values (Read Log tab). Turning protection off needs a passkey too.
       accessorKey: "protected",
       header: "Protected",
       size: 120,
@@ -209,12 +211,16 @@ export function EnvironmentsTable() {
             const select = e.currentTarget
             const protect = select.value === 'on'
             if (protect === row.original.protected) return
-            if (!protect && !confirm(`Stop recording reads of ${row.original.name}?`)) {
-              select.value = 'on'
+            const question = protect
+              ? `Protect ${row.original.name}? Reading it will need a passkey, and API tokens other than machine tokens stop working for it.`
+              : `Unprotect ${row.original.name}? Reading it will no longer need a passkey, and reads will no longer be recorded.`
+            if (!confirm(question)) {
+              select.value = row.original.protected ? 'on' : 'off'
               return
             }
             try {
-              await updateEnvironmentProtectionAction({ environmentId: row.original.id, protect })
+              const result = await withStepUp(() => updateEnvironmentProtectionAction({ environmentId: row.original.id, protect }))
+              if (!result) select.value = row.original.protected ? 'on' : 'off'
             } catch (err: any) {
               select.value = row.original.protected ? 'on' : 'off'
               alert(err?.message || 'Failed to update protection')

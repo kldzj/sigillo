@@ -18,6 +18,7 @@ import type { BatchItem } from 'drizzle-orm/batch'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import { encrypt, decrypt, deriveSecrets, getUserEnvironmentAccess } from './db.ts'
+import { requireStepUp, type Reader } from './step-up.ts'
 
 const ZERO_HASH = '0'.repeat(64)
 const encoder = new TextEncoder()
@@ -280,28 +281,36 @@ function readRow({ request, environmentId, author, kind, names }: {
   }
 }
 
-// Records a read of a protected environment. Call it before any value leaves
-// the server: when the row can't be written, it throws and the read fails.
+// Every read of values passes here before any value leaves the server. A
+// protected environment needs a passkey approval for the reading session, or
+// a machine token (step-up.ts), and the read is recorded: when the row can't
+// be written, it throws and the read fails.
 export async function recordSecretRead({ request, environment, author, kind, names }: {
   request: Request
   environment: { id: string; protected: boolean }
-  author: { userId: string | null; apiTokenId: string | null }
+  author: Reader
   kind: Exclude<SecretReadKind, 'protected' | 'unprotected'>
   names: string[]
 }) {
   if (!environment.protected) return
+  await requireStepUp({ environmentId: environment.id, reader: author })
   await appendRead(readRow({ request, environmentId: environment.id, author, kind, names }))
 }
 
 // Turns protection on or off together with a row in the read log, so a
 // stretch of unlogged reads shows up there
+// Turning protection off takes the same passkey approval as a read, or a
+// stolen admin session could switch it off and read
 export async function setEnvironmentProtection({ request, environmentId, protect, author }: {
   request: Request
   environmentId: string
   protect: boolean
-  author: { userId: string | null; apiTokenId: string | null }
+  author: Reader
 }) {
   const db = getDb()
+  const env = await db.query.environment.findFirst({ where: { id: environmentId }, columns: { protected: true } })
+  if (!env) throw new Error('Environment not found')
+  if (env.protected && !protect) await requireStepUp({ environmentId, reader: author })
   await appendRead(
     readRow({ request, environmentId, author, kind: protect ? 'protected' : 'unprotected', names: [] }),
     [db.update(schema.environment).set({ protected: protect, updatedAt: Date.now() }).where(orm.eq(schema.environment.id, environmentId))],
@@ -312,9 +321,10 @@ export async function setEnvironmentProtection({ request, environmentId, protect
 // Pages send names only. A value reaches the browser when someone reveals,
 // downloads or copies it, and that is what the read log records.
 
-export async function readSecretValues({ request, userId, environmentId, names, kind }: {
+export async function readSecretValues({ request, userId, sessionId, environmentId, names, kind }: {
   request: Request
   userId: string
+  sessionId: string
   environmentId: string
   // null for all of them
   names: string[] | null
@@ -323,14 +333,15 @@ export async function readSecretValues({ request, userId, environmentId, names, 
   const env = await getUserEnvironmentAccess({ userId, environmentRef: environmentId })
   if (!env) throw new Error('Environment not found')
   const secrets = (await deriveSecrets(env.id)).filter((secret) => !names || names.includes(secret.name))
-  await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null }, kind, names: secrets.map((secret) => secret.name) })
+  await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null, sessionId }, kind, names: secrets.map((secret) => secret.name) })
   return Object.fromEntries(await Promise.all(secrets.map(async (secret) => [secret.name, await decrypt(secret.valueEncrypted, secret.iv)] as const)))
 }
 
 // An old value from the event log
-export async function readEventValue({ request, userId, eventId }: {
+export async function readEventValue({ request, userId, sessionId, eventId }: {
   request: Request
   userId: string
+  sessionId: string
   eventId: string
 }): Promise<string | null> {
   const event = await getDb().query.secretEvent.findFirst({ where: { id: eventId } })
@@ -338,7 +349,7 @@ export async function readEventValue({ request, userId, eventId }: {
   const env = await getUserEnvironmentAccess({ userId, environmentRef: event.environmentId })
   if (!env) throw new Error('Environment not found')
   if (!event.valueEncrypted || !event.iv) return null
-  await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null }, kind: 'event-log', names: [event.name] })
+  await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null, sessionId }, kind: 'event-log', names: [event.name] })
   return decrypt(event.valueEncrypted, event.iv)
 }
 

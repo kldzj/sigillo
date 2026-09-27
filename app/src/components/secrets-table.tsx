@@ -44,8 +44,12 @@ import {
   saveSecretsAction,
   syncMissingSecretsAction,
 } from "../actions.ts";
+import { withStepUp } from "./step-up.ts";
 import { useLoaderData } from "spiceflow/react";
 
+
+// A copy whose passkey approval wasn't given
+class NotApproved extends Error {}
 
 // Secret values use the .text-security-disc CSS class from globals.css
 // instead of inline style objects (eliminates duplication with event-log-table).
@@ -55,6 +59,7 @@ function SecretValueCell({
   editedValue,
   onValueChange,
   visible,
+  loading,
   onToggle,
   isDirty,
 }: {
@@ -63,11 +68,13 @@ function SecretValueCell({
   editedValue: string | undefined;
   onValueChange: (value: string) => void;
   visible: boolean;
+  loading: boolean;
   onToggle: () => void;
   isDirty?: boolean;
 }) {
   const displayValue = editedValue ?? value;
-  const loading = visible && displayValue === undefined;
+  // Shown once fetched; a read that wasn't approved stays masked
+  const shown = visible && !loading && displayValue !== undefined;
 
   return (
     <div className="flex w-full min-w-0 items-center gap-1.5">
@@ -78,13 +85,13 @@ function SecretValueCell({
         autoComplete="off"
         data-1p-ignore
         data-lpignore="true"
-        value={visible && !loading ? displayValue : "••••••••••••"}
+        value={shown ? displayValue : "••••••••••••"}
         onChange={(e) => {
-          if (visible && !loading) {
+          if (shown) {
             onValueChange(e.target.value);
           }
         }}
-        readOnly={!visible || loading}
+        readOnly={!shown}
         onFocus={(e) => {
           if (!visible) {
             e.target.blur()
@@ -93,7 +100,7 @@ function SecretValueCell({
         }}
         className={cn(
           "min-w-0 max-w-full flex-1 mono-sm",
-          visible && !loading ? "bg-muted/50 value-reveal" : "text-security-disc border-transparent bg-muted/50 cursor-pointer select-none",
+          shown ? "bg-muted/50 value-reveal" : "text-security-disc border-transparent bg-muted/50 cursor-pointer select-none",
           isDirty && "border-amber-400/50 focus:ring-amber-500",
         )}
       />
@@ -139,20 +146,29 @@ export function SecretsTable({
   // value is fetched again
   const [values, setValues] = useState<Record<string, string>>({});
 
-  // Ids being fetched, so a re-render doesn't fetch (and record) them twice
+  // Ids being fetched: the ref so a re-render doesn't fetch (and record) them
+  // twice, the state to show them loading
   const fetching = useRef(new Set<string>());
+  const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
 
   const loadValues = useCallback(async (targets: { id: string; name: string }[]) => {
     const missing = targets.filter((secret) => values[secret.id] === undefined && !fetching.current.has(secret.id));
     if (!environmentId || missing.length === 0) return;
     for (const secret of missing) fetching.current.add(secret.id);
+    setPending(new Set(fetching.current));
     try {
-      const fetched = await revealSecretsAction({ environmentId, names: missing.map((secret) => secret.name) });
-      setValues((prev) => ({ ...prev, ...Object.fromEntries(missing.map((secret) => [secret.id, fetched[secret.name] ?? ""])) }));
+      // A protected environment asks for the passkey first
+      const result = await withStepUp(() => revealSecretsAction({ environmentId, names: missing.map((secret) => secret.name) }));
+      if (result) {
+        setValues((prev) => ({ ...prev, ...Object.fromEntries(missing.map((secret) => [secret.id, result.values[secret.name] ?? ""])) }));
+      } else {
+        setRowVisible((prev) => ({ ...prev, ...Object.fromEntries(missing.map((secret) => [secret.id, false])) }));
+      }
     } catch (e: any) {
       alert(e?.message || "Failed to load values");
     } finally {
       for (const secret of missing) fetching.current.delete(secret.id);
+      setPending(new Set(fetching.current));
     }
   }, [environmentId, values]);
 
@@ -220,9 +236,11 @@ export function SecretsTable({
   const totalDirtyCount = pendingEdits.length;
 
   // The .env of this environment with unsaved edits applied. Fetches every
-  // value, recorded as a download.
+  // value, recorded as a download. Null when its passkey approval wasn't given.
   const buildEnvFile = useCallback(async () => {
-    const fetched = await revealSecretsAction({ environmentId, names: null, download: true });
+    const result = await withStepUp(() => revealSecretsAction({ environmentId, names: null, download: true }));
+    if (!result) return null;
+    const fetched = result.values;
     return renderEnvFile([
       ...secrets.map((secret): [string, string] => [
         edits[secret.id]?.name ?? secret.name,
@@ -264,7 +282,9 @@ export function SecretsTable({
 
   const handleDownloadEnv = useCallback(async () => {
     try {
-      const blob = new Blob([await buildEnvFile()], { type: "text/plain;charset=utf-8" });
+      const text = await buildEnvFile();
+      if (text === null) return;
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -280,13 +300,17 @@ export function SecretsTable({
     try {
       // A pending ClipboardItem keeps the click's permission to write while
       // the values load; writeText after an await would lose it in Safari
-      const text = buildEnvFile();
+      const text = buildEnvFile().then((t) => {
+        if (t === null) throw new NotApproved();
+        return t;
+      });
       if (typeof ClipboardItem !== "undefined") {
         await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then((t) => new Blob([t], { type: "text/plain" })) })]);
       } else {
         await navigator.clipboard.writeText(await text);
       }
     } catch (error: any) {
+      if (error instanceof NotApproved) return;
       alert(error?.message || "Failed to copy .env contents");
     }
   }, [buildEnvFile]);
@@ -363,6 +387,7 @@ export function SecretsTable({
                       editedValue={edits[secret.id]?.value}
                       onValueChange={(v) => setEdit(secret.id, "value", v)}
                       visible={isVisible}
+                      loading={pending.has(secret.id)}
                       onToggle={() => {
                         if (!isVisible) void loadValues([secret]);
                         setRowVisible((prev) => ({ ...prev, [secret.id]: !isVisible }));
@@ -548,8 +573,9 @@ export function SecretsTable({
         onSave={async (envIds) => {
           setSaving(true);
           try {
-            if (pendingEdits.length > 0) {
-              await saveSecretsAction({ edits: pendingEdits, environmentIds: envIds });
+            // Copying a kept value out of a protected environment asks for the passkey
+            if (pendingEdits.length > 0 && await withStepUp(() => saveSecretsAction({ edits: pendingEdits, environmentIds: envIds })) === null) {
+              return;
             }
             setEdits({});
             setMissingEdits({});
@@ -823,11 +849,12 @@ function SyncMissingDialog({
             setSyncing(true);
             setError(null);
             try {
-              const result = await syncMissingSecretsAction({
+              const result = await withStepUp(() => syncMissingSecretsAction({
                 sourceEnvironmentId,
                 targetEnvironmentId: currentEnvironmentId,
                 names: missingKeys,
-              });
+              }));
+              if (!result) return;
               if (result.count === 0) {
                 setError("That environment doesn't have any of the missing secrets.");
               } else {

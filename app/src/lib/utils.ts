@@ -45,6 +45,9 @@ export function formatTime({ ts, now, timeZone }: { ts: number; now: number; tim
 // these and createTokenAction accepts nothing else.
 export const TOKEN_EXPIRY_DAYS = [7, 30, 90, 365] as const
 export const DEFAULT_TOKEN_EXPIRY_DAYS = 90
+// A machine token reads protected environments without a passkey, so it must
+// expire sooner
+export const MACHINE_TOKEN_MAX_DAYS = 90
 
 // Who may sign up and sign in, from ALLOWED_USERS: comma-separated email
 // addresses and domains. Empty lets in anyone the provider signs in. Only
