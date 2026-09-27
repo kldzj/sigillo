@@ -463,6 +463,67 @@ export async function requirePageOrgMember(userId: string, orgId: string) {
   }
 }
 
+// ── Project & environment authorization ─────────────────────────────
+// requireOrgMember only proves org membership. Anything scoped to a project
+// must also honour member_access, and anything scoped to an environment must
+// honour its accessRole: a member can neither read, write, rename nor delete
+// an admin-only environment. The REST routes, the server actions and the
+// page loaders all go through these two, so the rule lives in one place.
+
+export async function requireProjectAccess({ userId, orgId, projectId }: {
+  userId: string
+  orgId: string
+  projectId: string
+}) {
+  // One query answers membership and granular project access, and returns
+  // the role needed for admin-only environments.
+  const access = await getMemberAccess({ userId, orgId })
+  if (!access) throw new ForbiddenError('forbidden')
+  if (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(projectId)) {
+    throw new ForbiddenError('you do not have access to this project')
+  }
+  return access
+}
+
+export async function requireEnvironmentAccess({ userId, environment }: {
+  userId: string
+  environment: { projectId: string; accessRole: string; orgId: string | null }
+}) {
+  if (!environment.orgId) throw new ForbiddenError('forbidden')
+  const access = await requireProjectAccess({ userId, orgId: environment.orgId, projectId: environment.projectId })
+  if (environment.accessRole === 'admin' && access.role !== 'admin') {
+    throw new ForbiddenError('admin access required for this environment')
+  }
+  return access
+}
+
+export async function requireApiProjectAccess(args: Parameters<typeof requireProjectAccess>[0]) {
+  try {
+    return await requireProjectAccess(args)
+  } catch (error) {
+    if (!(error instanceof ForbiddenError)) throw error
+    throw forbiddenResponse(error.message)
+  }
+}
+
+export async function requireApiEnvironmentAccess(args: Parameters<typeof requireEnvironmentAccess>[0]) {
+  try {
+    return await requireEnvironmentAccess(args)
+  } catch (error) {
+    if (!(error instanceof ForbiddenError)) throw error
+    throw forbiddenResponse(error.message)
+  }
+}
+
+export async function requirePageEnvironmentAccess(args: Parameters<typeof requireEnvironmentAccess>[0]) {
+  try {
+    return await requireEnvironmentAccess(args)
+  } catch (error) {
+    if (!(error instanceof ForbiddenError)) throw error
+    throw redirect('/')
+  }
+}
+
 // ── Org ownership chain lookups ─────────────────────────────────────
 
 export const getOrgIdForProject = memoize({
@@ -694,17 +755,7 @@ export async function requireSecretsApiAuth(
 
   const env = await resolveEnvironment(environmentRef, projectId)
   if (!env?.orgId) throw new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } })
-
-  // One query answers membership, granular project access, AND the role
-  // needed for admin-only environments (previously 3 sequential round-trips).
-  const access = await getMemberAccess({ userId: session.userId, orgId: env.orgId })
-  if (!access) throw forbiddenResponse()
-  if (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(env.projectId)) {
-    throw forbiddenResponse('you do not have access to this project')
-  }
-  if (env.accessRole === 'admin' && access.role !== 'admin') {
-    throw forbiddenResponse('admin access required for this environment')
-  }
+  await requireApiEnvironmentAccess({ userId: session.userId, environment: env })
 
   return { userId: session.userId, apiTokenId: null, environmentId: env.id }
 }

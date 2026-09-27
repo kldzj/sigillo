@@ -17,6 +17,7 @@ import {
   getDb, getAuth, getSession, getRequestOrigin, ensureOAuthClient,
   requirePageSession,
   requirePageOrgMember,
+  requirePageEnvironmentAccess,
   getOrgIdForProject,
   deriveEnvironmentSecretsAndNames,
   decrypt,
@@ -345,6 +346,12 @@ export const app = new Spiceflow({ tracer })
     if (selectedEnvId && !matchedEnv && environments[0]) {
       throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}`)
     }
+    // The selected environment's secrets are decrypted below, so it gets the
+    // same check as the REST secrets routes (project access + accessRole).
+    if (matchedEnv) {
+      const orgId = await getOrgIdForProject(projectId)
+      await requirePageEnvironmentAccess({ userId: session.userId, environment: { ...matchedEnv, orgId } })
+    }
 
     let secrets: { id: string; name: string; value: string; createdAt: number; updatedAt: number; createdBy: { id: string; name: string } | null }[] = []
     // One D1 batch derives the selected env's secrets AND the union of names
@@ -449,9 +456,10 @@ export const app = new Spiceflow({ tracer })
     return redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}/event-log`)
   })
 
-  .loader('/dash/projects/:projectId/envs/:envSlug/event-log', async ({ params, redirect }) => {
+  .loader('/dash/projects/:projectId/envs/:envSlug/event-log', async ({ params, request, redirect }) => {
     const db = getDb()
     const { projectId, envSlug } = params
+    const session = await requirePageSession(request)
 
     const environments = await db.query.environment.findMany({ where: { projectId }, orderBy: { createdAt: 'asc' } })
 
@@ -460,6 +468,11 @@ export const app = new Spiceflow({ tracer })
 
     if (selectedEnvId && !matchedEnv && environments[0]) {
       throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/event-log`)
+    }
+    // Every historical value is decrypted below: same check as the env page.
+    if (matchedEnv) {
+      const orgId = await getOrgIdForProject(projectId)
+      await requirePageEnvironmentAccess({ userId: session.userId, environment: { ...matchedEnv, orgId } })
     }
 
     // Load events for selected env, sorted by createdAt DESC

@@ -16,7 +16,6 @@ import type { BatchItem } from 'drizzle-orm/batch'
 import { schema } from 'db'
 import { getActionRequest, redirect } from 'spiceflow'
 import { router } from 'spiceflow/react'
-import { captureException } from '@strada.sh/sdk'
 import {
   getDb, getSession,
   requireOrgMember,
@@ -26,7 +25,9 @@ import {
   deriveSecrets,
   getEmailDomain,
   COMMON_EMAIL_DOMAINS,
-  getMemberProjectAccess,
+  requireProjectAccess,
+  requireEnvironmentAccess,
+  resolveEnvironment,
   deleteOrgMember,
 } from './db.ts'
 
@@ -51,6 +52,37 @@ async function ensureAnotherAdminExists(orgId: string, userId: string) {
   if (admins.length === 1 && admins[0]?.userId === userId) {
     throw new Error('This organization needs at least one admin')
   }
+}
+
+// Resolve an environment and apply the same check as the REST secrets
+// routes: project access, plus the admin role for an admin-only environment.
+async function requireEnvironment(userId: string, environmentId: string) {
+  const environment = await resolveEnvironment(environmentId)
+  if (!environment) throw new Error('Environment not found')
+  await requireEnvironmentAccess({ userId, environment })
+  return environment
+}
+
+// A token reads every secret in its scope, so creating or revoking one needs
+// access to that whole scope: its one environment, or every environment of
+// the project for a project-wide token.
+async function requireTokenScopeAccess({ userId, projectId, environmentId }: {
+  userId: string
+  projectId: string
+  environmentId: string | null
+}) {
+  const orgId = await getOrgIdForProject(projectId)
+  if (!orgId) throw new Error('Project not found')
+  await requireProjectAccess({ userId, orgId, projectId })
+  const db = getDb()
+  const environments = await db.query.environment.findMany({
+    where: environmentId ? { id: environmentId, projectId } : { projectId },
+    columns: { projectId: true, accessRole: true },
+  })
+  if (environmentId && environments.length === 0) throw new Error('Environment not found in this project')
+  await Promise.all(environments.map((environment) =>
+    requireEnvironmentAccess({ userId, environment: { ...environment, orgId } }),
+  ))
 }
 
 export async function createProjectAction({ name, orgId }: { name: string; orgId: string }) {
@@ -79,17 +111,10 @@ export async function deleteSecretAction({ name, environmentIds }: {
   const unique = Array.from(new Set(environmentIds))
   if (!unique.length) throw new Error('No environments selected')
   const session = await requireSession()
-  const orgIds = await Promise.all(unique.map((id) => getOrgIdForEnvironment(id)))
-  const orgId = orgIds[0]
-  if (!orgId || orgIds.some((id) => !id)) throw new Error('Environment not found')
-  if (orgIds.some((id) => id !== orgId)) throw new Error('All environments must belong to the same organization')
-  // getMemberProjectAccess also verifies org membership in a single query,
-  // so no separate requireOrgMember round-trip is needed.
-  const db0 = getDb()
-  const env0 = await db0.query.environment.findFirst({ where: { id: unique[0]! }, columns: { projectId: true } })
-  if (!env0) throw new Error('Environment not found')
-  if (!await getMemberProjectAccess({ userId: session.userId, orgId, projectId: env0.projectId })) {
-    throw new Error('You do not have access to this project')
+  // Every environment is checked, not just the first one
+  const environments = await Promise.all(unique.map((id) => requireEnvironment(session.userId, id)))
+  if (environments.some((env) => env.orgId !== environments[0]!.orgId)) {
+    throw new Error('All environments must belong to the same organization')
   }
   const db = getDb()
   const queries: BatchItem<'sqlite'>[] = unique.map((envId) =>
@@ -111,16 +136,9 @@ export async function saveSecretsAction({ edits, environmentIds }: {
   if (edits.length === 0 || environmentIds.length === 0) return
   const session = await requireSession()
   const currentEnvId = environmentIds[0]!
-  const orgId = await getOrgIdForEnvironment(currentEnvId)
-  if (!orgId) throw new Error('Environment not found')
-  // getMemberProjectAccess also verifies org membership in a single query,
-  // so no separate requireOrgMember round-trip is needed.
-  const db0 = getDb()
-  const env0 = await db0.query.environment.findFirst({ where: { id: currentEnvId }, columns: { projectId: true } })
-  if (!env0) throw new Error('Environment not found')
-  if (!await getMemberProjectAccess({ userId: session.userId, orgId, projectId: env0.projectId })) {
-    throw new Error('You do not have access to this project')
-  }
+  // Every environment written to is checked, not just the first one
+  const environments = await Promise.all(environmentIds.map((id) => requireEnvironment(session.userId, id)))
+  const orgId = environments[0]!.orgId
 
   const db = getDb()
 
@@ -152,13 +170,11 @@ export async function saveSecretsAction({ edits, environmentIds }: {
   }
 
   // Apply value changes to other environments
-  const otherEnvIds = environmentIds.slice(1)
-  for (const envId of otherEnvIds) {
-    const targetOrgId = await getOrgIdForEnvironment(envId)
-    if (targetOrgId !== orgId) continue
+  for (const env of environments.slice(1)) {
+    if (env.orgId !== orgId) continue
     for (const edit of editsWithEncrypted) {
       queries.push(db.insert(schema.secretEvent).values({
-        environmentId: envId, name: edit.name,
+        environmentId: env.id, name: edit.name,
         operation: 'set', valueEncrypted: edit.enc!.encrypted, iv: edit.enc!.iv,
         userId: session.userId,
       }))
@@ -173,9 +189,7 @@ export async function saveSecretsAction({ edits, environmentIds }: {
 
 export async function deleteEnvAction({ id }: { id: string }) {
   const session = await requireSession()
-  const orgId = await getOrgIdForEnvironment(id)
-  if (!orgId) throw new Error('Environment not found')
-  await requireOrgMember(session.userId, orgId)
+  await requireEnvironment(session.userId, id)
   const db = getDb()
   await db.delete(schema.environment).where(orm.eq(schema.environment.id, id))
 }
@@ -189,7 +203,7 @@ export async function createEnvAction({ name, slug, projectId }: {
   const session = await requireSession()
   const orgId = await getOrgIdForProject(projectId)
   if (!orgId) throw new Error('Project not found')
-  await requireOrgMember(session.userId, orgId)
+  await requireProjectAccess({ userId: session.userId, orgId, projectId })
   const db = getDb()
   await db.insert(schema.environment).values({ projectId, name, slug })
   return { name }
@@ -202,9 +216,7 @@ export async function renameEnvAction({ id, name, slug }: {
 }) {
   if (!name && !slug) throw new Error('At least one of name or slug is required')
   const session = await requireSession()
-  const orgId = await getOrgIdForEnvironment(id)
-  if (!orgId) throw new Error('Environment not found')
-  await requireOrgMember(session.userId, orgId)
+  await requireEnvironment(session.userId, id)
   const db = getDb()
   const updates: Partial<{ name: string; slug: string; updatedAt: number }> = { updatedAt: Date.now() }
   if (name) updates.name = name
@@ -255,36 +267,31 @@ export async function acceptInviteAction({ invitationId }: { invitationId: strin
     where: { id: invitationId },
   })
   if (!invite || invite.expiresAt < Date.now()) throw new Error('Invitation not found or expired')
-  // Insert membership, onConflictDoNothing handles the already-member case
-  // (unique index on org_id + user_id prevents duplicates).
-  const inserted = await db.insert(schema.orgMember)
-    .values({ orgId: invite.orgId, userId: session.userId, role: invite.role })
-    .onConflictDoNothing({ target: [schema.orgMember.orgId, schema.orgMember.userId] })
-    .returning({ id: schema.orgMember.id })
-
-  // If the invite has project scoping, create memberAccess rows
-  if (inserted.length > 0 && invite.projectIds) {
-    try {
-      const projectIds = JSON.parse(invite.projectIds) as string[]
-      if (Array.isArray(projectIds) && projectIds.length > 0) {
-        const memberId = inserted[0]!.id
-        const queries = projectIds.map((projectId) =>
-          db.insert(schema.memberAccess)
-            .values({ orgMemberId: memberId, projectId })
-            .onConflictDoNothing(),
-        )
-        const [first, ...rest] = queries
-        if (first) await db.batch([first, ...rest])
-      }
-    } catch (error) {
-      // Membership already exists at this point, so don't fail the whole
-      // accept — the user is in the org, just without the scoped project
-      // rows. Report it instead of swallowing: silently dropping these leaves
-      // the invitee with an org they can see nothing in, and no signal why.
-      captureException(error, {
-        tags: { action: 'acceptInviteAction', step: 'project-scoping', invitationId },
-      })
+  const existing = await db.query.orgMember.findFirst({
+    where: { orgId: invite.orgId, userId: session.userId },
+    columns: { id: true },
+  })
+  if (!existing) {
+    // Resolve the project scope BEFORE creating the membership: a member with
+    // zero memberAccess rows can access every project, so a scoped invite
+    // whose projects were all deleted must be refused, not accepted unscoped.
+    const invitedProjectIds: string[] = invite.projectIds ? JSON.parse(invite.projectIds) : []
+    const projects = invitedProjectIds.length > 0
+      ? await db.query.project.findMany({ where: { orgId: invite.orgId, id: { in: invitedProjectIds } }, columns: { id: true } })
+      : []
+    if (invitedProjectIds.length > 0 && projects.length === 0) {
+      throw new Error('The projects in this invitation no longer exist. Ask for a new invitation.')
     }
+    // Membership and scope in one batch, so a failure never leaves an
+    // unscoped member behind. onConflictDoNothing keeps a double-submitted
+    // accept a no-op (unique index on org_id + user_id).
+    const memberId = ulid()
+    await db.batch([
+      db.insert(schema.orgMember)
+        .values({ id: memberId, orgId: invite.orgId, userId: session.userId, role: invite.role })
+        .onConflictDoNothing({ target: [schema.orgMember.orgId, schema.orgMember.userId] }),
+      ...projects.map((p) => db.insert(schema.memberAccess).values({ orgMemberId: memberId, projectId: p.id })),
+    ])
   }
 
   throw redirect(router.href('/dash/orgs/:orgId', { orgId: invite.orgId }))
@@ -349,19 +356,7 @@ export async function createTokenAction({ name, projectId, environmentId }: {
   if (!name) throw new Error('Name is required')
   if (!projectId) throw new Error('Project is required')
   const session = await requireSession()
-  const orgId = await getOrgIdForProject(projectId)
-  if (!orgId) throw new Error('Project not found')
-  await requireOrgMember(session.userId, orgId)
-
-  // If environmentId is provided, verify it belongs to this project
-  if (environmentId) {
-    const db = getDb()
-    const env = await db.query.environment.findFirst({
-      where: { id: environmentId, projectId },
-      columns: { id: true },
-    })
-    if (!env) throw new Error('Environment not found in this project')
-  }
+  await requireTokenScopeAccess({ userId: session.userId, projectId, environmentId: environmentId || null })
 
   const { key, hashedKey, prefix } = await generateApiToken()
   const db = getDb()
@@ -384,12 +379,10 @@ export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
   const db = getDb()
   const token = await db.query.apiToken.findFirst({
     where: { id: tokenId },
-    columns: { projectId: true },
+    columns: { projectId: true, environmentId: true },
   })
   if (!token) throw new Error('Token not found')
-  const orgId = await getOrgIdForProject(token.projectId)
-  if (!orgId) throw new Error('Project not found')
-  await requireOrgMember(session.userId, orgId)
+  await requireTokenScopeAccess({ userId: session.userId, projectId: token.projectId, environmentId: token.environmentId })
   await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
 }
 
@@ -407,11 +400,12 @@ export async function syncMissingSecretsAction({
   if (!names.length) throw new Error('No secret names provided')
   const session = await requireSession()
 
-  const sourceOrgId = await getOrgIdForEnvironment(sourceEnvironmentId)
-  const targetOrgId = await getOrgIdForEnvironment(targetEnvironmentId)
-  if (!sourceOrgId || !targetOrgId) throw new Error('Environment not found')
-  if (sourceOrgId !== targetOrgId) throw new Error('Environments must belong to the same organization')
-  await requireOrgMember(session.userId, targetOrgId)
+  // Reads the source and writes the target, so both need the full check
+  const [source, target] = await Promise.all([
+    requireEnvironment(session.userId, sourceEnvironmentId),
+    requireEnvironment(session.userId, targetEnvironmentId),
+  ])
+  if (source.orgId !== target.orgId) throw new Error('Environments must belong to the same organization')
 
   // Re-derive both sides server-side so we never overwrite a key that was
   // added to the target after the client loaded (stale tab race condition).
@@ -510,14 +504,9 @@ export async function updateMemberAccessAction({ memberId, projectIds }: {
   // Cannot restrict admins
   if (member.role === 'admin') throw new Error('Admins always have full access')
 
-  // Delete all existing access rules for this member
-  await db.delete(schema.memberAccess)
-    .where(orm.eq(schema.memberAccess.orgMemberId, member.id))
-
-  // If no projects specified, member reverts to "all access" (no rows)
-  if (projectIds.length === 0) return { ok: true }
-
-  // Verify all projects belong to this org
+  // Verify all projects belong to this org BEFORE touching the old rules:
+  // zero rules means access to every project, so failing halfway through a
+  // replace used to leave a restricted member unrestricted.
   const orgProjects = await db.query.project.findMany({
     where: { orgId: member.orgId },
     columns: { id: true },
@@ -529,12 +518,11 @@ export async function updateMemberAccessAction({ memberId, projectIds }: {
     }
   }
 
-  // Insert new access rules
-  const queries = projectIds.map((projectId) =>
-    db.insert(schema.memberAccess).values({ orgMemberId: member.id, projectId }),
-  )
-  const [first, ...rest] = queries
-  if (first) await db.batch([first, ...rest])
+  // Replace the rules in one batch. No projects = no rows = "all access".
+  await db.batch([
+    db.delete(schema.memberAccess).where(orm.eq(schema.memberAccess.orgMemberId, member.id)),
+    ...projectIds.map((projectId) => db.insert(schema.memberAccess).values({ orgMemberId: member.id, projectId })),
+  ])
 
   return { ok: true }
 }

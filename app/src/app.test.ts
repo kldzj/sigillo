@@ -15,7 +15,7 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, deleteOrgMember } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, deleteOrgMember, resolveEnvironment, requireEnvironmentAccess, ForbiddenError } from './db.js'
 import { schema } from 'db'
 import { formatAbsoluteDate, formatTime } from './lib/utils.js'
 
@@ -1559,6 +1559,121 @@ describe('environment access roles', () => {
       { headers: { authorization: `Bearer ${memberToken}` } },
     ))
     expect(res.status).toBe(403)
+  })
+})
+
+// ── Authorization — project scoping and admin-only environments ─────
+
+// member_access (project scoping) and environment.accessRole used to be
+// enforced by the REST secrets routes only. The environment routes and the
+// page loaders checked org membership alone, so a member scoped to one
+// project could delete another project's admin-only production env.
+describe('authorization — project scoping and admin-only environments', () => {
+  let adminToken: string
+  let memberToken: string // member with access to every project
+  let scopedToken: string // member scoped to project B only
+  let adminUserId: string
+  let memberUserId: string
+  let scopedUserId: string
+  let projectAId: string
+  let projectBId: string
+  let aDevEnvId: string
+  let aProdEnvId: string // admin-only
+
+  beforeAll(async () => {
+    const admin = await createTestUser({ name: 'AuthzAdmin' })
+    const member = await createTestUser({ name: 'AuthzMember' })
+    const scoped = await createTestUser({ name: 'AuthzScoped' })
+    adminToken = admin.token
+    memberToken = member.token
+    scopedToken = scoped.token
+    adminUserId = admin.user.id
+    memberUserId = member.user.id
+    scopedUserId = scoped.user.id
+
+    const af = authedFetch(adminToken)
+    const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Authz Org' } }))
+    projectAId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Authz A', orgId: org.id } })).id
+    projectBId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Authz B', orgId: org.id } })).id
+    const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: projectAId } }))
+    aDevEnvId = envs.environments.find((e) => e.slug === 'dev')!.id
+    aProdEnvId = envs.environments.find((e) => e.slug === 'prod')!.id
+
+    const db = getDb()
+    await db.insert(schema.orgMember).values({ orgId: org.id, userId: member.user.id, role: 'member' })
+    const [scopedRow] = await db.insert(schema.orgMember)
+      .values({ orgId: org.id, userId: scoped.user.id, role: 'member' })
+      .returning({ id: schema.orgMember.id })
+    await db.insert(schema.memberAccess).values({ orgMemberId: scopedRow!.id, projectId: projectBId })
+    // Before any lookup, because resolveEnvironment is memoized
+    await db.update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, aProdEnvId))
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'PUT', params: { pid: projectAId, eid: aProdEnvId },
+      body: { secrets: { PROD_DB: 'prod-secret-value' } },
+    }))
+  })
+
+  test('a member scoped to another project gets 403 on every environment route', async () => {
+    const sf = authedFetch(scopedToken)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments', { params: { pid: projectAId } }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments/:id', { params: { pid: projectAId, id: aDevEnvId } }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments', {
+      method: 'POST', params: { pid: projectAId }, body: { name: 'Staging', slug: 'staging' },
+    }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments/:id', {
+      method: 'PATCH', params: { pid: projectAId, id: aDevEnvId }, body: { name: 'Renamed' },
+    }), 403)
+    assertErrorStatus(await sf('/api/v0/projects/:pid/environments/:id', {
+      method: 'DELETE', params: { pid: projectAId, id: aDevEnvId },
+    }), 403)
+  })
+
+  test('a member cannot rename or delete an admin-only environment', async () => {
+    const mf = authedFetch(memberToken)
+    assertErrorStatus(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'PATCH', params: { pid: projectAId, id: aProdEnvId }, body: { name: 'Pwned' },
+    }), 403)
+    assertErrorStatus(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'DELETE', params: { pid: projectAId, id: aProdEnvId },
+    }), 403)
+    expect(await getDb().query.environment.findFirst({ where: { id: aProdEnvId } })).toBeDefined()
+  })
+
+  test('a member manages the environments they can read', async () => {
+    const mf = authedFetch(memberToken)
+    const created = assertOk(await mf('/api/v0/projects/:pid/environments', {
+      method: 'POST', params: { pid: projectAId }, body: { name: 'QA', slug: 'qa' },
+    }))
+    assertOk(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'PATCH', params: { pid: projectAId, id: created.id }, body: { name: 'QA 2' },
+    }))
+    assertOk(await mf('/api/v0/projects/:pid/environments/:id', {
+      method: 'DELETE', params: { pid: projectAId, id: created.id },
+    }))
+  })
+
+  test('an admin manages an admin-only environment', async () => {
+    assertOk(await authedFetch(adminToken)('/api/v0/projects/:pid/environments/:id', {
+      method: 'PATCH', params: { pid: projectAId, id: aProdEnvId }, body: { name: 'Production' },
+    }))
+  })
+
+  // The env page and its event log loaders call this helper. Pages cannot be
+  // rendered in this harness, so the rule is tested on the helper directly.
+  test('requireEnvironmentAccess applies project scoping and accessRole', async () => {
+    const prod = (await resolveEnvironment(aProdEnvId))!
+    const dev = (await resolveEnvironment(aDevEnvId))!
+    await expect(requireEnvironmentAccess({ userId: memberUserId, environment: prod })).rejects.toBeInstanceOf(ForbiddenError)
+    await expect(requireEnvironmentAccess({ userId: scopedUserId, environment: dev })).rejects.toBeInstanceOf(ForbiddenError)
+    await expect(requireEnvironmentAccess({ userId: memberUserId, environment: dev })).resolves.toMatchObject({ role: 'member' })
+    await expect(requireEnvironmentAccess({ userId: adminUserId, environment: prod })).resolves.toMatchObject({ role: 'admin' })
+  })
+
+  test('a member cannot delete a project that holds an admin-only environment', async () => {
+    assertErrorStatus(await authedFetch(memberToken)('/api/v0/projects/:id', {
+      method: 'DELETE', params: { id: projectAId },
+    }), 403)
+    expect(await getDb().query.project.findFirst({ where: { id: projectAId } })).toBeDefined()
   })
 })
 

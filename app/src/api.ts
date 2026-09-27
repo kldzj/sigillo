@@ -33,6 +33,8 @@ import {
   COMMON_EMAIL_DOMAINS,
   getMemberProjectAccess,
   getAccessibleProjectIds,
+  requireApiProjectAccess,
+  requireApiEnvironmentAccess,
 } from './db.ts'
 import { memoize } from './lib/memoize.ts'
 
@@ -585,10 +587,17 @@ export const apiApp = new Spiceflow()
       const session = await requireApiSession(request)
       const orgId = await getOrgIdForProject(params.id)
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      // getMemberProjectAccess also verifies org membership (single query),
-      // so no separate requireApiOrgMember round-trip is needed.
-      if (!await getMemberProjectAccess({ userId: session.userId, orgId, projectId: params.id })) return json({ error: 'forbidden' }, { status: 403 })
+      const access = await requireApiProjectAccess({ userId: session.userId, orgId, projectId: params.id })
       const db = getDb()
+      // Deleting a project deletes its environments, so an admin-only one
+      // needs an admin here too.
+      if (access.role !== 'admin') {
+        const adminOnly = await db.query.environment.findFirst({
+          where: { projectId: params.id, accessRole: 'admin' },
+          columns: { id: true },
+        })
+        if (adminOnly) return json({ error: 'admin access required for this environment' }, { status: 403 })
+      }
       const [deleted] = await db.delete(schema.project).where(orm.eq(schema.project.id, params.id)).returning({ id: schema.project.id })
       if (!deleted) return json({ error: 'not found' }, { status: 404 })
       return { ok: true, id: deleted.id }
@@ -618,7 +627,7 @@ export const apiApp = new Spiceflow()
       const session = await requireApiSession(request)
       const orgId = await getOrgIdForProject(params.projectId)
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      await requireApiOrgMember(session.userId, orgId)
+      await requireApiProjectAccess({ userId: session.userId, orgId, projectId: params.projectId })
       const db = getDb()
       const environments = (await db.query.environment.findMany({ where: { projectId: params.projectId }, orderBy: { createdAt: 'asc' } })).map(toEnvironmentSummary)
       return { projectId: params.projectId, environments }
@@ -636,7 +645,7 @@ export const apiApp = new Spiceflow()
       const session = await requireApiSession(request)
       const orgId = await getOrgIdForProject(params.projectId)
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      await requireApiOrgMember(session.userId, orgId)
+      await requireApiProjectAccess({ userId: session.userId, orgId, projectId: params.projectId })
       const db = getDb()
       const [row] = await db.insert(schema.environment).values({ projectId: params.projectId, name: body.name, slug: body.slug })
         .returning({ id: schema.environment.id, projectId: schema.environment.projectId, name: schema.environment.name, slug: schema.environment.slug })
@@ -663,10 +672,9 @@ export const apiApp = new Spiceflow()
 
       const session = await requireApiSession(request)
       const environment = await resolveEnvironment(params.id, params.projectId)
-      const orgId = environment?.orgId ?? null
-      if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      await requireApiOrgMember(session.userId, orgId)
-      if (!environment) return json({ error: 'not found' }, { status: 404 })
+      if (!environment?.orgId) return json({ error: 'not found' }, { status: 404 })
+      // Metadata only, so project access is enough, same as the list route
+      await requireApiProjectAccess({ userId: session.userId, orgId: environment.orgId, projectId: environment.projectId })
       return toEnvironmentSummary(environment)
     },
   })
@@ -679,10 +687,8 @@ export const apiApp = new Spiceflow()
     async handler({ params, request }) {
       const session = await requireApiSession(request)
       const environment = await resolveEnvironment(params.id, params.projectId)
-      const orgId = environment?.orgId ?? null
-      if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      await requireApiOrgMember(session.userId, orgId)
-      if (!environment) return json({ error: 'not found' }, { status: 404 })
+      if (!environment?.orgId) return json({ error: 'not found' }, { status: 404 })
+      await requireApiEnvironmentAccess({ userId: session.userId, environment })
       const db = getDb()
       const [deleted] = await db.delete(schema.environment).where(orm.eq(schema.environment.id, environment.id)).returning({ id: schema.environment.id })
       if (!deleted) return json({ error: 'not found' }, { status: 404 })
@@ -703,10 +709,8 @@ export const apiApp = new Spiceflow()
       }
       const session = await requireApiSession(request)
       const environment = await resolveEnvironment(params.id, params.projectId)
-      const orgId = environment?.orgId ?? null
-      if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      await requireApiOrgMember(session.userId, orgId)
-      if (!environment) return json({ error: 'not found' }, { status: 404 })
+      if (!environment?.orgId) return json({ error: 'not found' }, { status: 404 })
+      await requireApiEnvironmentAccess({ userId: session.userId, environment })
       const db = getDb()
       const updates: Partial<{ name: string; slug: string; updatedAt: number }> = { updatedAt: Date.now() }
       if (body.name) updates.name = body.name
