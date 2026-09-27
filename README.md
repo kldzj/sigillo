@@ -65,7 +65,7 @@ Secrets are **automatically redacted** from process output so they never leak in
 - **No more `.env` files**: secrets live in the cloud and are easy to share across machines. No more "can you send me the .env?" on Slack.
 - **Single source of truth**: stop duplicating secrets across platforms. In CI, you only need the Sigillo token. Use built-in scripts to sync secrets to Cloudflare, Vercel, Docker, and more.
 - **Collaborative secrets**: share secrets between team members through organizations with role-based access, instead of brittle `.env` files or pasting keys in DMs.
-- **Multi-environment management**: manage dev, staging, and production secrets in one place. Switch between environments with `-c production`.
+- **Multi-environment management**: manage dev, preview, and prod secrets in one place. Switch between environments with `-c prod`.
 
 ### Why agents need this
 
@@ -254,13 +254,15 @@ sigillo run -c dev -- pnpm dev
 | **Output redaction** | High-entropy values automatically replaced with `*` in stdout/stderr |
 | **File mount** | `--mount .env` writes secrets to the given file path, deletes it after the process exits |
 | **Organizations** | Multi-tenant orgs with admin/member roles and invite links |
-| **Projects & environments** | Organize secrets into projects with dev/preview/production environments |
-| **Audit log** | Append-only event log tracks every secret change with user attribution |
-| **API tokens** | Scoped to project or single environment, SHA-256 hashed, shown once |
+| **Projects & environments** | Organize secrets into projects with dev, preview and prod environments |
+| **Audit log** | Every secret change, and in protected environments every read of a value, is recorded in hash chains your instance signs; `sigillo audit verify` checks them |
+| **API tokens** | Scoped to a project and optionally some of its environments, expire after 7 to 365 days, last use shown, SHA-256 hashed, shown once |
+| **Sign-in allowlist** | Only the email addresses and domains you list can sign up or sign in |
+| **Sessions** | See and end every browser and CLI login signed in as you |
 | **Device flow** | RFC 8628 login for CLI and agents, no copy-pasting tokens |
 | **AES-256-GCM encryption** | Every secret encrypted at rest with a random 12-byte IV |
-| **Download formats** | Export as `json`, `env`, `yaml`, `docker`, `dotnet-json`, `xargs` |
-| **Web UI** | Full management dashboard with Doppler-style hidden values |
+| **Download formats** | Export as `json`, `env`, `env-no-quotes`, `yaml`, `docker`, `dotnet-json`, `xargs` |
+| **Web UI** | Full management dashboard; a value loads only when you reveal it |
 | **Self-hostable** | Runs on Cloudflare Workers + D1, deploy your own instance |
 | **REST API** | OpenAPI-documented API for building custom integrations |
 
@@ -271,10 +273,12 @@ sigillo run -c dev -- pnpm dev
 Authenticate via device flow or bearer token.
 
 ```bash
-sigillo login                                              # interactive device flow
+sigillo login --api-url https://my-instance.dev            # interactive device flow
 sigillo login --token sig_xxx                              # save existing API token
-sigillo login --api-url https://my-instance.dev --scope .  # custom instance, scoped to current dir
+sigillo login --api-url https://my-instance.dev --scope .  # scoped to current dir
 ```
+
+`sigillo login` always starts a new login, also when one is saved, so run it again when the CLI says `not signed in, or the session expired`.
 
 ### `sigillo setup`
 
@@ -293,7 +297,7 @@ Execute a command with secrets injected as environment variables.
 sigillo run -- next dev                                          # inject secrets from the configured env
 sigillo run -c dev -- next dev                                   # use the dev environment
 sigillo run -c preview -- next dev                               # use the preview environment
-sigillo run -c production -- next build                          # use the production environment
+sigillo run -c prod -- next build                          # use the prod environment
 sigillo run -- printenv                                          # verify which vars are injected (values redacted)
 sigillo run --command 'echo $MY_SECRET'                          # shell string mode
 sigillo run --mount .env -- npm start                            # write to file, clean up after
@@ -388,6 +392,14 @@ sigillo environments rename env_abc --name Production --slug prod             # 
 sigillo environments delete env_abc                                          # delete
 ```
 
+### `sigillo audit verify`
+
+Check an environment's secret changes and reads against their signed hash chains. Org admins, signed in with `sigillo login` (API tokens are refused). The newest row of each chain is kept in `~/.sigillo/audit.json`, so the next check also notices rows removed or rewritten since.
+
+```bash
+sigillo audit verify -c prod
+```
+
 ### Global flags
 
 Most commands that resolve auth, project, or environment from config accept these overrides:
@@ -418,7 +430,7 @@ Most commands that resolve auth, project, or environment from config accept thes
 Upload secrets to a Cloudflare Worker using `wrangler secret bulk`:
 
 ```bash
-sigillo secrets download -c production --format env |
+sigillo secrets download -c prod --format env |
   wrangler secret bulk --env=""
 ```
 
@@ -433,13 +445,13 @@ Add these as `package.json` scripts so you can sync before each deploy:
 {
   "scripts": {
     "secrets:preview": "sigillo secrets download -c preview --format env | wrangler secret bulk --env preview",
-    "secrets:production": "sigillo secrets download -c production --format env | wrangler secret bulk --env=\"\""
+    "secrets:production": "sigillo secrets download -c prod --format env | wrangler secret bulk --env=\"\""
   }
 }
 ```
 
 This intentionally syncs the entire selected environment. Keep `dev`,
-`preview`, and `production` values separate in Sigillo, then use the matching
+`preview`, and `prod` values separate in Sigillo, then use the matching
 Wrangler environment at deployment time.
 
 ### Vercel
@@ -447,14 +459,14 @@ Wrangler environment at deployment time.
 `vercel env add` only accepts one variable at a time. Use the `xargs` format to pipe them:
 
 ```bash
-sigillo secrets download -c production --format xargs | \
+sigillo secrets download -c prod --format xargs | \
   xargs -0 -n2 sh -c 'printf %s "$2" | vercel env add "$1" production --force' sh
 ```
 
 Add `--sensitive` to mark values as sensitive in Vercel:
 
 ```bash
-sigillo secrets download -c production --format xargs | \
+sigillo secrets download -c prod --format xargs | \
   xargs -0 -n2 sh -c 'printf %s "$2" | vercel env add "$1" production --sensitive --force' sh
 ```
 
@@ -463,7 +475,7 @@ As a `package.json` script:
 ```json
 {
   "scripts": {
-    "secrets:vercel": "sigillo secrets download -c production --format xargs | xargs -0 -n2 sh -c 'printf %s \"$2\" | vercel env add \"$1\" production --sensitive --force' sh"
+    "secrets:vercel": "sigillo secrets download -c prod --format xargs | xargs -0 -n2 sh -c 'printf %s \"$2\" | vercel env add \"$1\" production --sensitive --force' sh"
   }
 }
 ```
@@ -473,14 +485,14 @@ As a `package.json` script:
 `fly secrets import` reads `NAME=VALUE` pairs from stdin. Pipe `sigillo secrets download` directly, no temp file needed:
 
 ```bash
-sigillo secrets download -c production --format env | fly secrets import --app my-app
+sigillo secrets download -c prod --format env | fly secrets import --app my-app
 ```
 
 By default `fly secrets import` triggers a machine restart once secrets are staged. Use `--stage` to skip the restart and deploy separately:
 
 ```bash
 # stage without restarting
-sigillo secrets download -c production --format env | fly secrets import --app my-app --stage
+sigillo secrets download -c prod --format env | fly secrets import --app my-app --stage
 # then deploy when ready
 fly deploy --app my-app
 ```
@@ -490,7 +502,7 @@ Add as `package.json` scripts:
 ```json
 {
   "scripts": {
-    "secrets:fly:production": "sigillo secrets download -c production --format env | fly secrets import --app my-app",
+    "secrets:fly:production": "sigillo secrets download -c prod --format env | fly secrets import --app my-app",
     "secrets:fly:preview": "sigillo secrets download -c preview --format env | fly secrets import --app my-app-staging"
   }
 }
@@ -513,7 +525,7 @@ sigillo run -- docker compose up
 
 ### CI / GitHub Actions
 
-Use an API token for non-interactive environments:
+Use an API token for non-interactive environments. Create it on the project's **Tokens** tab; it expires after the 7 to 365 days you choose, and an expired one gets `401 API token expired`.
 
 ```yaml
 - name: Run with secrets
@@ -558,12 +570,15 @@ The fastest way to self-host — no git clone, no build step:
 npx @kldzj/sigillo self-host
 ```
 
-It logs into Cloudflare (reusing your `wrangler login` when present, or an OAuth browser flow, or a pre-filled API token link that works over SSH), deploys both Workers with their D1 databases, applies migrations, and prints your instance URL. A new deployment needs a **Google OAuth client** for its login provider: the command prints the redirect URI to register at [Google Cloud credentials](https://console.cloud.google.com/apis/credentials) and asks for the client ID and secret. **Re-run the same command anytime to update** — only new migrations are applied and no secret is ever rotated.
+It logs into Cloudflare (reusing your `wrangler login` when present, or an OAuth browser flow, or a pre-filled API token link that works over SSH), deploys both Workers with their D1 databases, applies migrations, and prints your instance URL. A new deployment needs a **Google OAuth client** for its login provider: the command prints the redirect URI to register at [Google Cloud credentials](https://console.cloud.google.com/apis/credentials) and asks for the client ID and secret. It also asks who may sign in (`--allowed-users`), and for a passphrase that encrypts `~/.sigillo/selfhost.json`, the file with your deployment's keys. **Re-run the same command anytime to update** — only new migrations are applied and no secret is ever rotated.
+
+See [Self-hosting](https://github.com/kldzj/sigillo/blob/main/app/src/docs/self-hosting.mdx) for every option and [Hardening](https://github.com/kldzj/sigillo/blob/main/app/src/docs/hardening.mdx) for securing your instance.
 
 ```bash
 # non-interactive (CI/agents)
-CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes \
-  --google-client-id xxx.apps.googleusercontent.com --google-client-secret xxx
+CLOUDFLARE_API_TOKEN=xxx SIGILLO_SELFHOST_PASSPHRASE=xxx npx @kldzj/sigillo self-host --yes \
+  --google-client-id xxx.apps.googleusercontent.com --google-client-secret xxx \
+  --allowed-users acme.com
 
 # custom worker name and domain
 npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com
@@ -592,6 +607,8 @@ GOOGLE_CLIENT_SECRET=<your Google OAuth client secret>
 BETTER_AUTH_SECRET=<any random string>
 ENCRYPTION_KEY=<output of: openssl rand -base64 32>
 ```
+
+To limit who can sign in, set the same `ALLOWED_USERS=acme.com,ops@partner.io` in both files, and as a secret on both Workers when you deploy.
 
 4. Run both locally:
 
@@ -699,14 +716,14 @@ Two auth paths depending on the environment:
   Google sign-in                             │
        │                                     │
        ▼                                     ▼
-  Session cookie saved               Bearer token from env
+  Signed session token saved         Bearer token from env
   in ~/.sigillo/config.json           var or GitHub secret
        │                                     │
        ▼                                     ▼
   sigillo run -- next dev             sigillo run -- next build
 ```
 
-**Local**: interactive device flow (RFC 8628). Run `sigillo login` once, then the session is reused.
+**Local**: interactive device flow (RFC 8628). Run `sigillo login` once, then the session is reused until it expires or you end it on the Sessions page.
 
 **CI**: set `SIGILLO_TOKEN` as a secret in your CI provider. No browser needed, no interactive prompts.
 
@@ -730,18 +747,20 @@ Every secret value is **AES-256-GCM** encrypted before storage. Each write gener
   └──────┬──────┘     └──────────────┘
          │
          ▼
-  ┌────────────────────────────────┐
-  │ secretEvent (append-only row)  │
-  │                                │
-  │  action:    "set"              │
-  │  name:      "API_KEY"          │
-  │  value:     <iv>:<ciphertext>  │
-  │  userId:    usr_abc            │
-  │  createdAt: 1719000000         │
-  └────────────────────────────────┘
+  ┌──────────────────────────────────┐
+  │ secret_event (append-only row)   │
+  │                                  │
+  │  operation:       "set"          │
+  │  name:            "API_KEY"      │
+  │  value_encrypted: <ciphertext>   │
+  │  iv:              <12 bytes>     │
+  │  actor:           "user:usr_abc" │
+  │  seq, hash,       row in the     │
+  │  signature:       signed chain   │
+  └──────────────────────────────────┘
 ```
 
-Secrets are stored as an **append-only event log**. Current values are derived by replaying events. This gives you a full audit trail of every change with user/token attribution.
+Secrets are stored as an **append-only event log**. Current values are derived by replaying events. This gives you a full audit trail of every change with user/token attribution, and the signed hash chain makes an edited or removed row visible to `sigillo audit verify`.
 
 </details>
 

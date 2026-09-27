@@ -15,7 +15,7 @@ ALWAYS fetch the latest README before doing anything else. NEVER skip this:
 curl -s https://raw.githubusercontent.com/kldzj/sigillo/main/README.md
 ```
 
-**NEVER pipe through `head`, `tail`, `sed -n`, or any truncating command.** Read the full output — agent rules and integration patterns are near the bottom and will be missed if truncated.
+**NEVER pipe through `head`, `tail`, `sed -n`, or any truncating command.** Read the full output — integration patterns are near the bottom and will be missed if truncated.
 
 ALWAYS also run help to see exact flag names for the installed version (flags can differ between versions):
 
@@ -50,6 +50,8 @@ sigillo me
 
 Shows current user and organizations. If it errors with "not logged in" or "no Sigillo server configured", run `sigillo login` first. Every instance is self-hosted, so ask the user for their instance URL if you don't know it.
 
+If a command fails with `not signed in, or the session expired: run sigillo login`, the saved login no longer works (it expired, was ended, or predates signed sessions): run `sigillo login --api-url <instance>` again. An API token that fails with `API token expired` needs a new one from the project's **Tokens** tab.
+
 **2. Login (opens browser device flow):**
 
 ```bash
@@ -74,7 +76,7 @@ Interactive — fetches your projects and environments and lets you pick from a 
 sigillo setup --project proj_abc --env dev
 ```
 
-Use `dev` for local work, `preview` for staging, `production` for prod. Only use `preview` or `production` if the user explicitly asks for it.
+Use `dev` for local work, `preview` for staging, `prod` for production. Only use `preview` or `prod` if the user explicitly asks for it.
 
 Run `sigillo --help` to verify the exact flag name (`--env` vs `--environment`) for the installed version.
 
@@ -123,7 +125,7 @@ sigillo run -- printenv   # verify which vars are injected (values redacted)
 ```bash
 sigillo run -c dev -- next dev          # explicitly use dev
 sigillo run -c preview -- next build    # use preview
-sigillo run -c production -- next build # use production
+sigillo run -c prod -- next build       # use prod
 sigillo secrets get DATABASE_URL -c preview  # override for a single secrets command
 ```
 
@@ -135,11 +137,14 @@ Deploy Sigillo to the user's own Cloudflare account with one command (npm packag
 npx @kldzj/sigillo self-host
 ```
 
-It provisions two Workers with their D1 databases, the app and its own login provider (Google sign-in), applies migrations, and prints the instance URL. A new deployment needs a Google OAuth client: the command prints the redirect URI to register and asks for the client ID and secret, or takes `--google-client-id` and `--google-client-secret`. Cloudflare auth is resolved automatically: `CLOUDFLARE_API_TOKEN` env → existing `wrangler login` → OAuth browser flow → pre-filled API token creation link (works over SSH). Re-running the command is idempotent and deploys the latest release.
+It provisions two Workers with their D1 databases, the app and its own login provider (Google sign-in), applies migrations, and prints the instance URL. A new deployment needs a Google OAuth client: the command prints the redirect URI to register and asks for the client ID and secret, or takes `--google-client-id` and `--google-client-secret`. Cloudflare auth is resolved automatically: `CLOUDFLARE_API_TOKEN` env → a login saved by an earlier `self-host` run → existing `wrangler login` → OAuth browser flow → pre-filled API token creation link (works over SSH). Re-running the command is idempotent and deploys the latest release.
+
+`~/.sigillo/selfhost.json` holds the deployment's keys and is encrypted with a passphrase. Under an agent the command can't prompt, so it reads the passphrase from `SIGILLO_SELFHOST_PASSPHRASE`. **Never choose the passphrase yourself**: the user must keep it in their password manager, so ask them to set the variable. Also ask who may sign in and pass it as `--allowed-users`: without it, an agent run deploys an instance anyone with a Google account can sign up to.
 
 ```bash
 # non-interactive (agents/CI)
-CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes --google-client-id xxx --google-client-secret xxx
+CLOUDFLARE_API_TOKEN=xxx SIGILLO_SELFHOST_PASSPHRASE=xxx npx @kldzj/sigillo self-host --yes \
+  --google-client-id xxx --google-client-secret xxx --allowed-users acme.com
 
 # custom worker name and custom domain
 npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com
@@ -161,6 +166,10 @@ sigillo secrets get DATABASE_URL -c dev | sigillo secrets set DATABASE_URL -c pr
 ```
 
 The same pattern works for any secret copy, between environments, or when seeding a new environment from an existing one.
+
+### Reads of protected environments are recorded
+
+In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` is recorded in its Read Log with your login, the secret names and your IP address, and fails if it can't be recorded. Read only what the task needs.
 
 ### Never read `.env` files or `~/.sigillo/*`
 
@@ -239,9 +248,11 @@ After setup, `sigillo run` in any subdirectory uses that project + environment a
     SIGILLO_API_URL: ${{ vars.SIGILLO_API_URL }}
     SIGILLO_TOKEN: ${{ secrets.SIGILLO_TOKEN }}
     SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}
-    SIGILLO_ENVIRONMENT: production
+    SIGILLO_ENVIRONMENT: prod
   run: npx @kldzj/sigillo run -- pnpm build
 ```
+
+API tokens expire after the 7 to 365 days chosen when they were created (90 by default), so CI needs a new one before then.
 
 ### Redaction details
 
