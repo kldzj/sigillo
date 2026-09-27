@@ -8,6 +8,12 @@ const config = @import("config.zig");
 const client = @import("client.zig");
 const pty = @import("pty.zig");
 
+test {
+    // Pull tests from imported files into `zig build test`.
+    _ = config;
+    _ = pty;
+}
+
 const color = @import("color.zig");
 const prompt = @import("prompt.zig");
 
@@ -237,7 +243,7 @@ const Setup = zeke.cmd("setup", "Save default project and env for the current di
 
 const Run = zeke.cmd("run <...cmd>", "Run a command with secrets injected")
     .option("--command [cmd]", "Run a shell command string")
-    .option("--mount [path]", "Write secrets to a file before running")
+    .option("--mount [path]", "Write secrets to a new owner-only file (must not exist), deleted when the command exits")
     .option("--mount-format [fmt]", "Format for mounted file: env, env-no-quotes, json, yaml, docker, dotnet-json (default: env)")
     .option("--disable-redaction", "Print child output without secret redaction")
     .option("-p, --project [id]", "Project ID override")
@@ -871,6 +877,10 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
     try env_map.put("SIGILLO", "1");
 
     // ── Mount: write secrets to a file ────────────────────────────
+    // Before the mount file exists, so no signal can skip its cleanup.
+    const signal_forwarding = SignalForwarding.install();
+    defer signal_forwarding.restore();
+
     const exit_code: u8 = if (opts.mount) |mount_path| mount_block: {
         const mount_format = opts.mount_format orelse "env";
 
@@ -907,26 +917,24 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
             break :blk mount_res.body;
         };
 
-        // Write secrets to the mount file
-        {
-            const file = std.fs.cwd().createFile(mount_path, .{}) catch |err| {
-                try color.err(stderr, "error");
+        // Write secrets to the mount file. Exclusive create: never overwrite
+        // (and later delete) an existing file, never follow a symlink planted
+        // at the path, and keep the file owner-only (0600).
+        const file = createMountFile(mount_path) catch |err| {
+            try color.err(stderr, "error");
+            if (err == error.PathAlreadyExists) {
+                try stderr.print(": mount file '{s}' already exists; remove it or choose another path\n", .{mount_path});
+            } else {
                 try stderr.print(": failed to create mount file '{s}': {s}\n", .{ mount_path, @errorName(err) });
-                std.process.exit(1);
-            };
+            }
+            std.process.exit(1);
+        };
+        // We created it, so we delete it, even if the write below fails.
+        defer std.fs.cwd().deleteFile(mount_path) catch {};
+        {
             defer file.close();
             try file.writeAll(mount_body);
         }
-
-        // Clean up the mount file after the command finishes
-        const MountCleanup = struct {
-            path: []const u8,
-            fn cleanup(self: @This()) void {
-                std.fs.cwd().deleteFile(self.path) catch {};
-            }
-        };
-        const mount_cleanup = MountCleanup{ .path = mount_path };
-        defer mount_cleanup.cleanup();
         break :mount_block try runChildProcess(
             gpa.allocator(),
             &env_map,
@@ -941,6 +949,10 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
     );
 
     std.process.exit(exit_code);
+}
+
+fn createMountFile(path: []const u8) !File {
+    return std.fs.cwd().createFile(path, .{ .exclusive = true, .mode = 0o600 });
 }
 
 fn runChildProcess(
@@ -979,6 +991,95 @@ fn runChildProcessWithWriters(
     );
 }
 
+// ── Signal forwarding ─────────────────────────────────────────────
+// Without handlers, SIGTERM/SIGHUP killed sigillo instantly: the child was
+// orphaned and `run --mount` never deleted the secrets file. runAction
+// installs handlers BEFORE creating the mount file, and sigillo keeps
+// waiting, so the child decides when to exit and cleanup always runs.
+//
+// Lossless protocol: until the child has exec'd, signals are only recorded
+// in `pending_signal`. Between fork and exec the child still runs OUR
+// handler on its own memory copy, so a signal sent to it then is swallowed.
+// attachChild() waits for exec (Zig's CLOEXEC err pipe hits EOF or carries
+// the exec error), only then publishes the pid and flushes the pending one.
+//
+// SIGINT/SIGQUIT from an interactive terminal already reach a running child
+// via the foreground process group, so they are only forwarded when stdin
+// is not a TTY (avoids a double Ctrl+C that many tools treat as force-quit).
+var forward_signal_pid = std.atomic.Value(i32).init(0);
+var pending_signal = std.atomic.Value(i32).init(0);
+var forward_interrupts = std.atomic.Value(bool).init(false);
+
+fn forwardSignalHandler(sig: i32) callconv(.c) void {
+    const pid = forward_signal_pid.load(.seq_cst);
+    if (pid <= 0) { // no exec'd child yet; never kill(0), that signals our whole group
+        pending_signal.store(sig, .seq_cst);
+        return;
+    }
+    const is_interrupt = sig == std.posix.SIG.INT or sig == std.posix.SIG.QUIT;
+    if (is_interrupt and !forward_interrupts.load(.seq_cst)) return;
+    std.posix.kill(pid, @intCast(sig)) catch {};
+}
+
+const forwarded_signals = [_]u8{ std.posix.SIG.TERM, std.posix.SIG.HUP, std.posix.SIG.INT, std.posix.SIG.QUIT };
+
+// Windows has no POSIX signals; Ctrl+C reaches the child via the console.
+const SignalForwarding = if (builtin.os.tag == .windows) struct {
+    fn install() @This() {
+        return .{};
+    }
+    fn restore(_: *const @This()) void {}
+    fn takePending() ?u8 {
+        return null;
+    }
+    fn attachChild(_: *std.process.Child) void {}
+    fn detachChild() void {}
+} else struct {
+    previous: [forwarded_signals.len]std.posix.Sigaction = undefined,
+
+    fn install() SignalForwarding {
+        var self: SignalForwarding = .{};
+        forward_signal_pid.store(0, .seq_cst);
+        pending_signal.store(0, .seq_cst);
+        forward_interrupts.store(!std.posix.isatty(std.posix.STDIN_FILENO), .seq_cst);
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = forwardSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        for (forwarded_signals, 0..) |sig, i| std.posix.sigaction(sig, &action, &self.previous[i]);
+        return self;
+    }
+
+    fn restore(self: *const SignalForwarding) void {
+        for (forwarded_signals, 0..) |sig, i| std.posix.sigaction(sig, &self.previous[i], null);
+        forward_signal_pid.store(0, .seq_cst);
+        pending_signal.store(0, .seq_cst);
+    }
+
+    // A signal that arrived before spawn means "stop": don't start the child.
+    fn takePending() ?u8 {
+        const sig = pending_signal.swap(0, .seq_cst);
+        return if (sig == 0) null else @intCast(sig);
+    }
+
+    fn attachChild(child: *std.process.Child) void {
+        // Block until exec succeeded or failed. Only reads readiness, so
+        // child.wait() still gets any exec error from the pipe.
+        if (child.err_pipe) |fd| {
+            var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            _ = std.posix.poll(&fds, -1) catch {};
+        }
+        forward_signal_pid.store(@intCast(child.id), .seq_cst);
+        const sig = pending_signal.swap(0, .seq_cst);
+        if (sig != 0) std.posix.kill(child.id, @intCast(sig)) catch {};
+    }
+
+    fn detachChild() void {
+        forward_signal_pid.store(0, .seq_cst);
+    }
+};
+
 /// Core implementation. `force_stdout_pty`/`force_stderr_pty` allow tests
 /// to exercise the PTY branch even when the test runner's stdout is a pipe.
 ///
@@ -996,6 +1097,8 @@ fn runChildProcessImpl(
     force_stdout_pty: bool,
     force_stderr_pty: bool,
 ) !u8 {
+    // Shell convention: killed by signal N exits with 128 + N.
+    if (SignalForwarding.takePending()) |sig| return 128 +| sig;
     const needs_redaction = redact_values.len > 0;
     const is_posix = (builtin.os.tag != .windows);
 
@@ -1137,6 +1240,8 @@ fn runChildProcessImpl(
 
     try child.spawn();
     child_spawned = true;
+    SignalForwarding.attachChild(&child);
+    defer SignalForwarding.detachChild();
 
     // Restore parent's original stdout/stderr immediately after fork.
     if (is_posix) {
@@ -3161,6 +3266,93 @@ test "run command parses --mount with explicit --mount-format" {
 
     try std.testing.expectEqualStrings("config.json", State.mount.?);
     try std.testing.expectEqualStrings("json", State.mount_format.?);
+}
+
+test "createMountFile is owner-only and refuses existing files and symlinks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(".", &buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    const fresh = try std.fmt.bufPrint(&path_buf, "{s}/fresh.env", .{tmp_path});
+    const file = try createMountFile(fresh);
+    const stat = try file.stat();
+    file.close();
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0), stat.mode & 0o077);
+
+    // Existing file: must not be truncated.
+    try tmp.dir.writeFile(.{ .sub_path = "existing.env", .data = "KEEP=1\n" });
+    const existing = try std.fmt.bufPrint(&path_buf, "{s}/existing.env", .{tmp_path});
+    try std.testing.expectError(error.PathAlreadyExists, createMountFile(existing));
+    const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "existing.env", 64);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("KEEP=1\n", kept);
+
+    // Symlink (even dangling) must not be followed.
+    try tmp.dir.symLink("target.txt", "link.env", .{});
+    const link = try std.fmt.bufPrint(&path_buf, "{s}/link.env", .{tmp_path});
+    try std.testing.expectError(error.PathAlreadyExists, createMountFile(link));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("target.txt", .{}));
+}
+
+test "runChildProcess forwards SIGTERM to the child and returns its exit code" {
+    // Regression: SIGTERM used to kill sigillo outright, orphaning the child
+    // and leaving `run --mount` files on disk. The child signals its parent
+    // (this test process) so there is no sleep-based timing.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var env_map = std.process.EnvMap.init(allocator);
+    defer env_map.deinit();
+    const path = std.process.getEnvVarOwned(allocator, "PATH") catch "/usr/bin:/bin";
+    try env_map.put("PATH", path);
+
+    const argv = try shellCommandArgv(allocator, "trap 'exit 42' TERM; kill -TERM $PPID; for i in 1 2 3 4 5; do sleep 1 & wait $!; done; exit 1");
+    const forwarding = SignalForwarding.install();
+    defer forwarding.restore();
+    const code = try runChildProcessWithWriters(allocator, &env_map, &.{}, argv, File.stdout(), File.stderr());
+    try std.testing.expectEqual(@as(u8, 42), code);
+    try std.testing.expectEqual(@as(i32, 0), forward_signal_pid.load(.seq_cst));
+
+    // A signal before the child exists (e.g. while writing the mount file)
+    // stops the run without spawning, so runAction's cleanup still happens.
+    std.posix.raise(std.posix.SIG.TERM) catch unreachable;
+    const early_argv = try shellCommandArgv(allocator, "exit 7");
+    const early_code = try runChildProcessWithWriters(allocator, &env_map, &.{}, early_argv, File.stdout(), File.stderr());
+    try std.testing.expectEqual(@as(u8, 128 + std.posix.SIG.TERM), early_code);
+    try std.testing.expectEqual(@as(i32, 0), pending_signal.load(.seq_cst));
+}
+
+test "attachChild delivers a signal received between spawn and exec" {
+    // Regression: forwarding right after spawn() raced the child's exec; the
+    // forked child ran our inherited handler and swallowed the signal.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const forwarding = SignalForwarding.install();
+    defer forwarding.restore();
+
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        const argv = try shellCommandArgv(allocator, "trap 'exit 43' TERM; for i in 1 2 3 4 5; do sleep 1 & wait $!; done; exit 7");
+        var child = std.process.Child.init(argv, allocator);
+        try child.spawn();
+        pending_signal.store(std.posix.SIG.TERM, .seq_cst); // as if it arrived in the window
+        SignalForwarding.attachChild(&child);
+        const term = try child.wait();
+        SignalForwarding.detachChild();
+        // Killed by TERM before the trap was set, or ran the trap; never the loop's 7.
+        const stopped = switch (term) {
+            .Signal => |sig| sig == std.posix.SIG.TERM,
+            .Exited => |code| code == 43,
+            else => false,
+        };
+        try std.testing.expect(stopped);
+    }
 }
 
 test "run command leaves mount unset when flag is omitted" {

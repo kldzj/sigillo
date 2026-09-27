@@ -46,16 +46,20 @@ pub fn request(args: RequestArgs) !ApiResult {
         const auth_header = try std.fmt.allocPrint(args.allocator, "Bearer {s}", .{value});
         defer args.allocator.free(auth_header);
 
-        const extra_headers = [_]std.http.Header{
+        // Never follow redirects with a token: Zig keeps privileged headers
+        // for same-host/subdomain/other-port targets, so a redirect could
+        // hand the token to another service. 3xx comes back as a status.
+        const privileged_headers = [_]std.http.Header{
             .{ .name = "authorization", .value = auth_header },
-            accept_header[0],
         };
         break :blk try http_client.fetch(.{
             .location = .{ .url = url },
             .method = args.method,
             .payload = args.json_body,
             .headers = headers,
-            .extra_headers = &extra_headers,
+            .extra_headers = &accept_header,
+            .privileged_headers = &privileged_headers,
+            .redirect_behavior = .unhandled,
             .response_writer = &response_body.writer,
         });
     } else try http_client.fetch(.{
@@ -66,6 +70,11 @@ pub fn request(args: RequestArgs) !ApiResult {
         .extra_headers = &accept_header,
         .response_writer = &response_body.writer,
     });
+
+    // Point --api-url / api-url at the final URL (e.g. https://) instead.
+    if (args.token != null and @intFromEnum(result.status) >= 300 and @intFromEnum(result.status) < 400) {
+        return error.ApiUrlRedirected;
+    }
 
     return .{
         .status = @intFromEnum(result.status),

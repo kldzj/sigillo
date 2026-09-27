@@ -193,94 +193,121 @@ pub fn clearScope(allocator: std.mem.Allocator, scope_input: []const u8) !void {
     try writeConfig(allocator, &config);
 }
 
-pub fn resolve(allocator: std.mem.Allocator, cwd_input: []const u8, flags: ResolvedConfig) !ResolvedConfig {
-    const config = try readConfig(allocator);
+pub const default_api_url = "https://sigillo.dev";
 
-    const cwd = try normalizeScope(allocator, cwd_input);
+// Longest-scope-wins accumulator. A saved token remembers the api_url of the
+// record it came from so it is only ever sent to the server that issued it.
+const ScopeResolution = struct {
+    result: ResolvedConfig = .{},
+    token_api_url: ?[]const u8 = null,
+    best_token_len: usize = 0,
+    best_api_url_len: usize = 0,
+    best_project_len: usize = 0,
+    best_environment_len: usize = 0,
 
-    var result: ResolvedConfig = .{};
-    var best_token_len: usize = 0;
-    var best_api_url_len: usize = 0;
-    var best_project_len: usize = 0;
-    var best_environment_len: usize = 0;
-
-    for (config.scopes.items) |record| {
-        if (!scopeMatches(cwd, record.scope)) continue;
-
-        if (record.entry.token != null and record.scope.len >= best_token_len) {
-            result.token = record.entry.token;
-            best_token_len = record.scope.len;
-        }
-        if (record.entry.api_url != null and record.scope.len >= best_api_url_len) {
-            result.api_url = record.entry.api_url;
-            best_api_url_len = record.scope.len;
-        }
-        if (record.entry.project != null and record.scope.len >= best_project_len) {
-            result.project = record.entry.project;
-            result.project_name = record.entry.project_name;
-            best_project_len = record.scope.len;
-        }
-        if (record.entry.environment != null and record.scope.len >= best_environment_len) {
-            result.environment = record.entry.environment;
-            best_environment_len = record.scope.len;
-        }
-    }
-
-    // Worktree fallback: check if cwd is inside a git worktree and
-    // re-match scopes against the main repo root. This lets `sigillo setup`
-    // in the main repo automatically apply to all worktrees.
-    //
-    // Main-repo scopes override fields that were only set by broader
-    // (shorter) scopes like "/". For example, if "/" sets environment=dev
-    // and "/project" sets environment=prod, a worktree of /project should
-    // get prod, not dev. We allow the main-repo match to win when its
-    // scope is more specific (longer) than what matched in the first pass.
-    if (findGitMainWorktree(allocator, cwd)) |main_root| {
+    fn apply(self: *ScopeResolution, config: *const ConfigFile, path: []const u8) void {
         for (config.scopes.items) |record| {
-            if (!scopeMatches(main_root, record.scope)) continue;
+            if (!scopeMatches(path, record.scope)) continue;
 
-            if (record.entry.token != null and record.scope.len >= best_token_len) {
-                result.token = record.entry.token;
-                best_token_len = record.scope.len;
+            if (record.entry.token != null and record.scope.len >= self.best_token_len) {
+                self.result.token = record.entry.token;
+                self.token_api_url = record.entry.api_url;
+                self.best_token_len = record.scope.len;
             }
-            if (record.entry.api_url != null and record.scope.len >= best_api_url_len) {
-                result.api_url = record.entry.api_url;
-                best_api_url_len = record.scope.len;
+            if (record.entry.api_url != null and record.scope.len >= self.best_api_url_len) {
+                self.result.api_url = record.entry.api_url;
+                self.best_api_url_len = record.scope.len;
             }
-            if (record.entry.project != null and record.scope.len >= best_project_len) {
-                result.project = record.entry.project;
-                result.project_name = record.entry.project_name;
-                best_project_len = record.scope.len;
+            if (record.entry.project != null and record.scope.len >= self.best_project_len) {
+                self.result.project = record.entry.project;
+                self.result.project_name = record.entry.project_name;
+                self.best_project_len = record.scope.len;
             }
-            if (record.entry.environment != null and record.scope.len >= best_environment_len) {
-                result.environment = record.entry.environment;
-                best_environment_len = record.scope.len;
+            if (record.entry.environment != null and record.scope.len >= self.best_environment_len) {
+                self.result.environment = record.entry.environment;
+                self.best_environment_len = record.scope.len;
             }
         }
     }
+};
 
-    if (try getEnvVarOptional(allocator, "SIGILLO_TOKEN")) |value| result.token = value;
-    if (try getEnvVarOptional(allocator, "SIGILLO_API_URL")) |value| result.api_url = value;
-    if (try getEnvVarOptional(allocator, "SIGILLO_PROJECT")) |value| {
+pub const Overrides = struct {
+    env: ResolvedConfig = .{},
+    flags: ResolvedConfig = .{},
+};
+
+pub const Resolved = struct {
+    config: ResolvedConfig,
+    // Set when a saved token was withheld because the api url was pointed
+    // at a different server than the one the token was saved for.
+    withheld_token_api_url: ?[]const u8 = null,
+};
+
+fn sameApiUrl(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trimRight(u8, a, "/"), std.mem.trimRight(u8, b, "/"));
+}
+
+// Env vars and flags can come from an untrusted repo (.envrc, package.json
+// scripts), so an overridden api url must never receive a saved token.
+// Explicit SIGILLO_TOKEN / --token are always sent as given.
+fn applyOverrides(scoped: ScopeResolution, overrides: Overrides) Resolved {
+    var result = scoped.result;
+    const saved_token = result.token;
+    const saved_token_api_url = scoped.token_api_url orelse default_api_url;
+
+    if (overrides.env.token) |value| result.token = value;
+    if (overrides.env.api_url) |value| result.api_url = value;
+    if (overrides.env.project) |value| {
         result.project = value;
         result.project_name = null;
     }
-    if (try getEnvVarOptional(allocator, "SIGILLO_ENVIRONMENT")) |value| result.environment = value;
+    if (overrides.env.environment) |value| result.environment = value;
 
-    if (flags.token) |value| result.token = value;
-    if (flags.api_url) |value| result.api_url = value;
-    if (flags.project) |value| {
+    if (overrides.flags.token) |value| result.token = value;
+    if (overrides.flags.api_url) |value| result.api_url = value;
+    if (overrides.flags.project) |value| {
         result.project = value;
-        result.project_name = flags.project_name;
+        result.project_name = overrides.flags.project_name;
     }
-    if (flags.environment) |value| result.environment = value;
+    if (overrides.flags.environment) |value| result.environment = value;
 
-    // Default api_url to sigillo.dev when not configured anywhere
-    if (result.api_url == null) {
-        result.api_url = "https://sigillo.dev";
+    if (result.api_url == null) result.api_url = default_api_url;
+
+    const token_is_saved = saved_token != null and overrides.env.token == null and overrides.flags.token == null;
+    if (token_is_saved and !sameApiUrl(result.api_url.?, saved_token_api_url)) {
+        result.token = null;
+        return .{ .config = result, .withheld_token_api_url = saved_token_api_url };
     }
+    return .{ .config = result };
+}
 
-    return result;
+pub fn resolve(allocator: std.mem.Allocator, cwd_input: []const u8, flags: ResolvedConfig) !ResolvedConfig {
+    const config = try readConfig(allocator);
+    const cwd = try normalizeScope(allocator, cwd_input);
+
+    var scoped: ScopeResolution = .{};
+    scoped.apply(&config, cwd);
+    // Worktree fallback: re-match scopes against the main repo root so
+    // `sigillo setup` in the main repo applies to all its worktrees. Longer
+    // (more specific) main-repo scopes override broader first-pass matches.
+    if (findGitMainWorktree(allocator, cwd)) |main_root| scoped.apply(&config, main_root);
+
+    const resolved = applyOverrides(scoped, .{
+        .env = .{
+            .token = try getEnvVarOptional(allocator, "SIGILLO_TOKEN"),
+            .api_url = try getEnvVarOptional(allocator, "SIGILLO_API_URL"),
+            .project = try getEnvVarOptional(allocator, "SIGILLO_PROJECT"),
+            .environment = try getEnvVarOptional(allocator, "SIGILLO_ENVIRONMENT"),
+        },
+        .flags = flags,
+    });
+    if (resolved.withheld_token_api_url) |saved_url| {
+        std.debug.print(
+            "warning: not sending saved token to {s}: it was saved for {s}. Use --token or SIGILLO_TOKEN, or run `sigillo login --api-url {s}`.\n",
+            .{ resolved.config.api_url.?, saved_url, resolved.config.api_url.? },
+        );
+    }
+    return resolved.config;
 }
 
 fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
@@ -452,34 +479,49 @@ test "resolve prefers the longest matching scope" {
     const allocator = arena.allocator();
 
     var config_file: ConfigFile = .{};
+    try config_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .token = "global" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/tmp/project", .entry = .{ .project = "project" } });
 
-    try config_file.scopes.append(allocator, .{
-        .scope = try allocator.dupe(u8, "/"),
-        .entry = .{ .token = try allocator.dupe(u8, "global") },
-    });
-    try config_file.scopes.append(allocator, .{
-        .scope = try allocator.dupe(u8, "/tmp/project"),
-        .entry = .{ .project = try allocator.dupe(u8, "project") },
-    });
+    var scoped: ScopeResolution = .{};
+    scoped.apply(&config_file, "/tmp/project/subdir");
 
-    const cwd = "/tmp/project/subdir";
-    var resolved: ResolvedConfig = .{};
-    var best_token_len: usize = 0;
-    var best_project_len: usize = 0;
-    for (config_file.scopes.items) |record| {
-        if (!scopeMatches(cwd, record.scope)) continue;
-        if (record.entry.token != null and record.scope.len >= best_token_len) {
-            resolved.token = record.entry.token;
-            best_token_len = record.scope.len;
-        }
-        if (record.entry.project != null and record.scope.len >= best_project_len) {
-            resolved.project = record.entry.project;
-            best_project_len = record.scope.len;
-        }
-    }
+    try std.testing.expectEqualStrings("global", scoped.result.token.?);
+    try std.testing.expectEqualStrings("project", scoped.result.project.?);
+}
 
-    try std.testing.expectEqualStrings("global", resolved.token.?);
-    try std.testing.expectEqualStrings("project", resolved.project.?);
+test "saved token is only sent to the api url it was saved with" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var config_file: ConfigFile = .{};
+    try config_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .token = "saved", .api_url = "https://secrets.acme.com" } });
+    var scoped: ScopeResolution = .{};
+    scoped.apply(&config_file, "/repo");
+
+    // No overrides: saved token goes to its own server (trailing slash ignored).
+    const plain = applyOverrides(scoped, .{ .flags = .{ .api_url = "https://secrets.acme.com/" } });
+    try std.testing.expectEqualStrings("saved", plain.config.token.?);
+    try std.testing.expect(plain.withheld_token_api_url == null);
+
+    // Repo-controlled SIGILLO_API_URL / --api-url must not receive the saved token.
+    const via_env = applyOverrides(scoped, .{ .env = .{ .api_url = "https://evil.example" } });
+    try std.testing.expect(via_env.config.token == null);
+    try std.testing.expectEqualStrings("https://secrets.acme.com", via_env.withheld_token_api_url.?);
+    const via_flag = applyOverrides(scoped, .{ .flags = .{ .api_url = "https://evil.example" } });
+    try std.testing.expect(via_flag.config.token == null);
+
+    // An explicit token is sent as given.
+    const explicit = applyOverrides(scoped, .{ .env = .{ .api_url = "https://other.example", .token = "explicit" } });
+    try std.testing.expectEqualStrings("explicit", explicit.config.token.?);
+
+    // Token saved without api-url is bound to the default server.
+    var legacy_file: ConfigFile = .{};
+    try legacy_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .token = "legacy" } });
+    var legacy: ScopeResolution = .{};
+    legacy.apply(&legacy_file, "/repo");
+    try std.testing.expectEqualStrings("legacy", applyOverrides(legacy, .{}).config.token.?);
+    try std.testing.expect(applyOverrides(legacy, .{ .env = .{ .api_url = "http://localhost:5188" } }).config.token == null);
 }
 
 test "findGitMainWorktree returns null for non-git directory" {
@@ -513,7 +555,7 @@ test "findGitMainWorktree parses worktree .git file" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tmp_base = std.testing.tmpDir(.{});
+    var tmp_base = std.testing.tmpDir(.{});
     defer tmp_base.cleanup();
 
     // Create main-repo/.git/worktrees/my-wt/ directory tree
@@ -549,7 +591,7 @@ test "findGitMainWorktree parses relative gitdir path" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tmp_base = std.testing.tmpDir(.{});
+    var tmp_base = std.testing.tmpDir(.{});
     defer tmp_base.cleanup();
 
     try tmp_base.dir.makePath("main-repo/.git/worktrees/my-wt");
@@ -572,156 +614,42 @@ test "findGitMainWorktree parses relative gitdir path" {
 }
 
 test "worktree fallback: main repo scope overrides broad global scope" {
-    // Scenario:
-    //   "/" → { environment: "dev" }
-    //   "/project" → { project: "proj_x", environment: "prod" }
-    //
-    // In a worktree of /project at /project-feature:
-    //   First pass: "/" matches → environment = "dev" (scope len 1)
-    //   Fallback:   "/project" matches main root → environment = "prod" (scope len 8, wins)
-    //   Result should be project = "proj_x", environment = "prod"
+    // "/" sets environment=dev, "/project" sets project + environment=prod.
+    // A worktree of /project at /project-feature must get prod, not dev.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var config_file: ConfigFile = .{};
+    try config_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .environment = "dev" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/project", .entry = .{ .project = "proj_x", .environment = "prod" } });
 
-    try config_file.scopes.append(allocator, .{
-        .scope = try allocator.dupe(u8, "/"),
-        .entry = .{ .environment = try allocator.dupe(u8, "dev") },
-    });
-    try config_file.scopes.append(allocator, .{
-        .scope = try allocator.dupe(u8, "/project"),
-        .entry = .{
-            .project = try allocator.dupe(u8, "proj_x"),
-            .environment = try allocator.dupe(u8, "prod"),
-        },
-    });
+    var scoped: ScopeResolution = .{};
+    scoped.apply(&config_file, "/project-feature");
+    try std.testing.expectEqualStrings("dev", scoped.result.environment.?);
+    try std.testing.expect(scoped.result.project == null);
 
-    // Simulate resolve for cwd="/project-feature" with main_root="/project"
-    const cwd = "/project-feature";
-    const main_root = "/project";
-
-    var result: ResolvedConfig = .{};
-    var best_token_len: usize = 0;
-    var best_api_url_len: usize = 0;
-    var best_project_len: usize = 0;
-    var best_environment_len: usize = 0;
-
-    // First pass: match against cwd
-    for (config_file.scopes.items) |record| {
-        if (!scopeMatches(cwd, record.scope)) continue;
-        if (record.entry.token != null and record.scope.len >= best_token_len) {
-            result.token = record.entry.token;
-            best_token_len = record.scope.len;
-        }
-        if (record.entry.api_url != null and record.scope.len >= best_api_url_len) {
-            result.api_url = record.entry.api_url;
-            best_api_url_len = record.scope.len;
-        }
-        if (record.entry.project != null and record.scope.len >= best_project_len) {
-            result.project = record.entry.project;
-            best_project_len = record.scope.len;
-        }
-        if (record.entry.environment != null and record.scope.len >= best_environment_len) {
-            result.environment = record.entry.environment;
-            best_environment_len = record.scope.len;
-        }
-    }
-
-    // After first pass: only "/" matched, so environment = "dev" (len 1)
-    try std.testing.expectEqualStrings("dev", result.environment.?);
-    try std.testing.expect(result.project == null);
-
-    // Fallback pass: match against main repo root (same logic as resolve())
-    for (config_file.scopes.items) |record| {
-        if (!scopeMatches(main_root, record.scope)) continue;
-        if (record.entry.token != null and record.scope.len >= best_token_len) {
-            result.token = record.entry.token;
-            best_token_len = record.scope.len;
-        }
-        if (record.entry.api_url != null and record.scope.len >= best_api_url_len) {
-            result.api_url = record.entry.api_url;
-            best_api_url_len = record.scope.len;
-        }
-        if (record.entry.project != null and record.scope.len >= best_project_len) {
-            result.project = record.entry.project;
-            best_project_len = record.scope.len;
-        }
-        if (record.entry.environment != null and record.scope.len >= best_environment_len) {
-            result.environment = record.entry.environment;
-            best_environment_len = record.scope.len;
-        }
-    }
-
-    // "/project" scope (len 8) beats "/" scope (len 1) for both project and environment
-    try std.testing.expectEqualStrings("proj_x", result.project.?);
-    try std.testing.expectEqualStrings("prod", result.environment.?);
+    scoped.apply(&config_file, "/project");
+    try std.testing.expectEqualStrings("proj_x", scoped.result.project.?);
+    try std.testing.expectEqualStrings("prod", scoped.result.environment.?);
 }
 
 test "worktree fallback: worktree-specific scope wins over main repo" {
-    // If the worktree directory itself has a scope, it should win because
-    // it's more specific (matched in pass 1 with the actual cwd).
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var config_file: ConfigFile = .{};
+    try config_file.scopes.append(allocator, .{ .scope = "/project", .entry = .{ .project = "proj_main", .environment = "prod" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/project-feature", .entry = .{ .environment = "staging" } });
 
-    try config_file.scopes.append(allocator, .{
-        .scope = try allocator.dupe(u8, "/project"),
-        .entry = .{
-            .project = try allocator.dupe(u8, "proj_main"),
-            .environment = try allocator.dupe(u8, "prod"),
-        },
-    });
-    try config_file.scopes.append(allocator, .{
-        .scope = try allocator.dupe(u8, "/project-feature"),
-        .entry = .{
-            .environment = try allocator.dupe(u8, "staging"),
-        },
-    });
+    var scoped: ScopeResolution = .{};
+    scoped.apply(&config_file, "/project-feature");
+    try std.testing.expectEqualStrings("staging", scoped.result.environment.?);
+    try std.testing.expect(scoped.result.project == null);
 
-    // cwd="/project-feature", main_root="/project"
-    const cwd = "/project-feature";
-    const main_root = "/project";
-
-    var result: ResolvedConfig = .{};
-    var best_project_len: usize = 0;
-    var best_environment_len: usize = 0;
-
-    // First pass
-    for (config_file.scopes.items) |record| {
-        if (!scopeMatches(cwd, record.scope)) continue;
-        if (record.entry.project != null and record.scope.len >= best_project_len) {
-            result.project = record.entry.project;
-            best_project_len = record.scope.len;
-        }
-        if (record.entry.environment != null and record.scope.len >= best_environment_len) {
-            result.environment = record.entry.environment;
-            best_environment_len = record.scope.len;
-        }
-    }
-
-    // Worktree scope "/project-feature" (len 17) matched for environment
-    try std.testing.expectEqualStrings("staging", result.environment.?);
-    try std.testing.expect(result.project == null);
-
-    // Fallback pass
-    for (config_file.scopes.items) |record| {
-        if (!scopeMatches(main_root, record.scope)) continue;
-        if (record.entry.project != null and record.scope.len >= best_project_len) {
-            result.project = record.entry.project;
-            best_project_len = record.scope.len;
-        }
-        if (record.entry.environment != null and record.scope.len >= best_environment_len) {
-            result.environment = record.entry.environment;
-            best_environment_len = record.scope.len;
-        }
-    }
-
-    // Project inherited from main repo, but environment stays "staging"
-    // because "/project-feature" (len 17) > "/project" (len 8)
-    try std.testing.expectEqualStrings("proj_main", result.project.?);
-    try std.testing.expectEqualStrings("staging", result.environment.?);
+    // Project inherited from main repo; "/project-feature" (len 16) beats "/project" (len 8).
+    scoped.apply(&config_file, "/project");
+    try std.testing.expectEqualStrings("proj_main", scoped.result.project.?);
+    try std.testing.expectEqualStrings("staging", scoped.result.environment.?);
 }
