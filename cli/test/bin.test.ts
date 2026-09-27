@@ -13,11 +13,12 @@ const cliDir = dirname(dirname(fileURLToPath(import.meta.url)))
 describe('bin', () => {
   test('self-host exits non-zero when it fails', () => {
     // An empty home, no token and no TTY: self-host fails at the credential
-    // step before touching the network.
+    // step before touching the network (the passphrase lets it get there).
     const home = mkdtempSync(join(tmpdir(), 'sigillo-bin-'))
     try {
       const env: NodeJS.ProcessEnv = {
         ...process.env,
+        SIGILLO_SELFHOST_PASSPHRASE: 'bin test passphrase',
         HOME: home,
         XDG_CONFIG_HOME: join(home, '.config'),
         APPDATA: home,

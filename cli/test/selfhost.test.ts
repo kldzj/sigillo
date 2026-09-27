@@ -4,6 +4,9 @@
 // account (network + credentials required), not here.
 
 import { gzipSync } from 'node:zlib'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { CloudflareApiError, parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
 import {
@@ -11,6 +14,7 @@ import {
   providerSecretsForDeploy, resolveDeploySecrets, updateAllowedUsersSecret, uploadWorker,
   type SelfhostBundle, type WorkerBundle,
 } from '../src/selfhost/deploy.js'
+import { deriveStateKey, isSealed, openState, sealState, unlockStateFile } from '../src/selfhost/state-file.js'
 
 describe('parseWranglerToml', () => {
   const sample = [
@@ -366,5 +370,145 @@ describe('allowed users', () => {
       'delete sigillo ALLOWED_USERS',
       'delete gone ALLOWED_USERS',
     ])
+  })
+})
+
+describe('encrypted state file', () => {
+  const state = JSON.stringify({ deployments: { 'acct/sigillo': { betterAuthSecret: 'bas-very-secret', encryptionKey: 'enc-very-secret' } } })
+  const passphrase = 'correct horse battery staple'
+  const noPrompt = async (): Promise<never> => { throw new Error('should not prompt') }
+  const unlock = (args: Partial<Parameters<typeof unlockStateFile>[0]>) => unlockStateFile({
+    text: null, envPassphrase: undefined, interactive: false,
+    askPassphrase: noPrompt, askNewPassphrase: noPrompt, confirmEncrypt: noPrompt, ...args,
+  })
+
+  test('sealed, the file holds no secret, and opens only with its passphrase', () => {
+    const text = sealState(state, deriveStateKey(passphrase))
+    const { kdf } = JSON.parse(text)
+    const tampered = JSON.parse(text)
+    tampered.data = Buffer.from(Buffer.from(tampered.data, 'base64').map((byte, i) => (i === 0 ? byte ^ 1 : byte))).toString('base64')
+    expect({
+      sealed: isSealed(text),
+      leaks: text.includes('very-secret') || text.includes('betterAuthSecret'),
+      opened: openState(text, deriveStateKey(passphrase, kdf)),
+      wrong: (() => { try { return openState(text, deriveStateKey('not the passphrase', kdf)) } catch (e) { return (e as Error).message } })(),
+      tampered: (() => { try { return openState(JSON.stringify(tampered), deriveStateKey(passphrase, kdf)) } catch (e) { return (e as Error).message } })(),
+    }).toEqual({
+      sealed: true,
+      leaks: false,
+      opened: state,
+      wrong: 'Wrong passphrase for ~/.sigillo/selfhost.json',
+      tampered: 'Wrong passphrase for ~/.sigillo/selfhost.json',
+    })
+  })
+
+  test('a first run needs a passphrase: prompted, or from the variable when it cannot prompt', async () => {
+    const prompted = await unlock({ interactive: true, askNewPassphrase: async () => passphrase })
+    const fromEnv = await unlock({ envPassphrase: passphrase })
+    const none = await unlock({}).catch((e: Error) => e.message)
+    const short = await unlock({ envPassphrase: 'short' }).catch((e: Error) => e.message)
+    expect({ prompted: prompted.stateKey !== null, fromEnv: fromEnv.stateKey !== null, none, short }).toEqual({
+      prompted: true,
+      fromEnv: true,
+      none: 'Set SIGILLO_SELFHOST_PASSPHRASE to the passphrase that encrypts ~/.sigillo/selfhost.json',
+      short: 'SIGILLO_SELFHOST_PASSPHRASE: Use at least 12 characters',
+    })
+  })
+
+  test('an encrypted file opens with the right passphrase, and three wrong ones stop the run', async () => {
+    const text = sealState(state, deriveStateKey(passphrase))
+    const answers = ['wrong one here', passphrase]
+    const retried = await unlock({ text, interactive: true, askPassphrase: async () => answers.shift()! })
+    const wrongEnv = await unlock({ text, envPassphrase: 'wrong one here' }).catch((e: Error) => e.message)
+    const noEnv = await unlock({ text }).catch((e: Error) => e.message)
+    let tries = 0
+    const gaveUp = await unlock({ text, interactive: true, askPassphrase: async () => { tries++; return 'wrong one here' } }).catch((e: Error) => e.message)
+    expect({
+      retried: openState(text, retried.stateKey!), wrongEnv, noEnv, gaveUp, tries,
+    }).toEqual({
+      retried: state,
+      wrongEnv: 'Wrong passphrase for ~/.sigillo/selfhost.json',
+      noEnv: '~/.sigillo/selfhost.json is encrypted: set SIGILLO_SELFHOST_PASSPHRASE to its passphrase',
+      gaveUp: 'Wrong passphrase for ~/.sigillo/selfhost.json',
+      tries: 3,
+    })
+  })
+
+  test('an unencrypted file is sealed when the owner agrees, and otherwise left with a warning', async () => {
+    const agreed = await unlock({ text: state, interactive: true, confirmEncrypt: async () => true, askNewPassphrase: async () => passphrase })
+    const declined = await unlock({ text: state, interactive: true, confirmEncrypt: async () => false })
+    const fromEnv = await unlock({ text: state, envPassphrase: passphrase })
+    const unattended = await unlock({ text: state })
+    expect({
+      agreed: agreed.seal && agreed.stateKey !== null,
+      declined: { seal: declined.seal, key: declined.stateKey, warned: !!declined.warning },
+      fromEnv: fromEnv.seal && fromEnv.stateKey !== null,
+      unattended: { seal: unattended.seal, key: unattended.stateKey, warning: unattended.warning },
+    }).toEqual({
+      agreed: true,
+      declined: { seal: false, key: null, warned: true },
+      fromEnv: true,
+      unattended: {
+        seal: false,
+        key: null,
+        warning: '~/.sigillo/selfhost.json is not encrypted. Run self-host in a terminal, or set SIGILLO_SELFHOST_PASSPHRASE, to encrypt it.',
+      },
+    })
+  })
+})
+
+describe('state file on disk', () => {
+  const originalHome = process.env.HOME
+  afterEach(() => {
+    process.env.HOME = originalHome
+    vi.resetModules()
+  })
+  // cloudflare.ts reads the home directory when it loads
+  const loadWithHome = async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'sigillo-state-'))
+    process.env.HOME = home
+    vi.resetModules()
+    return { home, file: path.join(home, '.sigillo', 'selfhost.json'), cloudflare: await import('../src/selfhost/cloudflare.js') }
+  }
+  const prompts = { envPassphrase: 'correct horse battery staple', interactive: false, askPassphrase: async () => '', askNewPassphrase: async () => '', confirmEncrypt: async () => false }
+  const deployment = { accountId: 'acct', workerName: 'sigillo', databaseId: 'db', betterAuthSecret: 'bas-very-secret' }
+
+  test('writes are sealed, and reads open them', async () => {
+    const { file, cloudflare } = await loadWithHome()
+    await cloudflare.unlockState(prompts)
+    cloudflare.writeState({ deployments: { 'acct/sigillo': deployment } })
+    const text = readFileSync(file, 'utf-8')
+    expect({ sealed: isSealed(text), leaks: text.includes('very-secret'), read: cloudflare.readState() })
+      .toEqual({ sealed: true, leaks: false, read: { deployments: { 'acct/sigillo': deployment } } })
+  })
+
+  test('an unencrypted file is sealed in place, with the same content', async () => {
+    const { file, cloudflare } = await loadWithHome()
+    mkdirSync(path.dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify({ deployments: { 'acct/sigillo': deployment } }))
+    await cloudflare.unlockState(prompts)
+    expect({ sealed: isSealed(readFileSync(file, 'utf-8')), read: cloudflare.readState() })
+      .toEqual({ sealed: true, read: { deployments: { 'acct/sigillo': deployment } } })
+  })
+
+  test('a new passphrase replaces the old one', async () => {
+    const { home, cloudflare } = await loadWithHome()
+    await cloudflare.unlockState(prompts)
+    cloudflare.writeState({ deployments: { 'acct/sigillo': deployment } })
+    cloudflare.changeStatePassphrase('a brand new passphrase')
+    // A later run with each passphrase
+    const later = async (envPassphrase: string) => {
+      process.env.HOME = home
+      vi.resetModules()
+      const next = await import('../src/selfhost/cloudflare.js')
+      return next.unlockState({ ...prompts, envPassphrase }).then(() => next.readState()).catch((e: Error) => e.message)
+    }
+    expect({ old: await later(prompts.envPassphrase), new: await later('a brand new passphrase') })
+      .toEqual({ old: 'Wrong passphrase for ~/.sigillo/selfhost.json', new: { deployments: { 'acct/sigillo': deployment } } })
+  })
+
+  test('nothing is read or written before the file is unlocked', async () => {
+    const { cloudflare } = await loadWithHome()
+    expect(() => cloudflare.writeState({})).toThrow('~/.sigillo/selfhost.json was not unlocked')
   })
 })
