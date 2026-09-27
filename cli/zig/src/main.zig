@@ -1967,13 +1967,13 @@ fn auditVerifyAction(_: AuditVerify.Args, opts: AuditVerify.Options, global: Glo
             try stdout.print(" {s}: {s}\n", .{ chain.label, message });
         } else {
             try color.green(stdout, "✔");
-            try stdout.print(" {s}: {d} rows, intact\n", .{ chain.label, chain.rows.len });
+            try stdout.print(" {s}: {d} {s}, intact\n", .{ chain.label, chain.rows.len, if (chain.rows.len == 1) "row" else "rows" });
         }
     }
     if (chains.events.outside > 0) {
         intact = false;
         try color.err(stdout, "✘");
-        try stdout.print(" changes: {d} rows were added outside the chain\n", .{chains.events.outside});
+        try stdout.print(" changes: {d} {s} added outside the chain\n", .{ chains.events.outside, if (chains.events.outside == 1) "row was" else "rows were" });
     }
     if (!intact) std.process.exit(1);
 
