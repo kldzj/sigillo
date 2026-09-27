@@ -27,7 +27,7 @@ import {
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
-import { cn } from 'sigillo-app/src/lib/utils'
+import { cn, loginErrorMessage } from 'sigillo-app/src/lib/utils'
 import { CreateOrgForm } from 'sigillo-app/src/components/create-org-form'
 import { SigilloLogo } from 'sigillo-app/src/components/logo'
 import { app as holocronApp } from '@holocron.so/vite/app'
@@ -646,6 +646,7 @@ export const app = new Spiceflow({ tracer })
     const session = await getSession(request)
     const url = new URL(request.url)
     const redirectTo = safeRedirectPath(url.searchParams.get('redirect'))
+    const error = url.searchParams.get('error')
     if (session) throw redirect(redirectTo)
     const { LoginButton } = await import('sigillo-app/src/components/login-button')
     return (
@@ -653,6 +654,7 @@ export const app = new Spiceflow({ tracer })
         <div className="text-center max-w-sm">
           <SigilloLogo className="h-[40px] w-auto mx-auto mb-2" />
           <p className="text-muted-foreground mb-6">Sign in to manage your secrets</p>
+          {error && <p className="text-sm text-destructive mb-6">{loginErrorMessage(error)}</p>}
           <LoginButton callbackURL={redirectTo} />
         </div>
       </ContentFrame>

@@ -17,7 +17,7 @@ import { makeSignature } from 'better-auth/crypto'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 import { redirect } from 'spiceflow'
 import { memoize } from './lib/memoize.ts'
-import { COMMON_EMAIL_DOMAINS, getEmailDomain } from './lib/utils.ts'
+import { COMMON_EMAIL_DOMAINS, getEmailDomain, isUserAllowed } from './lib/utils.ts'
 export { COMMON_EMAIL_DOMAINS, getEmailDomain }
 
 // ── Drizzle client via D1 ───────────────────────────────────────────
@@ -217,6 +217,19 @@ export async function ensureOAuthClient(request: Request): Promise<string> {
   return client_id
 }
 
+// ── Sign-in allowlist ───────────────────────────────────────────────
+// ALLOWED_USERS limits who may sign up and sign in (see isUserAllowed).
+
+function isAllowed(user: { email: string; emailVerified: boolean }): boolean {
+  return isUserAllowed(user, process.env.ALLOWED_USERS)
+}
+
+// The OAuth callback turns this into /login?error=: a refused session sends
+// the code, a refused new user the message with underscores for spaces.
+function notAllowedError(): APIError {
+  return new APIError('FORBIDDEN', { message: 'user not allowed', code: 'USER_NOT_ALLOWED' })
+}
+
 // ── BetterAuth ──────────────────────────────────────────────────────
 
 export async function getAuth(request: Request) {
@@ -263,6 +276,24 @@ export async function getAuth(request: Request) {
         const signature = await makeSignature(issued.access_token, ctx.context.secret)
         return ctx.json({ ...issued, access_token: `${issued.access_token}.${signature}` })
       }),
+    },
+    // Nobody off the allowlist gets a user or a session, whichever way they sign in
+    databaseHooks: {
+      user: {
+        create: {
+          before: async (user) => {
+            if (!isAllowed(user)) throw notAllowedError()
+          },
+        },
+      },
+      session: {
+        create: {
+          before: async (session) => {
+            const user = await db.query.user.findFirst({ where: { id: session.userId }, columns: { email: true, emailVerified: true } })
+            if (!user || !isAllowed(user)) throw notAllowedError()
+          },
+        },
+      },
     },
     plugins: [
       genericOAuth({
@@ -330,7 +361,8 @@ async function resolveSession(request: Request): Promise<Session | null> {
 
   const auth = await getAuth(request)
   const session = await auth.api.getSession({ headers: request.headers })
-  if (!session) return null
+  // A session made before its user left the allowlist ends with it
+  if (!session || !isAllowed(session.user)) return null
   return { userId: session.user.id, user: { id: session.user.id, name: session.user.name, email: session.user.email, emailVerified: session.user.emailVerified } }
 }
 
