@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.2.0
+
+### Minor Changes
+
+- 037d5ce: API tokens expire, and the token list shows when each one was last used.
+
+  - A new token lasts 7, 30, 90 or 365 days, 90 by default. An expired token gets `401 API token expired`.
+  - Tokens made before this never expire. The token list marks them as **Never**, so they can be replaced.
+  - Last use is recorded at most once an hour, so a busy CI token does not cost a database write per request.
+
+- 940d20d: Protected environments and a tamper-evident history.
+
+  - **Protected** (Environments tab, admins) records every read of an environment's values: who, when, which secrets, how (revealed, old value in the event log, listed, downloaded, copied) and from which IP. Admins see it on the new **Read Log** tab. The read is recorded before any value leaves the server, and fails if it can't be. Turning protection off is recorded too.
+  - The secrets page and the event log load a value only when you reveal it, download or copy it, so opening a page no longer sends any values to the browser.
+  - Each environment's secret changes and reads form hash chains signed by the server, so editing, removing or adding a row in the database shows up.
+  - `sigillo audit verify` checks both chains of an environment and remembers their heads in `~/.sigillo/audit.json`, so rows removed since the last check show up too:
+
+  ```bash
+  $ sigillo audit verify -c prod
+  ✔ changes: 42 rows, intact
+  ✔ reads: 7 rows, intact
+  ```
+
+- e27d1e5: New **Sessions** page (user menu → Sessions) that lists every browser and CLI login signed in as you, with its device, IP address and sign-in time. End one you don't recognize, or all but the current one.
+
+  An ended session stops working on its next request. The session cookie cache is off for that, so each request checks the session in D1. New sessions record the client IP from `cf-connecting-ip`. CLI logins show as **Sigillo CLI** with their version; ones from older CLIs show as `zig/0.15.2`.
+
+- 4105d93: Limit who can sign in with `ALLOWED_USERS`, a comma-separated list of email addresses and domains.
+
+  - Nobody else can sign up or sign in, in the browser or with the CLI. A signed-in user taken off the list is signed out on their next request.
+  - Only verified emails match, and a domain matches exactly, not its subdomains. Without `ALLOWED_USERS`, anyone can sign in as before.
+  - A refused sign-in lands on the login page with an explanation. Other sign-in errors land there too, instead of on a bare error page.
+
+### Patch Changes
+
+- 6c44802: The app and its login provider run on the stable `better-auth` 1.7.6 instead of `1.7.0-beta.4`. The provider gets migration `0003` for the new columns and tables of `@better-auth/oauth-provider` 1.7.6, and local development registers its `http://localhost` callback as a native OAuth client, which 1.7.6 requires.
+- 10b4428: New docs page **Hardening**: who can reach the secrets on a self-hosted instance, and the steps that narrow it, from a dedicated Cloudflare account and the deploy file to sign-in, access inside the app, the read log and `sigillo audit verify`, and what to do when someone leaves.
+- 6b425ce: A session token copied out of the database no longer signs anyone in.
+
+  - Bearer tokens must carry the signature that only the Worker's `BETTER_AUTH_SECRET` can make, as the session cookie already does, and `sigillo login` now receives such a signed token. **CLI logins from before this update stop working: run `sigillo login` once.**
+  - The OAuth tokens that the app and its login provider store are encrypted in D1.
+  - Neither the app nor the provider signs anyone in with a raw `id_token` any more. Both stored the last one in D1 as is, so it could be replayed while still valid. Signing in always goes through the redirect.
+  - A request without a valid session gets `not signed in, or the session expired: run sigillo login` instead of `unauthorized`.
+
 ## 0.1.0
 
 ### Minor Changes

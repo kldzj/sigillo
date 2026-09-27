@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.15.0
+
+### Minor Changes
+
+- 677870e: `self-host` encrypts `~/.sigillo/selfhost.json` with a passphrase. The file holds the keys to your deployments, so it can now stay on disk while only the passphrase lives in your password manager.
+
+  - The first run asks for a passphrase, and each run asks for it once. Runs without a terminal read it from `SIGILLO_SELFHOST_PASSPHRASE`.
+  - A file from before is encrypted on the next run in a terminal, if you agree.
+  - `self-host --change-passphrase` encrypts the file with a new one.
+
+  ```bash
+  CLOUDFLARE_API_TOKEN=xxx SIGILLO_SELFHOST_PASSPHRASE=xxx npx @kldzj/sigillo self-host --yes
+  ```
+
+- 940d20d: Protected environments and a tamper-evident history.
+
+  - **Protected** (Environments tab, admins) records every read of an environment's values: who, when, which secrets, how (revealed, old value in the event log, listed, downloaded, copied) and from which IP. Admins see it on the new **Read Log** tab. The read is recorded before any value leaves the server, and fails if it can't be. Turning protection off is recorded too.
+  - The secrets page and the event log load a value only when you reveal it, download or copy it, so opening a page no longer sends any values to the browser.
+  - Each environment's secret changes and reads form hash chains signed by the server, so editing, removing or adding a row in the database shows up.
+  - `sigillo audit verify` checks both chains of an environment and remembers their heads in `~/.sigillo/audit.json`, so rows removed since the last check show up too:
+
+  ```bash
+  $ sigillo audit verify -c prod
+  ✔ changes: 42 rows, intact
+  ✔ reads: 7 rows, intact
+  ```
+
+- d8fd963: `self-host --allowed-users` limits who can sign in to your instance.
+
+  ```bash
+  npx @kldzj/sigillo self-host --allowed-users acme.com,ops@partner.io
+  ```
+
+  - A new deployment asks for the list. The app and its login provider both enforce it.
+  - Updates keep the saved list. Pass the flag again to change it, or `--allowed-users ''` to let anyone in.
+  - `self-host` warns when anyone with a Google account can sign in.
+
+### Patch Changes
+
+- 2793a2d: The npm package has a README: install, deploying your instance and the first commands, with a link to the full documentation.
+- 4e76355: The CLI now sends `User-Agent: sigillo-cli/<version>` instead of Zig's default `zig/<version>`, so the server can tell it apart from other clients.
+- e39f1a6: `sigillo login` signs in again when a token is already saved. It used to re-save the saved token and stop, so a login that had stopped working could only be replaced after `sigillo logout`. `--token` and `SIGILLO_TOKEN` are still saved as given.
+- ad62fac: When sign-in fails or is refused, the login provider's error page now leads back to your instance's sign-in page. Its button used to open the provider's root, which only answers with a health check.
+
 ## 0.14.1
 
 ### Patch Changes
