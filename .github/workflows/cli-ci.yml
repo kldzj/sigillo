@@ -50,6 +50,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --filter @kldzj/sigillo --frozen-lockfile
 
+      # npm drops what it has to "fix" in package.json at publish time (a
+      # "./dist/bin.js" bin once staged a release without the sigillo
+      # command), so the manifest must already be in the form npm writes.
+      - name: Check package.json needs no npm fixes
+        working-directory: cli
+        run: |
+          npx --yes npm@^11.15.0 pkg fix
+          git diff --exit-code -- package.json
+
       - name: Build all targets
         working-directory: cli
         run: pnpm tsx scripts/build.ts
