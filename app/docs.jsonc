@@ -37,7 +37,7 @@
           {
             "group": "Getting Started",
             "icon": "lucide:rocket",
-            "pages": ["index", "docs/self-hosting"]
+            "pages": ["index", "docs/self-hosting", "docs/hardening"]
           }
         ]
       },
