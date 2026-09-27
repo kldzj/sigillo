@@ -46,10 +46,12 @@ pub fn request(args: RequestArgs) !ApiResult {
         const auth_header = try std.fmt.allocPrint(args.allocator, "Bearer {s}", .{value});
         defer args.allocator.free(auth_header);
 
-        // Never follow redirects with a token: Zig keeps privileged headers
-        // for same-host/subdomain/other-port targets, so a redirect could
-        // hand the token to another service. 3xx comes back as a status.
-        const privileged_headers = [_]std.http.Header{
+        // The token goes in extra_headers: std.http 0.15 never writes
+        // privileged_headers, so a token there was not sent at all. Since
+        // extra_headers would follow any redirect, never follow one with a
+        // token: 3xx comes back as a status.
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "accept", .value = args.accept },
             .{ .name = "authorization", .value = auth_header },
         };
         break :blk try http_client.fetch(.{
@@ -57,8 +59,7 @@ pub fn request(args: RequestArgs) !ApiResult {
             .method = args.method,
             .payload = args.json_body,
             .headers = headers,
-            .extra_headers = &accept_header,
-            .privileged_headers = &privileged_headers,
+            .extra_headers = &extra_headers,
             .redirect_behavior = .unhandled,
             .response_writer = &response_body.writer,
         });
