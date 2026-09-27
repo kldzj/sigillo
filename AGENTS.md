@@ -4,6 +4,15 @@ sigillo is still in pre release. ignore backwards compatibility, instead focus o
 
 Self-hostable secret manager (Doppler/Infisical alternative) running on Cloudflare Workers + D1.
 
+## This fork (kldzj/sigillo)
+
+This repo is a maintained fork of [remorses/sigillo](https://github.com/remorses/sigillo) with no hosted service. Where the rest of this file describes sigillo.dev, auth.sigillo.dev, Strada or the upstream release process, these rules win:
+
+- **No default server.** The CLI never falls back to sigillo.dev. Without `--api-url`, `SIGILLO_API_URL` or a saved login it stops with "no Sigillo server configured".
+- **Own login provider per instance.** `self-host` deploys the provider next to the app as `<name>-auth` and asks for a Google OAuth client. The release bundle (format 2) carries both workers.
+- **Package and releases.** The CLI is published as `@kldzj/sigillo` (bin `sigillo`) from this repo's CI through npm trusted publishing, stage only, so no npm token exists anywhere. Releases only run while the `RELEASE_ENABLED` repository variable is `true`. CI stages the npm version (`npm stage publish`) and creates the GitHub release as a draft; a maintainer then approves the staged version with 2FA (`npm stage approve <stage-id>` or npmjs.com → Staged Packages) and publishes the draft release. self-host reads releases from github.com/kldzj/sigillo, and never sees drafts. Changesets name `@kldzj/sigillo`, not `sigillo`.
+- **Upstream PRs** are branched from upstream `main` and must not contain fork-only changes; this repo's `main` merges them in.
+
 ## Architecture
 
 Two Cloudflare Workers in a pnpm monorepo, each backed by a D1 database:

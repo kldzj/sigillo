@@ -14,7 +14,7 @@
   },
   "navbar": {
     "links": [
-      { "type": "github", "href": "https://github.com/remorses/sigillo" }
+      { "type": "github", "href": "https://github.com/kldzj/sigillo" }
     ],
     "primary": {
       "type": "button",
@@ -24,7 +24,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/remorses/sigillo",
+      "github": "https://github.com/kldzj/sigillo",
       "x": "https://x.com/__morse"
     }
   },
@@ -91,8 +91,8 @@
     "global": {
       // Anchors use placement "tabs" so they appear in the tab bar
       "anchors": [
-        { "anchor": "GitHub", "href": "https://github.com/remorses/sigillo", "icon": "lucide:github", "placement": "tabs" },
-        { "anchor": "Changelog", "href": "https://github.com/remorses/sigillo/releases", "icon": "lucide:newspaper", "placement": "tabs"  }
+        { "anchor": "GitHub", "href": "https://github.com/kldzj/sigillo", "icon": "lucide:github", "placement": "tabs" },
+        { "anchor": "Changelog", "href": "https://github.com/kldzj/sigillo/releases", "icon": "lucide:newspaper", "placement": "tabs"  }
       ]
     }
   },
