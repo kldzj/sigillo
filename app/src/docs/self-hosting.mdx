@@ -54,6 +54,18 @@ npx sigillo self-host
 
 Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and your auth secret is never rotated, so your stored secrets stay decryptable.
 
+Stored secrets are encrypted with a key derived from `BETTER_AUTH_SECRET`, which is saved in `~/.sigillo/selfhost.json`. **Back up that file.** If the worker and the file are both lost, the stored secrets cannot be decrypted, and `self-host` refuses to reuse that database.
+
+## Separate encryption key
+
+Optional. To use a separate AES key instead of the derived one, set `SIGILLO_ENCRYPTION_KEY` on the **first** deploy:
+
+```bash
+SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx sigillo self-host
+```
+
+It is bound as the worker's `ENCRYPTION_KEY` secret and saved in `~/.sigillo/selfhost.json`. It cannot be set on an existing deployment, because a new key would make its stored secrets unreadable.
+
 ## Options
 
 See the full flag reference at [sigillo self-host](./cli/self-host.mdx).

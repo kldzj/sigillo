@@ -21,7 +21,7 @@ import {
   ensureDatabase,
   fetchReleaseInfo,
   isSigilloWorker,
-  generateBetterAuthSecret,
+  resolveDeploySecrets,
   loadBundle,
   syncAssets,
   uploadWorker,
@@ -47,6 +47,8 @@ cli
   .example('npx sigillo self-host')
   .example('npx sigillo self-host --name sigillo --domain secrets.acme.com')
   .example('CLOUDFLARE_API_TOKEN=xxx npx sigillo self-host --yes')
+  .example('# Optional, first deploy only: separate AES key instead of deriving it from BETTER_AUTH_SECRET')
+  .example('SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx sigillo self-host')
   .action(async (options) => {
     clack.intro(colors.bold('sigillo self-host'))
     const releaseLock = acquireLock()
@@ -143,25 +145,17 @@ async function selfHost(options: SelfHostOptions) {
   // ── D1 + migrations ───────────────────────────────────────────────
   spinner.start('Provisioning D1 database')
   const firstMigrationName = Object.keys(bundle.migrations).sort()[0]
+  // Validate before touching anything: a bad SIGILLO_ENCRYPTION_KEY must fail early.
+  const secrets = resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv: process.env.SIGILLO_ENCRYPTION_KEY })
   const databaseId =
     saved?.databaseId ??
-    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName }))
+    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName, newSecrets: !workerExists }))
   const applied = await applyMigrations({ client, accountId, databaseId, migrations: bundle.migrations })
   spinner.stop(
     applied.length > 0
       ? `D1 ready — applied ${applied.length} migration${applied.length > 1 ? 's' : ''}`
       : 'D1 ready — no new migrations',
   )
-
-  // ── Secret handling ───────────────────────────────────────────────
-  // Never rotate BETTER_AUTH_SECRET: it derives the AES key encrypting all
-  // stored secrets. Existing worker → NEVER send secrets, inherit everything
-  // via keep_bindings (sending would delete user-added secrets like a custom
-  // ENCRYPTION_KEY and make stored data unreadable). New worker → reuse the
-  // state-saved secret (worker deleted but D1 survived) or generate one.
-  const betterAuthSecret = workerExists
-    ? undefined
-    : (saved?.betterAuthSecret ?? generateBetterAuthSecret())
 
   // ── Assets + worker upload ────────────────────────────────────────
   spinner.start('Uploading static assets')
@@ -177,7 +171,7 @@ async function selfHost(options: SelfHostOptions) {
   spinner.stop('Static assets synced')
 
   spinner.start(`Uploading worker (${Object.keys(bundle.modules).length} modules)`)
-  await uploadWorker(client, { accountId, scriptName: workerName, bundle, databaseId, assetsJwt, betterAuthSecret })
+  await uploadWorker(client, { accountId, scriptName: workerName, bundle, databaseId, assetsJwt, ...secrets })
   spinner.stop('Worker deployed')
 
   // ── workers.dev URL ───────────────────────────────────────────────
@@ -217,7 +211,8 @@ async function selfHost(options: SelfHostOptions) {
     accountId,
     workerName,
     databaseId,
-    betterAuthSecret: betterAuthSecret ?? saved?.betterAuthSecret,
+    betterAuthSecret: secrets.betterAuthSecret ?? saved?.betterAuthSecret,
+    encryptionKey: secrets.encryptionKey ?? saved?.encryptionKey,
     deployedVersion: bundle.version,
     url: workersDevUrl,
     customDomain: saved?.customDomain,

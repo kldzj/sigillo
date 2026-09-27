@@ -6,7 +6,7 @@
 import { gzipSync } from 'node:zlib'
 import { describe, expect, test } from 'vitest'
 import { parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL } from '../src/selfhost/cloudflare.js'
-import { parseBundle, type SelfhostBundle } from '../src/selfhost/deploy.js'
+import { parseBundle, resolveDeploySecrets, type SelfhostBundle } from '../src/selfhost/deploy.js'
 
 describe('parseWranglerToml', () => {
   const sample = [
@@ -120,6 +120,58 @@ describe('TOKEN_TEMPLATE_URL', () => {
           "type": "read",
         },
       ]
+    `)
+  })
+})
+
+describe('resolveDeploySecrets', () => {
+  const key = Buffer.alloc(32, 7).toString('base64')
+  const other = Buffer.alloc(32, 9).toString('base64')
+  const run = (args: Parameters<typeof resolveDeploySecrets>[0]) => {
+    try {
+      const r = resolveDeploySecrets(args)
+      return { betterAuthSecret: r.betterAuthSecret ? (args.saved?.betterAuthSecret ? 'saved' : 'generated') : undefined, encryptionKey: r.encryptionKey }
+    } catch (error) {
+      return (error as Error).message
+    }
+  }
+
+  test('existing worker never sends secrets; the key can only be set on first deploy', () => {
+    expect({
+      defaultNew: run({ workerExists: false }),
+      newWithKey: run({ workerExists: false, encryptionKeyEnv: key }),
+      recreatedFromState: run({ workerExists: false, saved: { betterAuthSecret: 's', encryptionKey: key } }),
+      existing: run({ workerExists: true, saved: { betterAuthSecret: 's' } }),
+      existingSameKey: run({ workerExists: true, saved: { encryptionKey: key }, encryptionKeyEnv: key }),
+      existingNewKey: run({ workerExists: true, saved: { betterAuthSecret: 's' }, encryptionKeyEnv: key }),
+      recreatedDifferentKey: run({ workerExists: false, saved: { encryptionKey: key }, encryptionKeyEnv: other }),
+      invalidKey: run({ workerExists: false, encryptionKeyEnv: 'short' }),
+    }).toMatchInlineSnapshot(`
+      {
+        "defaultNew": {
+          "betterAuthSecret": "generated",
+          "encryptionKey": undefined,
+        },
+        "existing": {
+          "betterAuthSecret": undefined,
+          "encryptionKey": undefined,
+        },
+        "existingNewKey": "SIGILLO_ENCRYPTION_KEY can only be set on the first deploy. Changing the key of an existing deployment would make its stored secrets unreadable. Unset it to update.",
+        "existingSameKey": {
+          "betterAuthSecret": undefined,
+          "encryptionKey": undefined,
+        },
+        "invalidKey": "SIGILLO_ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32)",
+        "newWithKey": {
+          "betterAuthSecret": "generated",
+          "encryptionKey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        },
+        "recreatedDifferentKey": "SIGILLO_ENCRYPTION_KEY differs from the key saved for this deployment. Unset it to reuse the saved key.",
+        "recreatedFromState": {
+          "betterAuthSecret": "saved",
+          "encryptionKey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        },
+      }
     `)
   })
 })

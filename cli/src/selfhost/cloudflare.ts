@@ -68,6 +68,8 @@ export interface DeploymentState {
   workerName: string
   databaseId: string
   betterAuthSecret?: string
+  /** Only set when the user passed SIGILLO_ENCRYPTION_KEY on first deploy */
+  encryptionKey?: string
   deployedVersion?: string
   url?: string
   customDomain?: string

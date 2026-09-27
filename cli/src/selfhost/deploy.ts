@@ -119,11 +119,13 @@ export function isSigilloWorker(settings: { bindings?: Array<{ type: string; nam
  * `d1_migrations` history starts with our first migration is ours, anything
  * else is an unrelated database that must not be touched.
  */
-export async function ensureDatabase({ client, accountId, name, firstMigrationName }: {
+export async function ensureDatabase({ client, accountId, name, firstMigrationName, newSecrets }: {
   client: CfClient
   accountId: string
   name: string
   firstMigrationName?: string
+  /** This deploy generates a new BETTER_AUTH_SECRET (no worker, no saved state) */
+  newSecrets: boolean
 }): Promise<string> {
   const existing = await client.findD1ByName(accountId, name)
   if (!existing) {
@@ -146,7 +148,25 @@ export async function ensureDatabase({ client, accountId, name, firstMigrationNa
       sql: 'SELECT name FROM d1_migrations ORDER BY id LIMIT 1;',
     })
     const first = appliedResult?.results?.[0]?.name
-    if (first === undefined || first === firstMigrationName) return existing.uuid
+    if (first === undefined || first === firstMigrationName) {
+      // Adopting a database with stored secrets under a freshly generated
+      // BETTER_AUTH_SECRET makes every one of them undecryptable, silently.
+      if (newSecrets && tables.includes('secret_event')) {
+        const [secretsResult] = await client.d1Query({
+          accountId,
+          databaseId: existing.uuid,
+          sql: 'SELECT 1 AS found FROM secret_event LIMIT 1;',
+        })
+        if (secretsResult?.results?.length) {
+          throw new Error(
+            `The D1 database "${name}" already stores secrets, but its worker and the saved keys in ` +
+              '~/.sigillo/selfhost.json are gone. A new deploy would generate a new secret and make them unreadable. ' +
+              'Restore ~/.sigillo/selfhost.json and re-run, or deploy under --name <other-name>.',
+          )
+        }
+      }
+      return existing.uuid
+    }
   }
 
   throw new Error(
@@ -244,6 +264,41 @@ export function generateBetterAuthSecret(): string {
   return randomBytes(32).toString('base64')
 }
 
+/**
+ * Secrets to bind on this deploy. By default the app derives its AES key from
+ * BETTER_AUTH_SECRET (never rotated). SIGILLO_ENCRYPTION_KEY optionally binds a
+ * separate ENCRYPTION_KEY, but only on a new worker: changing the key of a
+ * worker that already stores secrets would make them all unreadable.
+ * Returns {} for an existing worker (inherit everything via keep_bindings).
+ */
+export function resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv }: {
+  workerExists: boolean
+  saved?: { betterAuthSecret?: string; encryptionKey?: string }
+  encryptionKeyEnv?: string
+}): { betterAuthSecret?: string; encryptionKey?: string } {
+  const encryptionKey = encryptionKeyEnv?.trim() || undefined
+  if (encryptionKey && Buffer.from(encryptionKey, 'base64').length !== 32) {
+    throw new Error('SIGILLO_ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32)')
+  }
+  const keyChanged = !!encryptionKey && encryptionKey !== saved?.encryptionKey
+  if (workerExists) {
+    if (keyChanged) {
+      throw new Error(
+        'SIGILLO_ENCRYPTION_KEY can only be set on the first deploy. Changing the key of an existing ' +
+          'deployment would make its stored secrets unreadable. Unset it to update.',
+      )
+    }
+    return {}
+  }
+  if (keyChanged && saved?.encryptionKey) {
+    throw new Error('SIGILLO_ENCRYPTION_KEY differs from the key saved for this deployment. Unset it to reuse the saved key.')
+  }
+  return {
+    betterAuthSecret: saved?.betterAuthSecret ?? generateBetterAuthSecret(),
+    encryptionKey: encryptionKey ?? saved?.encryptionKey,
+  }
+}
+
 export async function uploadWorker(
   client: CfClient,
   args: {
@@ -254,6 +309,7 @@ export async function uploadWorker(
     assetsJwt: string
     /** undefined = worker already exists, inherit stored secrets via keep_bindings */
     betterAuthSecret?: string
+    encryptionKey?: string
   },
 ): Promise<void> {
   const { bundle } = args
@@ -263,6 +319,7 @@ export async function uploadWorker(
   ]
   if (args.betterAuthSecret) {
     bindings.push({ type: 'secret_text', name: 'BETTER_AUTH_SECRET', text: args.betterAuthSecret })
+    if (args.encryptionKey) bindings.push({ type: 'secret_text', name: 'ENCRYPTION_KEY', text: args.encryptionKey })
   }
 
   const metadata = {
