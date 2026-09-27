@@ -16,7 +16,7 @@
 import { gunzipSync } from 'node:zlib'
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { CfClient } from './cloudflare.js'
+import { CfClient, type DeploymentState } from './cloudflare.js'
 
 export const RELEASE_INFO_URL = 'https://sigillo.dev/api/selfhost/release/latest'
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/remorses/sigillo/releases?per_page=30'
@@ -117,13 +117,17 @@ export function isSigilloWorker(settings: { bindings?: Array<{ type: string; nam
  * (nothing in local state), verify it actually belongs to Sigillo before
  * applying migrations into it: an empty database is fine, a database whose
  * `d1_migrations` history starts with our first migration is ours, anything
- * else is an unrelated database that must not be touched.
+ * else is an unrelated database that must not be touched. A Sigillo database
+ * that already stores secrets is only adopted when the existing worker keeps
+ * its secrets: new ones would make every stored secret unreadable.
  */
-export async function ensureDatabase({ client, accountId, name, firstMigrationName }: {
+export async function ensureDatabase({ client, accountId, name, firstMigrationName, secretsKept }: {
   client: CfClient
   accountId: string
   name: string
   firstMigrationName?: string
+  /** false when this deploy generates new secrets (see secretsForDeploy) */
+  secretsKept: boolean
 }): Promise<string> {
   const existing = await client.findD1ByName(accountId, name)
   if (!existing) {
@@ -146,7 +150,21 @@ export async function ensureDatabase({ client, accountId, name, firstMigrationNa
       sql: 'SELECT name FROM d1_migrations ORDER BY id LIMIT 1;',
     })
     const first = appliedResult?.results?.[0]?.name
-    if (first === undefined || first === firstMigrationName) return existing.uuid
+    if (first === undefined) return existing.uuid
+    if (first === firstMigrationName) {
+      if (secretsKept) return existing.uuid
+      const [secretsResult] = await client.d1Query({
+        accountId,
+        databaseId: existing.uuid,
+        sql: 'SELECT 1 FROM secret_event LIMIT 1;',
+      })
+      if (!secretsResult?.results?.length) return existing.uuid
+      throw new Error(
+        `The D1 database "${name}" already stores secrets from an earlier deployment, but its worker and ` +
+          `~/.sigillo/selfhost.json are gone, so new keys would leave them unreadable. Restore selfhost.json ` +
+          'from the machine that deployed it, or re-run with --name <other-name> to start a new deployment.',
+      )
+    }
   }
 
   throw new Error(
@@ -244,6 +262,25 @@ export function generateBetterAuthSecret(): string {
   return randomBytes(32).toString('base64')
 }
 
+// Never rotate either secret. ENCRYPTION_KEY is the AES key for all stored
+// secrets, and without it the app derives that key from BETTER_AUTH_SECRET.
+// Existing worker → NEVER send secrets, inherit everything via keep_bindings
+// (sending would delete user-added secrets and make stored data unreadable).
+// New worker → reuse what the state file saved (worker deleted but D1
+// survived), else generate both. Only a brand-new deployment gets its own
+// ENCRYPTION_KEY: one that stored data before this keeps its derived key.
+export function secretsForDeploy({ workerExists, saved }: {
+  workerExists: boolean
+  saved?: DeploymentState
+}): { betterAuthSecret?: string; encryptionKey?: string } {
+  if (workerExists) return {}
+  if (saved) {
+    return { betterAuthSecret: saved.betterAuthSecret ?? generateBetterAuthSecret(), encryptionKey: saved.encryptionKey }
+  }
+  // 32 random bytes, base64: the format the app's ENCRYPTION_KEY expects
+  return { betterAuthSecret: generateBetterAuthSecret(), encryptionKey: randomBytes(32).toString('base64') }
+}
+
 export async function uploadWorker(
   client: CfClient,
   args: {
@@ -254,6 +291,8 @@ export async function uploadWorker(
     assetsJwt: string
     /** undefined = worker already exists, inherit stored secrets via keep_bindings */
     betterAuthSecret?: string
+    /** set on new deployments only, see secretsForDeploy */
+    encryptionKey?: string
   },
 ): Promise<void> {
   const { bundle } = args
@@ -263,6 +302,9 @@ export async function uploadWorker(
   ]
   if (args.betterAuthSecret) {
     bindings.push({ type: 'secret_text', name: 'BETTER_AUTH_SECRET', text: args.betterAuthSecret })
+  }
+  if (args.encryptionKey) {
+    bindings.push({ type: 'secret_text', name: 'ENCRYPTION_KEY', text: args.encryptionKey })
   }
 
   const metadata = {

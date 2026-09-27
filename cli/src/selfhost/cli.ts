@@ -3,7 +3,7 @@
 // the Zig binary is exec'd, so it only exists in the npm package.
 //
 // Idempotent: re-running updates the worker to the latest release, applies
-// only new D1 migrations, and never rotates BETTER_AUTH_SECRET.
+// only new D1 migrations, and never rotates BETTER_AUTH_SECRET or ENCRYPTION_KEY.
 
 import { goke, colors, isAgent } from 'goke'
 import * as clack from '@clack/prompts'
@@ -21,7 +21,7 @@ import {
   ensureDatabase,
   fetchReleaseInfo,
   isSigilloWorker,
-  generateBetterAuthSecret,
+  secretsForDeploy,
   loadBundle,
   syncAssets,
   uploadWorker,
@@ -145,7 +145,7 @@ async function selfHost(options: SelfHostOptions) {
   const firstMigrationName = Object.keys(bundle.migrations).sort()[0]
   const databaseId =
     saved?.databaseId ??
-    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName }))
+    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName, secretsKept: workerExists }))
   const applied = await applyMigrations({ client, accountId, databaseId, migrations: bundle.migrations })
   spinner.stop(
     applied.length > 0
@@ -153,15 +153,8 @@ async function selfHost(options: SelfHostOptions) {
       : 'D1 ready — no new migrations',
   )
 
-  // ── Secret handling ───────────────────────────────────────────────
-  // Never rotate BETTER_AUTH_SECRET: it derives the AES key encrypting all
-  // stored secrets. Existing worker → NEVER send secrets, inherit everything
-  // via keep_bindings (sending would delete user-added secrets like a custom
-  // ENCRYPTION_KEY and make stored data unreadable). New worker → reuse the
-  // state-saved secret (worker deleted but D1 survived) or generate one.
-  const betterAuthSecret = workerExists
-    ? undefined
-    : (saved?.betterAuthSecret ?? generateBetterAuthSecret())
+  // ── Secret handling (see secretsForDeploy) ────────────────────────
+  const { betterAuthSecret, encryptionKey } = secretsForDeploy({ workerExists, saved })
 
   // ── Assets + worker upload ────────────────────────────────────────
   spinner.start('Uploading static assets')
@@ -177,7 +170,7 @@ async function selfHost(options: SelfHostOptions) {
   spinner.stop('Static assets synced')
 
   spinner.start(`Uploading worker (${Object.keys(bundle.modules).length} modules)`)
-  await uploadWorker(client, { accountId, scriptName: workerName, bundle, databaseId, assetsJwt, betterAuthSecret })
+  await uploadWorker(client, { accountId, scriptName: workerName, bundle, databaseId, assetsJwt, betterAuthSecret, encryptionKey })
   spinner.stop('Worker deployed')
 
   // ── workers.dev URL ───────────────────────────────────────────────
@@ -218,6 +211,7 @@ async function selfHost(options: SelfHostOptions) {
     workerName,
     databaseId,
     betterAuthSecret: betterAuthSecret ?? saved?.betterAuthSecret,
+    encryptionKey: encryptionKey ?? saved?.encryptionKey,
     deployedVersion: bundle.version,
     url: workersDevUrl,
     customDomain: saved?.customDomain,
