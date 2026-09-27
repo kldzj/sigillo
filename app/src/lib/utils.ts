@@ -34,11 +34,17 @@ export function formatAbsoluteDate({ ts, timeZone }: { ts: number; timeZone: str
 
 export function formatTime({ ts, now, timeZone }: { ts: number; now: number; timeZone: string }) {
   const diff = now - ts
+  if (diff < 0) return formatAbsoluteDate({ ts, timeZone })
   if (diff < 60_000) return 'just now'
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
   return formatAbsoluteDate({ ts, timeZone })
 }
+
+// Lifetimes a new API token can have, in days. The create dialog offers
+// these and createTokenAction accepts nothing else.
+export const TOKEN_EXPIRY_DAYS = [7, 30, 90, 365] as const
+export const DEFAULT_TOKEN_EXPIRY_DAYS = 90
 
 // ── Email domain helpers (client-safe) ──────────────────────────────
 // These are used by both server code (db.ts, actions.ts) and client

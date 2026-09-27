@@ -831,7 +831,8 @@ export async function requireSecretsApiAuth(
 // ── API token helpers ───────────────────────────────────────────────
 // Tokens use SHA-256 hashing — the full key is never stored, only shown
 // once at creation. generateApiToken() creates the raw key + hash + prefix.
-// verifyApiToken() looks up a key by its hash for API authentication.
+// verifyApiToken() looks up a key by its hash for API authentication,
+// refuses it once expired, and records its last use at most once an hour.
 
 export async function hashTokenKey(key: string): Promise<string> {
   const encoded = new TextEncoder().encode(key)
@@ -858,10 +859,19 @@ export async function verifyApiToken(key: string): Promise<{
   const db = getDb()
   const token = await db.query.apiToken.findFirst({
     where: { hashedKey },
-    columns: { id: true, projectId: true, createdBy: true },
+    columns: { id: true, projectId: true, createdBy: true, expiresAt: true, lastUsedAt: true },
     with: { environments: { columns: { environmentId: true } } },
   })
   if (!token) return null
+  const now = Date.now()
+  if (token.expiresAt !== null && token.expiresAt <= now) {
+    throw new Response(JSON.stringify({ error: 'API token expired' }), {
+      status: 401, headers: { 'content-type': 'application/json' },
+    })
+  }
+  if (token.lastUsedAt === null || now - token.lastUsedAt > 3_600_000) {
+    await db.update(schema.apiToken).set({ lastUsedAt: now }).where(orm.eq(schema.apiToken.id, token.id))
+  }
   return {
     tokenId: token.id,
     projectId: token.projectId,
