@@ -12,6 +12,9 @@
   "icons": {
     "library": "lucide"
   },
+  "layout": {
+    "mode": "compact"
+  },
   "navbar": {
     "links": [
       { "type": "github", "href": "https://github.com/remorses/sigillo" }
@@ -89,10 +92,9 @@
       }
     ],
     "global": {
-      // Anchors use placement "tabs" so they appear in the tab bar
       "anchors": [
-        { "anchor": "GitHub", "href": "https://github.com/remorses/sigillo", "icon": "lucide:github", "placement": "tabs" },
-        { "anchor": "Changelog", "href": "https://github.com/remorses/sigillo/releases", "icon": "lucide:newspaper", "placement": "tabs"  }
+        { "anchor": "GitHub", "href": "https://github.com/remorses/sigillo", "icon": "lucide:github" },
+        { "anchor": "Changelog", "href": "https://github.com/remorses/sigillo/releases", "icon": "lucide:newspaper" }
       ]
     }
   },
