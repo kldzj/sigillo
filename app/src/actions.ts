@@ -29,6 +29,7 @@ import {
   getUserEnvironmentAccess,
   getEnvironmentAccessError,
   getClaimableAutoJoinDomain,
+  deleteOrgMember,
 } from './db.ts'
 
 async function requireSession() {
@@ -363,7 +364,7 @@ export async function removeOrgMemberAction({ memberId }: { memberId: string }) 
     await ensureAnotherAdminExists(member.orgId, member.userId)
   }
 
-  await db.delete(schema.orgMember).where(orm.eq(schema.orgMember.id, member.id)).limit(1)
+  await deleteOrgMember(member)
   return { id: member.id }
 }
 
