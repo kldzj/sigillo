@@ -24,12 +24,11 @@ import {
   encrypt,
   generateApiToken,
   deriveSecrets,
-  getEmailDomain,
-  COMMON_EMAIL_DOMAINS,
   getMemberProjectAccess,
   getMemberAccess,
   getUserEnvironmentAccess,
   getEnvironmentAccessError,
+  getClaimableAutoJoinDomain,
 } from './db.ts'
 
 async function requireSession() {
@@ -477,11 +476,8 @@ export async function createOrgAction({ name, enableAutoJoin }: { name: string; 
 
   let autoJoinDomain: string | null = null
   if (enableAutoJoin) {
-    if (!session.user.emailVerified) throw new Error('Email must be verified to enable auto-join')
-    const domain = getEmailDomain(session.user.email)
-    if (!domain || COMMON_EMAIL_DOMAINS.has(domain)) {
-      throw new Error('Cannot enable auto-join for public email domains')
-    }
+    const domain = await getClaimableAutoJoinDomain({ session })
+    if (domain instanceof Error) throw domain
     autoJoinDomain = domain
   }
 
@@ -501,11 +497,8 @@ export async function updateAutoJoinDomainAction({ orgId, enabled }: { orgId: st
 
   let autoJoinDomain: string | null = null
   if (enabled) {
-    if (!session.user.emailVerified) throw new Error('Email must be verified to enable auto-join')
-    const domain = getEmailDomain(session.user.email)
-    if (!domain || COMMON_EMAIL_DOMAINS.has(domain)) {
-      throw new Error('Cannot enable auto-join for public email domains')
-    }
+    const domain = await getClaimableAutoJoinDomain({ session, orgId })
+    if (domain instanceof Error) throw domain
     autoJoinDomain = domain
   }
 
