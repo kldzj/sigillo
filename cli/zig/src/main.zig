@@ -174,6 +174,58 @@ fn fetchAvailableEnvs(
     return res.value;
 }
 
+// Project IDs are ULIDs: 26 characters of uppercase Crockford base32
+fn isProjectId(ref: []const u8) bool {
+    if (ref.len != 26) return false;
+    for (ref) |c| switch (c) {
+        '0'...'9', 'A'...'H', 'J', 'K', 'M', 'N', 'P'...'T', 'V'...'Z' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn projectsNamed(
+    allocator: std.mem.Allocator,
+    projects: []const client.api.ProjectListResponseProjectsItem,
+    name: []const u8,
+) ![]const client.api.ProjectListResponseProjectsItem {
+    var matches: std.ArrayList(client.api.ProjectListResponseProjectsItem) = .empty;
+    for (projects) |project| {
+        if (std.mem.eql(u8, project.name, name)) try matches.append(allocator, project);
+    }
+    return matches.toOwnedSlice(allocator);
+}
+
+// The API addresses projects by ID, but --project and SIGILLO_PROJECT also
+// take a project name. A value shaped like an ID is used as-is; anything else
+// is looked up in the projects this token can see, and must match exactly one.
+fn requireProjectId(allocator: std.mem.Allocator, stderr: Writer, api: ApiContext, ref: []const u8) ![]const u8 {
+    if (isProjectId(ref)) return ref;
+
+    const res = client.listProjects(.{ .allocator = allocator, .api_url = api.api_url, .token = api.token }) catch |err| {
+        try color.err(stderr, "error");
+        try stderr.print(": failed to fetch projects: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const projects = (if (res.status == 200) res.value else null) orelse {
+        const message = client.parseError(allocator, res.body) orelse try allocator.dupe(u8, "unknown error");
+        try color.err(stderr, "error");
+        try stderr.print(": failed to fetch projects ({d}): {s}\n", .{ res.status, message });
+        std.process.exit(1);
+    };
+
+    const matches = try projectsNamed(allocator, projects.projects, ref);
+    if (matches.len == 1) return matches[0].id;
+    if (matches.len == 0) exitProjectNotFound(allocator, stderr, api.api_url, api.token, ref);
+
+    try color.err(stderr, "error");
+    try stderr.print(": {d} projects are named {s}, use the project ID instead\n", .{ matches.len, ref });
+    for (matches) |project| {
+        try stderr.print("  - {s} / {s} ({s})\n", .{ project.orgName, project.name, project.id });
+    }
+    std.process.exit(1);
+}
+
 fn exitProjectNotFound(
     allocator: std.mem.Allocator,
     stderr: Writer,
@@ -200,11 +252,20 @@ fn printEnvNotFound(
 ) void {
     color.err(stderr, "error") catch {};
     if (project) |project_id| {
+        const listed = fetchAvailableEnvs(allocator, api_url, token, project_id) catch {
+            stderr.print(": env {s} was not found in project {s}\n", .{ env, project_id }) catch {};
+            return;
+        };
+        // The env list is only refused when the project itself is missing or
+        // off limits, so say that instead of blaming the env
+        const available = listed orelse {
+            stderr.print(": project {s} was not found or you do not have access to it\n", .{project_id}) catch {};
+            printAvailableProjects(allocator, stderr, api_url, token) catch {};
+            return;
+        };
         stderr.print(": env {s} was not found in project {s}\n", .{ env, project_id }) catch {};
-        if (fetchAvailableEnvs(allocator, api_url, token, project_id) catch null) |available| {
-            const env_options = envOptionsFrom(allocator, available.environments) catch &.{};
-            printAvailableEnvs(stderr, env_options) catch {};
-        }
+        const env_options = envOptionsFrom(allocator, available.environments) catch &.{};
+        printAvailableEnvs(stderr, env_options) catch {};
     } else {
         stderr.print(": env {s} was not found or you do not have access to it\n", .{env}) catch {};
     }
@@ -236,7 +297,7 @@ const Me = zeke.cmd("me", "Show current user info")
     .option("--json", "Print raw JSON");
 
 const Setup = zeke.cmd("setup", "Save default project and env for the current directory (stored in ~/.sigillo, not in the repo)")
-    .option("-p, --project [id]", "Project ID")
+    .option("-p, --project [id]", "Project ID or name")
     .option("--env [slug]", "Env slug, usually dev since you run locally with the development environment")
     .option("-c, --config [slug]", "Env slug alias")
     .example("sigillo setup --project website --env dev");
@@ -246,7 +307,7 @@ const Run = zeke.cmd("run <...cmd>", "Run a command with secrets injected")
     .option("--mount [path]", "Write secrets to a new owner-only file (must not exist), deleted when the command exits")
     .option("--mount-format [fmt]", "Format for mounted file: env, env-no-quotes, json, yaml, docker, dotnet-json (default: env)")
     .option("--disable-redaction", "Print child output without secret redaction")
-    .option("-p, --project [id]", "Project ID override")
+    .option("-p, --project [id]", "Project ID or name override")
     .option("--env [slug]", "Env slug override (e.g. dev, prod)")
     .option("-c, --config [slug]", "Env slug override")
     .example("sigillo run -- env")
@@ -255,33 +316,33 @@ const Run = zeke.cmd("run <...cmd>", "Run a command with secrets injected")
     .example("sigillo run --command 'echo $MY_SECRET'");
 
 const Secrets = zeke.cmd("secrets", "List secrets for the configured env")
-    .option("-p, --project [id]", "Project ID override")
+    .option("-p, --project [id]", "Project ID or name override")
     .option("--env [slug]", "Env slug override (e.g. dev, prod)")
     .option("-c, --config [slug]", "Env slug override");
 
 const SecretsGet = zeke.cmd("secrets get <name>", "Get a secret value")
-    .option("-p, --project [id]", "Project ID override")
+    .option("-p, --project [id]", "Project ID or name override")
     .option("--env [slug]", "Env slug override (e.g. dev, prod)")
     .option("-c, --config [slug]", "Env slug override")
     .option("--force", "Allow printing secret values in agent shells")
     .option("--raw", "Output only the raw value (no YAML wrapping)");
 
 const SecretsSet = zeke.cmd("secrets set <name> [value]", "Set a secret value (omit value for a masked prompt or stdin)")
-    .option("-p, --project [id]", "Project ID override")
+    .option("-p, --project [id]", "Project ID or name override")
     .optionMany("--env <slug>", "Env slug override, repeatable (e.g. dev, prod)")
     .optionMany("-c, --config <slug>", "Env slug override, repeatable")
     .example("sigillo secrets set STRIPE_SECRET_KEY -c prod")
     .example("sigillo secrets set DATABASE_URL postgres://... -c dev -c prod");
 
 const SecretsDelete = zeke.cmd("secrets delete <name>", "Delete a secret")
-    .option("-p, --project [id]", "Project ID override")
+    .option("-p, --project [id]", "Project ID or name override")
     .optionMany("--env <slug>", "Env slug override, repeatable (e.g. dev, prod)")
     .optionMany("-c, --config <slug>", "Env slug override, repeatable")
     .example("sigillo secrets delete OLD_KEY -c dev -c prod");
 
 const SecretsDownload = zeke.cmd("secrets download", "Download all secrets in a chosen format")
     .option("--format [fmt]", "Output format: json, env, env-no-quotes, xargs, yaml, docker, dotnet-json (default: yaml)")
-    .option("-p, --project [id]", "Project ID override")
+    .option("-p, --project [id]", "Project ID or name override")
     .option("--env [slug]", "Env slug override (e.g. dev, prod)")
     .option("-c, --config [slug]", "Env slug override")
     .option("--force", "Allow printing secret values in agent shells")
@@ -308,10 +369,10 @@ const ProjectsUpdate = zeke.cmd("projects update <id>", "Update a project")
 const ProjectsDelete = zeke.cmd("projects delete <id>", "Delete a project");
 
 const Environments = zeke.cmd("environments", "List envs for the configured project")
-    .option("-p, --project [id]", "Project ID override");
+    .option("-p, --project [id]", "Project ID or name override");
 
 const EnvironmentsCreate = zeke.cmd("environments create", "Create an env")
-    .option("-p, --project <id>", "Project ID")
+    .option("-p, --project <id>", "Project ID or name")
     .option("--name <name>", "Env name")
     .option("--slug <slug>", "Env slug");
 
@@ -661,7 +722,11 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
 
     // ── Resolve project ────────────────────────────────────────────
     const SelectedProject = struct { id: []const u8, name: ?[]const u8, envs: ?[]const EnvOption };
-    const selected_project: SelectedProject = if (opts.project) |p| .{ .id = p, .name = null, .envs = null } else if (is_tty) proj: {
+    const selected_project: SelectedProject = if (opts.project) |p| .{
+        .id = try requireProjectId(allocator, stderr, .{ .api_url = api_url, .token = token }, p),
+        .name = null,
+        .envs = null,
+    } else if (is_tty) proj: {
         // Fetch all accessible projects in one request and present an interactive select.
         const projects_res = client.listProjects(.{
             .allocator = allocator,
@@ -850,13 +915,13 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
         std.process.exit(1);
     };
     const api_url = resolved.api_url.?; // always set — defaults to https://sigillo.dev
-    const project = resolved.project orelse {
+    const project = try requireProjectId(allocator, stderr, .{ .api_url = api_url, .token = token }, resolved.project orelse {
         try color.err(stderr, "error");
         try stderr.print(": project not configured for {s}\n", .{cwd});
         try stderr.writeAll("  sigillo setup --project <PROJECT_ID> --env <SLUG>\n");
         try printChildScopes(allocator, stderr, cwd);
         std.process.exit(1);
-    };
+    });
     const environment = resolved.environment orelse {
         try color.err(stderr, "error");
         try stderr.print(": env not configured for {s}\n", .{cwd});
@@ -880,7 +945,7 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
 
     if (res.status != 200) {
         if (res.status == 404) {
-            exitEnvNotFound(allocator, stderr, api_url, token, environment, resolved.project);
+            exitEnvNotFound(allocator, stderr, api_url, token, environment, project);
         }
         const message = client.parseError(allocator, res.body) orelse try allocator.dupe(u8, "unknown error");
         try color.err(stderr, "error");
@@ -937,7 +1002,7 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
             };
             if (mount_res.status != 200) {
                 if (mount_res.status == 404) {
-                    exitEnvNotFound(allocator, stderr, api_url, token, environment, resolved.project);
+                    exitEnvNotFound(allocator, stderr, api_url, token, environment, project);
                 }
                 const message = client.parseError(allocator, mount_res.body) orelse try allocator.dupe(u8, "unknown error");
                 try color.err(stderr, "error");
@@ -1571,7 +1636,7 @@ fn requireApiContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []const 
 }
 
 fn requireProjectContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []const u8, flags: config.ResolvedConfig) !ProjectContext {
-    return resolveProjectContext(allocator, cwd, flags) catch |err| switch (err) {
+    var ctx = resolveProjectContext(allocator, cwd, flags) catch |err| switch (err) {
         error.NotLoggedIn => {
             try color.err(stderr, "error");
             try stderr.print(": not logged in\n", .{});
@@ -1587,10 +1652,12 @@ fn requireProjectContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []co
         },
         else => return err,
     };
+    ctx.project_id = try requireProjectId(allocator, stderr, ctx.api, ctx.project_id);
+    return ctx;
 }
 
 fn requireEnvironmentContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []const u8, flags: config.ResolvedConfig) !EnvironmentContext {
-    return resolveEnvironmentContext(allocator, cwd, flags) catch |err| switch (err) {
+    var ctx = resolveEnvironmentContext(allocator, cwd, flags) catch |err| switch (err) {
         error.NotLoggedIn => {
             try color.err(stderr, "error");
             try stderr.print(": not logged in\n", .{});
@@ -1613,6 +1680,8 @@ fn requireEnvironmentContext(allocator: std.mem.Allocator, stderr: Writer, cwd: 
         },
         else => return err,
     };
+    ctx.project_id = try requireProjectId(allocator, stderr, ctx.api, ctx.project_id);
+    return ctx;
 }
 
 /// Resolve the list of environments a mutating command (set/delete) should
@@ -2303,7 +2372,7 @@ fn environmentsCreateAction(_: EnvironmentsCreate.Args, opts: EnvironmentsCreate
         .allocator = allocator,
         .api_url = api_ctx.api_url,
         .token = api_ctx.token,
-        .project_id = opts.project,
+        .project_id = try requireProjectId(allocator, stderr, api_ctx, opts.project),
         .name = opts.name,
         .slug = opts.slug,
     });
@@ -2645,6 +2714,40 @@ test "agent guard only blocks terminal output" {
     try std.testing.expect(!shouldBlockPlainSecretOutput(false, false, "codex"));
     try std.testing.expect(!shouldBlockPlainSecretOutput(true, true, "codex"));
     try std.testing.expect(!shouldBlockPlainSecretOutput(false, true, null));
+}
+
+test "project IDs are recognized by their ULID shape" {
+    try std.testing.expect(isProjectId("01M3FQJ2NGEAT5R9VPEMD2RDJN"));
+    try std.testing.expect(!isProjectId("test"));
+    try std.testing.expect(!isProjectId("website"));
+    // Right length, but lowercase or with letters Crockford base32 leaves out
+    try std.testing.expect(!isProjectId("01m3fqj2ngeat5r9vpemd2rdjn"));
+    try std.testing.expect(!isProjectId("01M3FQJ2NGEAT5R9VPEMD2RDJU"));
+}
+
+test "projectsNamed returns every project with exactly that name" {
+    const Project = client.api.ProjectListResponseProjectsItem;
+    const project = struct {
+        fn make(id: []const u8, name: []const u8) Project {
+            return .{ .id = id, .orgId = "org", .name = name, .createdAt = .null, .updatedAt = .null, .orgName = "Org", .environments = &.{} };
+        }
+    }.make;
+    const projects = [_]Project{ project("A", "website"), project("B", "api"), project("C", "website"), project("D", "Website") };
+    const allocator = std.testing.allocator;
+
+    const two = try projectsNamed(allocator, &projects, "website");
+    defer allocator.free(two);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqualStrings("A", two[0].id);
+    try std.testing.expectEqualStrings("C", two[1].id);
+
+    const one = try projectsNamed(allocator, &projects, "api");
+    defer allocator.free(one);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+
+    const none = try projectsNamed(allocator, &projects, "missing");
+    defer allocator.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "redaction handles repeated and multiple secret values" {
