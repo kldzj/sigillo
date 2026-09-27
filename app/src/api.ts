@@ -35,6 +35,7 @@ import {
   getAccessibleProjectIds,
   getUserEnvironmentAccess,
   getMemberAccess,
+  getReadableEnvironmentIds,
   ForbiddenError,
 } from './db.ts'
 import { memoize } from './lib/memoize.ts'
@@ -760,11 +761,7 @@ export const apiApp = new Spiceflow()
       // Derive projectId from the authenticated environment, not the URL param,
       // so a token for project A can't leak allNames from project B's URL.
       const authProjectId = await getProjectIdForEnvironment(auth.environmentId)
-      const environments = await db.query.environment.findMany({
-        where: { projectId: authProjectId! },
-        columns: { id: true },
-      })
-      const environmentIds = environments.map((e) => e.id)
+      const environmentIds = await getReadableEnvironmentIds(auth, authProjectId!)
 
       const { secrets: derived, allNames } = await deriveEnvironmentSecretsAndNames({
         environmentIds,

@@ -340,9 +340,8 @@ export async function autoJoinOrgsByDomain(session: Session): Promise<void> {
 }
 
 // ── Granular project access ─────────────────────────────────────────
-// If a member has ZERO memberAccess rows → full access to all projects.
-// If a member has ANY memberAccess rows → only listed projects.
-// Admins always bypass all restrictions.
+// orgMember.projectAccess 'all' → every project; 'selected' → only projects
+// in memberAccess (none if zero rows). Admins always bypass restrictions.
 
 // Membership + granular access in ONE round-trip. db.query with `with` emits
 // a single SQL statement (accessRules joined via the orgMember relation), so
@@ -355,7 +354,7 @@ export async function getMemberAccess({ userId, orgId }: {
   orgId: string
 }): Promise<{
   role: (typeof schema.orgMember.$inferSelect)['role']
-  /** null = unrestricted (admin, or no memberAccess rows); string[] = only these projects */
+  /** null = unrestricted (admin, or projectAccess 'all'); string[] = only these projects */
   accessibleProjectIds: string[] | null
 } | null> {
   const db = getDb()
@@ -364,7 +363,7 @@ export async function getMemberAccess({ userId, orgId }: {
     with: { accessRules: true },
   })
   if (!member) return null
-  if (member.role === 'admin' || member.accessRules.length === 0) {
+  if (member.role === 'admin' || member.projectAccess === 'all') {
     return { role: member.role, accessibleProjectIds: null }
   }
   return { role: member.role, accessibleProjectIds: member.accessRules.map((r) => r.projectId) }
@@ -384,7 +383,7 @@ export async function getMemberProjectAccess({ userId, orgId, projectId }: {
 }
 
 // Get list of project IDs a member can access, or null if unrestricted.
-// null = all projects (admin, or no memberAccess rows).
+// null = all projects (admin, or projectAccess 'all').
 // string[] = only these project IDs ([] for non-members).
 export async function getAccessibleProjectIds(
   userId: string,
@@ -678,6 +677,35 @@ export type SecretsAuth = (
   | { userId: string; apiTokenId: null }
   | { userId: null; apiTokenId: string }
 )
+
+// Environments of a project the caller may read, with the same rules as
+// requireSecretsApiAuth. Used where one request touches several envs (e.g.
+// the allNames list), so names from admin-only or out-of-scope envs never leak.
+export async function getReadableEnvironmentIds(auth: SecretsAuth, projectId: string): Promise<string[]> {
+  const db = getDb()
+  const [environments, orgId] = await Promise.all([
+    db.query.environment.findMany({ where: { projectId }, columns: { id: true, projectId: true, accessRole: true } }),
+    getOrgIdForProject(projectId),
+  ])
+  if (!orgId) return []
+  if (auth.userId) {
+    const access = await getMemberAccess({ userId: auth.userId, orgId })
+    return environments.filter((env) => !getEnvironmentAccessError(access, env)).map((env) => env.id)
+  }
+  if (!auth.apiTokenId) return []
+  const token = await db.query.apiToken.findFirst({
+    where: { id: auth.apiTokenId },
+    columns: { projectId: true, createdBy: true },
+    with: { environments: { columns: { environmentId: true } } },
+  })
+  if (!token || token.projectId !== projectId) return []
+  const allowlist = token.environments.length > 0 ? new Set(token.environments.map((row) => row.environmentId)) : null
+  const creator = await getMemberAccess({ userId: token.createdBy, orgId })
+  return environments
+    .filter((env) => !allowlist || allowlist.has(env.id))
+    .filter((env) => env.accessRole !== 'admin' || creator?.role === 'admin')
+    .map((env) => env.id)
+}
 
 // The environmentRef can be either a ULID or a slug. For token auth the
 // token's project scope is used to resolve slugs. For session auth we

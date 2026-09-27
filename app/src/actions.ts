@@ -294,9 +294,8 @@ export async function acceptInviteAction({ invitationId }: { invitationId: strin
     columns: { id: true },
   })
   if (!existing) {
-    // Resolve the project scope BEFORE creating the membership: a member with
-    // zero memberAccess rows can access every project, so a scoped invite
-    // whose projects were all deleted must be refused, not accepted unscoped.
+    // A scoped invite whose projects were all deleted is refused: joining
+    // with access to nothing would only confuse the invitee.
     const invitedProjectIds: string[] = invite.projectIds ? JSON.parse(invite.projectIds) : []
     const projects = invitedProjectIds.length > 0
       ? await db.query.project.findMany({ where: { orgId: invite.orgId, id: { in: invitedProjectIds } }, columns: { id: true } })
@@ -304,13 +303,16 @@ export async function acceptInviteAction({ invitationId }: { invitationId: strin
     if (invitedProjectIds.length > 0 && projects.length === 0) {
       throw new Error('The projects in this invitation no longer exist. Ask for a new invitation.')
     }
-    // Membership and scope in one batch, so a failure never leaves an
-    // unscoped member behind. onConflictDoNothing keeps a double-submitted
+    // Membership and scope in one batch, so a failure never leaves a
+    // half-scoped member behind. onConflictDoNothing keeps a double-submitted
     // accept a no-op (unique index on org_id + user_id).
     const memberId = ulid()
     await db.batch([
       db.insert(schema.orgMember)
-        .values({ id: memberId, orgId: invite.orgId, userId: session.userId, role: invite.role })
+        .values({
+          id: memberId, orgId: invite.orgId, userId: session.userId, role: invite.role,
+          projectAccess: invitedProjectIds.length > 0 ? 'selected' : 'all',
+        })
         .onConflictDoNothing({ target: [schema.orgMember.orgId, schema.orgMember.userId] }),
       ...projects.map((p) => db.insert(schema.memberAccess).values({ orgMemberId: memberId, projectId: p.id })),
     ])
@@ -522,9 +524,10 @@ export async function updateAutoJoinDomainAction({ orgId, enabled }: { orgId: st
 // Admin-only. Sets which projects a member can access and which secrets
 // are restricted. Passing an empty projects array reverts to "all access".
 
+// projectIds null = all projects; [] = no projects.
 export async function updateMemberAccessAction({ memberId, projectIds }: {
   memberId: string
-  projectIds: string[]
+  projectIds: string[] | null
 }) {
   const session = await requireSession()
   const db = getDb()
@@ -538,23 +541,25 @@ export async function updateMemberAccessAction({ memberId, projectIds }: {
   // Cannot restrict admins
   if (member.role === 'admin') throw new Error('Admins always have full access')
 
-  // Validate BEFORE touching the old rules: zero rules means access to every
-  // project, so failing halfway through a replace left a member unrestricted.
+  const selected = projectIds ?? []
   const orgProjects = await db.query.project.findMany({
     where: { orgId: member.orgId },
     columns: { id: true },
   })
   const orgProjectIdsSet = new Set(orgProjects.map((p) => p.id))
-  for (const pid of projectIds) {
+  for (const pid of selected) {
     if (!orgProjectIdsSet.has(pid)) {
       throw new Error(`Project ${pid} does not belong to this organization`)
     }
   }
 
-  // Replace the rules in one batch. No projects = no rows = "all access".
+  // Mode and rules in one batch, so a failure keeps the old access.
   await db.batch([
+    db.update(schema.orgMember)
+      .set({ projectAccess: projectIds === null ? 'all' : 'selected' })
+      .where(orm.eq(schema.orgMember.id, member.id)),
     db.delete(schema.memberAccess).where(orm.eq(schema.memberAccess.orgMemberId, member.id)),
-    ...projectIds.map((projectId) => db.insert(schema.memberAccess).values({ orgMemberId: member.id, projectId })),
+    ...selected.map((projectId) => db.insert(schema.memberAccess).values({ orgMemberId: member.id, projectId })),
   ])
 
   return { ok: true }
