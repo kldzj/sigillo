@@ -20,15 +20,17 @@ import {
 import { router, useLoaderData } from "spiceflow/react";
 
 const cliBannerCookieName = "sigillo-cli-banner-dismissed";
-const cliBannerCodeLines = [
+// The CLI signs in to this instance: it has no default one
+const cliBannerCodeLines = (apiUrl: string) => [
   [
     { text: "npm", kind: "command" },
     { text: " install -g ", kind: "plain" },
-    { text: "sigillo", kind: "value" },
+    { text: "@kldzj/sigillo", kind: "value" },
   ],
   [
     { text: "sigillo", kind: "value" },
-    { text: " login", kind: "plain" },
+    { text: " login --api-url ", kind: "plain" },
+    { text: apiUrl, kind: "value" },
   ],
   [
     { text: "sigillo", kind: "value" },
@@ -47,9 +49,9 @@ const cliBannerCodeLines = [
     { text: "next", kind: "command" },
     { text: " dev", kind: "plain" },
   ],
-] as const;
+];
 
-function CliBanner() {
+function CliBanner({ apiUrl }: { apiUrl: string }) {
   const [open, setOpen] = useState(true);
   if (!open) return null;
 
@@ -80,7 +82,7 @@ function CliBanner() {
 
         <pre className="cli-banner-code overflow-x-auto rounded-xl border border-border/70 bg-background/95 p-4 text-[12px]">
           <code className="block mono-sm">
-            {cliBannerCodeLines.map((line, i) => (
+            {cliBannerCodeLines(apiUrl).map((line, i) => (
               <span key={i} className="flex gap-x-4 leading-6">
                 <span className="w-5 shrink-0 select-none text-right text-muted-foreground/80">
                   {i + 1}
@@ -110,6 +112,7 @@ export function ProjectPage() {
     locked,
     secrets,
     showBanner,
+    apiUrl,
   } = useLoaderData('/dash/projects/:projectId/envs/:envSlug');
   const [allVisible, setAllVisible] = useState(false);
 
@@ -149,7 +152,7 @@ export function ProjectPage() {
         </div>
       </div>
 
-      {showBanner && <CliBanner />}
+      {showBanner && <CliBanner apiUrl={apiUrl} />}
 
       {/* Secrets table */}
       {locked ? (

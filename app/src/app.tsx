@@ -422,6 +422,7 @@ export const app = new Spiceflow({ tracer })
       secrets,
       allSecretNames,
       showBanner: !hasCookie({ cookieHeader, name: cliBannerCookieName }),
+      apiUrl: getRequestOrigin(request),
     }
   })
 
