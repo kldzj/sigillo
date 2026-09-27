@@ -14,7 +14,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 if (process.argv[2] === 'self-host' || process.argv[2] === 'selfhost') {
   const { run } = await import('./selfhost/cli.js')
   await run()
-  process.exit(0)
+  // No explicit code: a failed deploy sets process.exitCode = 1
+  process.exit()
 }
 
 // Targets that ship prebuilt binaries (must match scripts/build.ts)
