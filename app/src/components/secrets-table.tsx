@@ -10,6 +10,7 @@
 
 import { EyeIcon, EyeOffIcon, TrashIcon, UploadIcon, PlusIcon, KeyIcon, CheckIcon, DownloadIcon, CopyIcon, ArrowDownToLineIcon } from "lucide-react";
 import { EmptyState } from "sigillo-app/src/components/ui/empty-state";
+import { Spinner } from "sigillo-app/src/components/ui/spinner";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { z } from "zod";
 import { parseFormData } from "spiceflow";
@@ -70,13 +71,14 @@ function SecretValueCell({
 
   return (
     <div className="flex w-full min-w-0 items-center gap-1.5">
+      <div className="relative flex min-w-0 flex-1" aria-busy={loading}>
       <Input
         type="text"
         inputSize="sm"
         autoComplete="off"
         data-1p-ignore
         data-lpignore="true"
-        value={loading ? "Loading…" : visible ? displayValue : "••••••••••••"}
+        value={visible && !loading ? displayValue : "••••••••••••"}
         onChange={(e) => {
           if (visible && !loading) {
             onValueChange(e.target.value);
@@ -91,16 +93,21 @@ function SecretValueCell({
         }}
         className={cn(
           "min-w-0 max-w-full flex-1 mono-sm",
-          visible ? "bg-muted/50" : "text-security-disc border-transparent bg-muted/50 cursor-pointer select-none",
+          visible && !loading ? "bg-muted/50 value-reveal" : "text-security-disc border-transparent bg-muted/50 cursor-pointer select-none",
           isDirty && "border-amber-400/50 focus:ring-amber-500",
         )}
       />
+      {loading && <span aria-hidden className="pointer-events-none absolute inset-0 rounded-md value-loading" />}
+      </div>
       <button
         onClick={onToggle}
-        className="shrink-0 cursor-pointer text-muted-foreground hover:text-foreground"
-        title={visible ? "Hide value" : "Reveal value"}
+        disabled={loading}
+        className="shrink-0 cursor-pointer text-muted-foreground hover:text-foreground disabled:cursor-default"
+        title={loading ? "Loading value" : visible ? "Hide value" : "Reveal value"}
       >
-        {visible ? (
+        {loading ? (
+          <Spinner className="size-4" />
+        ) : visible ? (
           <EyeOffIcon className="size-4" />
         ) : (
           <EyeIcon className="size-4" />

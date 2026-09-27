@@ -12,6 +12,7 @@ import { useState } from "react";
 import { router, useLoaderData } from "spiceflow/react";
 import { revealEventValueAction } from "../actions.ts";
 import { Badge } from "sigillo-app/src/components/ui/badge";
+import { Spinner } from "sigillo-app/src/components/ui/spinner";
 import { Frame } from "sigillo-app/src/components/ui/frame";
 import {
   Select,
@@ -115,7 +116,7 @@ export function EventLogTable() {
               {events.map((evt) => {
                 const isVisible = visibleValues[evt.id] ?? false;
                 const hasValue = evt.hasValue;
-                const loaded = evt.id in values;
+                const loading = isVisible && !(evt.id in values);
                 return (
                   <TableRow key={evt.id}>
                     <TableCell>
@@ -135,20 +136,26 @@ export function EventLogTable() {
                     <TableCell>
                       {hasValue ? (
                         <div className="flex items-center gap-1.5">
-                          <span
-                            className={cn(
-                              "text-sm mono-sm truncate min-w-0 flex-1",
-                              !isVisible && "text-security-disc",
-                            )}
-                          >
-                            {!isVisible ? "••••••••••••" : loaded ? values[evt.id] : "Loading…"}
+                          <span className="relative min-w-0 flex-1" aria-busy={loading}>
+                            <span
+                              className={cn(
+                                "block text-sm mono-sm truncate",
+                                isVisible && !loading ? "value-reveal" : "text-security-disc",
+                              )}
+                            >
+                              {isVisible && !loading ? values[evt.id] : "••••••••••••"}
+                            </span>
+                            {loading && <span aria-hidden className="pointer-events-none absolute inset-0 rounded-sm value-loading" />}
                           </span>
                           <button
                             onClick={() => void toggleValue(evt.id)}
-                            className="text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
-                            title={isVisible ? "Hide value" : "Reveal value"}
+                            disabled={loading}
+                            className="text-muted-foreground hover:text-foreground cursor-pointer shrink-0 disabled:cursor-default"
+                            title={loading ? "Loading value" : isVisible ? "Hide value" : "Reveal value"}
                           >
-                            {isVisible ? (
+                            {loading ? (
+                              <Spinner className="size-3.5" />
+                            ) : isVisible ? (
                               <EyeOffIcon className="size-3.5" />
                             ) : (
                               <EyeIcon className="size-3.5" />

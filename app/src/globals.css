@@ -180,6 +180,36 @@
   text-security: disc;
 }
 
+/* A masked secret value while it is fetched: a soft sweep over the dots. It
+   fades in late, so a quick fetch shows only the reveal below. */
+.value-loading {
+  background-image: linear-gradient(90deg, transparent 38%, color-mix(in oklab, var(--foreground) 7%, transparent) 50%, transparent 62%);
+  background-size: 200% 100%;
+  animation: value-sweep 1.4s linear infinite, value-fade-in 200ms 150ms both;
+}
+
+/* A fetched value resolves out of a blur: the text only, not its box */
+.value-reveal {
+  animation: value-reveal 320ms ease-out;
+}
+
+@keyframes value-sweep {
+  from { background-position: 150% 0; }
+  to { background-position: -50% 0; }
+}
+
+@keyframes value-fade-in {
+  from { opacity: 0; }
+}
+
+@keyframes value-reveal {
+  from { color: transparent; text-shadow: 0 0 8px var(--foreground); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .value-loading, .value-reveal { animation: none; }
+}
+
 /* Hide scrollbar utility for horizontal tab scrolling on mobile */
 .scrollbar-hide {
   scrollbar-width: none;
