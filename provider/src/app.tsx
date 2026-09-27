@@ -356,7 +356,9 @@ export const app = new Spiceflow()
         request,
         asResponse: false,
       })
-      return Response.redirect(result.url, 302)
+      // When the client still needs consent, result.url is the relative
+      // `/consent?...`, and Response.redirect() only accepts absolute URLs.
+      return Response.redirect(new URL(result.url, url.origin).toString(), 302)
     }
 
     const callbackUrl = new URL('/select-account', url.origin)
