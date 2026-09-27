@@ -473,6 +473,7 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
 
 fn logoutAction(_: Logout.Args, opts: Logout.Options, _: Global.Options) !void {
     const stdout = getStdout();
+    const stderr = getStderr();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
@@ -480,11 +481,40 @@ fn logoutAction(_: Logout.Args, opts: Logout.Options, _: Global.Options) !void {
     const allocator = arena.allocator();
 
     const scope = opts.scope orelse "/";
+
+    // Revoke the session on the server before forgetting it here. Deleting
+    // only the local file left the session valid until it expired, so a copy
+    // of the token (backup, synced dotfiles, a leaked config) kept working.
+    if (try config.getScope(allocator, scope)) |entry| {
+        if (entry.token) |token| {
+            if (isSessionToken(token)) {
+                const revoked = if (client.request(.{
+                    .allocator = allocator,
+                    .method = .POST,
+                    .base_url = entry.api_url orelse "https://sigillo.dev",
+                    .path = "/api/auth/sign-out",
+                    .token = token,
+                    .json_body = "{}", // std.http asserts that a POST has a body
+                })) |res| res.status == 200 else |_| false;
+                if (!revoked) {
+                    try color.yellow(stderr, "warning");
+                    try stderr.writeAll(": could not revoke the session on the server, it stays valid until it expires\n");
+                }
+            }
+        }
+    }
+
     try config.clearScope(allocator, scope);
     try color.green(stdout, "✔");
     try stdout.writeAll(" Logged out from scope ");
     try color.bold(stdout, scope);
     try stdout.writeAll("\n");
+}
+
+/// Device-flow logins save a server session token. `sig_` API tokens are not
+/// sessions; they are revoked from the dashboard, not by signing out.
+fn isSessionToken(token: []const u8) bool {
+    return !std.mem.startsWith(u8, token, "sig_");
 }
 
 fn meAction(_: Me.Args, opts: Me.Options, global: Global.Options) !void {
@@ -3524,6 +3554,11 @@ test "login parses token option" {
 
     try std.testing.expectEqualStrings("sig_test_123", State.token.?);
     try std.testing.expectEqualStrings("/", State.scope.?);
+}
+
+test "logout revokes device-flow sessions but not sig_ API tokens" {
+    try std.testing.expect(isSessionToken("Lr8h3xT0cOVv1pQ9"));
+    try std.testing.expect(!isSessionToken("sig_a1b2c3d4e5f6"));
 }
 
 test "login leaves scope unset when flag is omitted" {
