@@ -54,11 +54,11 @@ export function HeroSection() {
         }}
       >
         <h1
-          className='flex flex-col items-center leading-none text-[40px] sm:text-[56px] md:text-[64px] text-foreground'
+          className='flex flex-col items-center leading-none text-[36px] sm:text-[48px] md:text-[56px] text-foreground'
           style={{ fontFamily: HERO_FONT }}
         >
-          <span>secrets manager for</span>
-          <span>humans &amp; agents</span>
+          <span>Secrets manager,</span>
+          <span>open source Doppler alternative</span>
         </h1>
 
         <div className='flex gap-3 flex-wrap justify-center'>

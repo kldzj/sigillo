@@ -55,7 +55,7 @@
         "groups": [
           {
             "group": "Overview",
-            "icon": "lucide:terminal",
+            "icon": "lucide:info",
             "pages": ["docs/cli/index"]
           },
           {
