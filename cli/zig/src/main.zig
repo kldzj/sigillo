@@ -418,7 +418,10 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
 
     const api_url = resolved.api_url orelse exitNoApiUrl(stderr);
 
-    if (resolved.token) |token| {
+    // Only a token given with --token or SIGILLO_TOKEN is saved as is. The
+    // saved one is not: when it stops working, login must sign in again.
+    const explicit_token = global.token orelse try config.getEnvVarOptional(allocator, "SIGILLO_TOKEN");
+    if (explicit_token) |token| {
         try config.setScope(allocator, scope, .{
             .token = token,
             .api_url = api_url,
