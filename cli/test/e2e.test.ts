@@ -1,6 +1,6 @@
 // End-to-end coverage for the real Sigillo CLI against a logged-in local setup.
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -17,7 +17,9 @@ type CliContext = {
   token: string
   env: NodeJS.ProcessEnv
   tmpDir: string
+  orgId: string
   projectId: string
+  projectName: string
   environmentId: string
   environmentSlug: string
   extraEnvironmentId: string
@@ -48,9 +50,10 @@ describe('sigillo cli e2e', () => {
     expect(me.orgs.length).toBeGreaterThan(0)
 
     const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const projectName = `sigillo-cli-e2e-${runId}`
     const project = await apiRequest({ method: 'POST', path: '/api/v0/projects', context: resolved, body: {
       orgId: me.orgs[0].id,
-      name: `sigillo-cli-e2e-${runId}`,
+      name: projectName,
     } })
     const environment = await apiRequest({ method: 'POST', path: `/api/v0/projects/${project.id}/environments`, context: resolved, body: {
       name: 'E2E',
@@ -92,7 +95,9 @@ describe('sigillo cli e2e', () => {
         SIGILLO_ENVIRONMENT: environment.slug,
       },
       tmpDir,
+      orgId: me.orgs[0].id,
       projectId: project.id,
+      projectName,
       environmentId: environment.id,
       environmentSlug: environment.slug,
       extraEnvironmentId: extraEnvironment.id,
@@ -172,6 +177,68 @@ describe('sigillo cli e2e', () => {
     const deleted = await runCli({ args: ['environments', 'delete', renamedSlug], context: cliContext })
     expect(deleted.status).toBe(0)
     expect(deleted.stdout).toContain(`id: "${cliContext.extraEnvironmentId}"`)
+  }, 60_000)
+
+  test('--project accepts a project name', async () => {
+    const result = await runCli({
+      args: ['run', '--project', cliContext.projectName, '--command', `printf "%s" "${'$'}${cliContext.secretName}" | wc -c`],
+      context: cliContext,
+    })
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.stdout.trim()).toBe(String(cliContext.secretValue.length))
+
+    const slug = `by-name-${Date.now()}`
+    const created = await runCli({
+      args: ['environments', 'create', '--project', cliContext.projectName, '--name', 'By Name', '--slug', slug],
+      context: cliContext,
+    })
+    expect(created.status, created.stderr).toBe(0)
+    const deleted = await runCli({ args: ['environments', 'delete', slug], context: cliContext })
+    expect(deleted.status, deleted.stderr).toBe(0)
+  }, 60_000)
+
+  test('an unknown project is reported as a missing project, not a missing env', async () => {
+    const missingName = `missing-project-${Date.now()}`
+    const byName = await runCli({ args: ['run', '--project', missingName, '--', 'true'], context: cliContext })
+    expect(byName.status).not.toBe(0)
+    expect(byName.stderr).toContain(`project ${missingName} was not found`)
+
+    // Shaped like a project ID, but no such project exists
+    const missingId = '01ZZZZZZZZZZZZZZZZZZZZZZZZ'
+    const byId = await runCli({ args: ['run', '--project', missingId, '--', 'true'], context: cliContext })
+    expect(byId.status).not.toBe(0)
+    expect(byId.stderr).toContain(`project ${missingId} was not found`)
+    expect(byId.stderr).not.toContain('was not found in project')
+  }, 60_000)
+
+  test('a project name shared by two projects is rejected with both IDs', async () => {
+    const twin = await apiRequest({ method: 'POST', path: '/api/v0/projects', context: cliContext, body: {
+      orgId: cliContext.orgId,
+      name: cliContext.projectName,
+    } })
+    try {
+      const result = await runCli({ args: ['run', '--project', cliContext.projectName, '--', 'true'], context: cliContext })
+      expect(result.status).not.toBe(0)
+      expect(result.stderr).toContain(cliContext.projectId)
+      expect(result.stderr).toContain(twin.id)
+    } finally {
+      await apiRequest({ method: 'DELETE', path: `/api/v0/projects/${twin.id}`, context: cliContext }).catch(() => undefined)
+    }
+  }, 60_000)
+
+  test('setup --project accepts a name and saves the project ID', async () => {
+    // Separate home so the real ~/.sigillo/config.json is never touched
+    const home = join(cliContext.tmpDir, 'home')
+    mkdirSync(home)
+    const result = await runCli({
+      args: ['setup', '--project', cliContext.projectName, '--env', cliContext.environmentSlug],
+      context: { ...cliContext, env: { ...cliContext.env, HOME: home, APPDATA: home } },
+    })
+    expect(result.status, result.stderr).toBe(0)
+    const configDir = process.platform === 'win32' ? 'sigillo' : '.sigillo'
+    const saved = JSON.parse(readFileSync(join(home, configDir, 'config.json'), 'utf8'))
+    const scopes = Object.values(saved.scoped) as Array<{ project?: string }>
+    expect(scopes.map((scope) => scope.project)).toEqual([cliContext.projectId])
   }, 60_000)
 
   test('secrets set reads value from piped stdin and strips trailing newline', async () => {
