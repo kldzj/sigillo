@@ -248,12 +248,10 @@ export async function getAuth(request: Request) {
     // OAuth provider. No-op in production since the UI only shows genericOAuth.
     // VITEST var is set in wrangler.test.jsonc, propagated to process.env by nodejs_compat.
     emailAndPassword: { enabled: !!process.env.VITEST },
-    session: {
-      cookieCache: {
-        enabled: true,
-        maxAge: 5 * 60, // 5 minutes — avoids a D1 round-trip on every request
-      },
-    },
+    // No cookie cache: a session ended on the Sessions page must stop working
+    // on its next request, not up to 5 minutes later. It costs one D1 read.
+    // Sessions record the client IP Cloudflare puts in cf-connecting-ip.
+    advanced: { ipAddress: { ipAddressHeaders: ['cf-connecting-ip'] } },
     // The provider's OAuth tokens are encrypted in D1. Rows written before
     // this stay readable: better-auth passes unencrypted values through.
     account: { encryptOAuthTokens: true },
@@ -364,6 +362,37 @@ async function resolveSession(request: Request): Promise<Session | null> {
   // A session made before its user left the allowlist ends with it
   if (!session || !isAllowed(session.user)) return null
   return { userId: session.user.id, user: { id: session.user.id, name: session.user.name, email: session.user.email, emailVerified: session.user.emailVerified } }
+}
+
+// ── Your sessions ───────────────────────────────────────────────────
+// Through better-auth, which only ever touches the signed-in user's own
+// sessions. Its session list carries each session's token, so tokens stay
+// on the server: the page gets ids, and ending one looks its token up again.
+
+export async function listUserSessions(request: Request) {
+  const auth = await getAuth(request)
+  const current = await auth.api.getSession({ headers: request.headers })
+  const sessions = await auth.api.listSessions({ headers: request.headers })
+  return sessions.map((session) => ({
+    id: session.id,
+    createdAt: new Date(session.createdAt).getTime(),
+    // better-auth stores '' when a request has no IP or user agent
+    ipAddress: session.ipAddress || null,
+    userAgent: session.userAgent || null,
+    isCurrent: session.id === current?.session.id,
+  }))
+}
+
+export async function endUserSession(request: Request, sessionId: string) {
+  const auth = await getAuth(request)
+  const sessions = await auth.api.listSessions({ headers: request.headers })
+  const token = sessions.find((session) => session.id === sessionId)?.token
+  if (token) await auth.api.revokeSession({ body: { token }, headers: request.headers })
+}
+
+export async function endOtherUserSessions(request: Request) {
+  const auth = await getAuth(request)
+  await auth.api.revokeOtherSessions({ headers: request.headers })
 }
 
 export async function requireApiSession(request: Request): Promise<Session> {

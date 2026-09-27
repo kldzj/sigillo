@@ -30,6 +30,8 @@ import {
   getEnvironmentAccessError,
   getClaimableAutoJoinDomain,
   deleteOrgMember,
+  endUserSession,
+  endOtherUserSessions,
 } from './db.ts'
 
 async function requireSession() {
@@ -368,6 +370,19 @@ export async function removeOrgMemberAction({ memberId }: { memberId: string }) 
 
   await deleteOrgMember(member)
   return { id: member.id }
+}
+
+// ── Session actions ─────────────────────────────────────────────────
+
+export async function endSessionAction({ sessionId }: { sessionId: string }) {
+  if (!sessionId) throw new Error('Session ID is required')
+  await requireSession()
+  await endUserSession(getActionRequest(), sessionId)
+}
+
+export async function endOtherSessionsAction() {
+  await requireSession()
+  await endOtherUserSessions(getActionRequest())
 }
 
 // ── API Token actions ───────────────────────────────────────────────
