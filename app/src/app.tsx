@@ -328,7 +328,7 @@ export const app = new Spiceflow({ tracer })
       orderBy: { createdAt: 'asc' },
     })
     const firstEnvSlug = environments[0]?.slug || '_'
-    return redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}`)
+    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}`)
   })
 
   .loader('/dash/projects/:projectId/envs/:envSlug', async ({ request, params, redirect }) => {
@@ -455,7 +455,7 @@ export const app = new Spiceflow({ tracer })
       orderBy: { createdAt: 'asc' },
     })
     const firstEnvSlug = environments[0]?.slug || '_'
-    return redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}/event-log`)
+    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}/event-log`)
   })
 
   .loader('/dash/projects/:projectId/envs/:envSlug/event-log', async ({ params, request, redirect }) => {
@@ -644,7 +644,7 @@ export const app = new Spiceflow({ tracer })
     const session = await getSession(request)
     const url = new URL(request.url)
     const redirectTo = safeRedirectPath(url.searchParams.get('redirect'))
-    if (session) return redirect(redirectTo)
+    if (session) throw redirect(redirectTo)
     const { LoginButton } = await import('sigillo-app/src/components/login-button')
     return (
       <ContentFrame className="flex grow justify-center items-center">
@@ -683,7 +683,7 @@ export const app = new Spiceflow({ tracer })
     const existing = await db.query.orgMember.findFirst({
       where: { orgId: invite.orgId, userId: session.userId },
     })
-    if (existing) return redirect(`/dash/orgs/${encodeURIComponent(invite.orgId)}`)
+    if (existing) throw redirect(`/dash/orgs/${encodeURIComponent(invite.orgId)}`)
     const { AcceptInviteButton } = await import('sigillo-app/src/components/accept-invite-button')
     return (
       <ContentFrame className="flex grow justify-center items-center">
