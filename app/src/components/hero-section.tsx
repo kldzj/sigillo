@@ -54,7 +54,7 @@ export function HeroSection() {
         }}
       >
         <h1
-          className='flex flex-col items-center leading-none text-[36px] sm:text-[48px] md:text-[56px] text-foreground'
+          className='flex flex-col items-center leading-none text-[36px] sm:text-[44px] md:text-[52px] text-foreground'
           style={{ fontFamily: HERO_FONT }}
         >
           <span>Secrets manager,</span>
