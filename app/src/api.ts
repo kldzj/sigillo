@@ -44,7 +44,7 @@ import { SECRET_NAME_REGEX, isRenderableSecretName, renderEnvFile } from './lib/
 const fetchLatestSelfhostRelease = memoize({
   namespace: 'selfhost-release',
   fn: async (): Promise<{ version: string; url: string } | null> => {
-    const res = await fetch('https://api.github.com/repos/remorses/sigillo/releases?per_page=30', {
+    const res = await fetch('https://api.github.com/repos/kldzj/sigillo/releases?per_page=30', {
       headers: { 'User-Agent': 'sigillo-app', Accept: 'application/vnd.github+json' },
     })
     if (!res.ok) return null

@@ -5,7 +5,7 @@ import path from 'node:path'
 import { Font } from '@ascii-kit/font'
 
 const outputPath = path.join(import.meta.dirname, '..', 'public', 'install.sh')
-const docsUrl = 'https://github.com/remorses/sigillo'
+const docsUrl = 'https://github.com/kldzj/sigillo'
 const installDirName = '.sigillo'
 
 async function getLogoLines(): Promise<string[]> {
@@ -35,7 +35,7 @@ async function createInstallScript(): Promise<string> {
 set -euo pipefail
 
 APP="sigillo"
-REPO="remorses/sigillo"
+REPO="kldzj/sigillo"
 
 MUTED='\033[0;2m'
 RED='\033[0;31m'

@@ -1,5 +1,5 @@
 {
-  "name": "sigillo",
+  "name": "@kldzj/sigillo",
   "version": "0.13.0",
   "type": "module",
   "description": "CLI for Sigillo — self-hostable secret manager. Manage secrets, environments, and configs from the terminal.",
@@ -22,7 +22,7 @@
     "test": "pnpm exec vitest run",
     "test:e2e": "pnpm exec vitest run test/e2e.test.ts",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "if [ -z \"$CI\" ]; then echo 'ERROR: Do not publish manually. Push to main and let CI handle it. Watch CI at https://github.com/remorses/sigillo/actions' && exit 1; fi"
+    "prepublishOnly": "if [ -z \"$CI\" ]; then echo 'ERROR: Do not publish manually. Push to main and let CI handle it. Watch CI at https://github.com/kldzj/sigillo/actions' && exit 1; fi"
   },
   "keywords": [
     "secrets",
@@ -37,12 +37,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/remorses/sigillo.git",
+    "url": "git+https://github.com/kldzj/sigillo.git",
     "directory": "cli"
   },
-  "homepage": "https://github.com/remorses/sigillo",
+  "homepage": "https://github.com/kldzj/sigillo",
   "bugs": {
-    "url": "https://github.com/remorses/sigillo/issues"
+    "url": "https://github.com/kldzj/sigillo/issues"
   },
   "os": [
     "darwin",
