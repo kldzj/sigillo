@@ -115,15 +115,14 @@ describe('sigillo cli e2e', () => {
   test('lists and downloads secrets from the configured environment', async () => {
     const list = await runCli({ args: ['secrets'], context: cliContext })
     expect(list.status).toBe(0)
-    expect(list.stdout).toContain(`environment_id: "${cliContext.environmentId}"`)
-    expect(list.stdout).toContain(`name: "${cliContext.secretName}"`)
-    expect(list.stdout).toContain(`name: "${cliContext.overlapLongName}"`)
+    // Piped, `secrets` prints one name per line
+    expect(list.stdout.split('\n')).toEqual(expect.arrayContaining([cliContext.secretName, cliContext.overlapLongName]))
     expect(list.stdout).not.toContain(cliContext.secretValue)
 
     const get = await runCli({ args: ['secrets', 'get', cliContext.secretName], context: cliContext })
     expect(get.status).toBe(0)
-    expect(get.stdout).toContain(`name: "${cliContext.secretName}"`)
-    expect(get.stdout).toContain(`value: "${cliContext.secretValue}"`)
+    // Piped, `secrets get` prints just the value
+    expect(get.stdout).toBe(cliContext.secretValue)
 
     const download = await runCli({ args: ['secrets', 'download', '--format', 'json'], context: cliContext })
     expect(download.status).toBe(0)
@@ -145,7 +144,7 @@ describe('sigillo cli e2e', () => {
 
     const get = await runCli({ args: ['secrets', 'get', cliContext.secretName], context: agentContext })
     expect(get.status).toBe(0)
-    expect(get.stdout).toContain(`value: "${cliContext.secretValue}"`)
+    expect(get.stdout).toBe(cliContext.secretValue)
 
     const download = await runCli({ args: ['secrets', 'download', '--format', 'json'], context: agentContext })
     expect(download.status).toBe(0)
@@ -196,7 +195,7 @@ describe('sigillo cli e2e', () => {
 
     const getPlain = await runCli({ args: ['secrets', 'get', plainName], context: cliContext })
     expect(getPlain.status).toBe(0)
-    expect(getPlain.stdout).toContain(`value: "${plainValue}"`) // no \n stored
+    expect(getPlain.stdout).toBe(plainValue) // no \n stored
 
     // Multiline value — trailing newline must NOT be stripped
     const multiName = 'E2E_STDIN_MULTILINE'
@@ -212,9 +211,7 @@ describe('sigillo cli e2e', () => {
 
     const getMulti = await runCli({ args: ['secrets', 'get', multiName], context: cliContext })
     expect(getMulti.status).toBe(0)
-    // Value contains embedded newlines — check it wasn't truncated
-    expect(getMulti.stdout).toContain('line1')
-    expect(getMulti.stdout).toContain('line2')
+    expect(getMulti.stdout).toBe(multiValue)
   }, 60_000)
 
   test('secrets set fans out to multiple envs with repeated -c', async () => {
@@ -230,18 +227,17 @@ describe('sigillo cli e2e', () => {
       context: cliContext,
     })
     expect(set.status, set.stderr).toBe(0)
-    // One result block per env, naming each environment id.
-    expect(set.stdout).toContain(`environment_id: "${cliContext.environmentId}"`)
-    expect(set.stdout).toContain(`environment_id: "${cliContext.extraEnvironmentId}"`)
+    // Piped, `secrets set` prints the new secret's ID once per env
+    expect(set.stdout.trim().split('\n')).toHaveLength(2)
 
     // Both envs must actually hold the value now.
     const getMain = await runCli({ args: ['secrets', 'get', name, '-c', cliContext.environmentSlug], context: cliContext })
     expect(getMain.status).toBe(0)
-    expect(getMain.stdout).toContain(`value: "${value}"`)
+    expect(getMain.stdout).toBe(value)
 
     const getExtra = await runCli({ args: ['secrets', 'get', name, '-c', cliContext.extraEnvironmentSlug], context: cliContext })
     expect(getExtra.status).toBe(0)
-    expect(getExtra.stdout).toContain(`value: "${value}"`)
+    expect(getExtra.stdout).toBe(value)
   }, 60_000)
 
   test('secrets delete fans out to multiple envs with repeated -c', async () => {
@@ -286,11 +282,11 @@ describe('sigillo cli e2e', () => {
     // Friendly env-not-found hint is preserved for the bad slug.
     expect(set.stderr).toContain(bogusSlug)
     // The valid env still got the value despite the failure.
-    expect(set.stdout).toContain(`environment_id: "${cliContext.environmentId}"`)
+    expect(set.stdout.trim().split('\n')).toHaveLength(1)
 
     const getMain = await runCli({ args: ['secrets', 'get', name, '-c', cliContext.environmentSlug], context: cliContext })
     expect(getMain.status).toBe(0)
-    expect(getMain.stdout).toContain(`value: "${value}"`)
+    expect(getMain.stdout).toBe(value)
   }, 60_000)
 
   test('secrets set rejects empty piped value', async () => {
