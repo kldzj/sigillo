@@ -16,10 +16,13 @@ import {
   resolveCloudflareAuth,
   readState,
   writeState,
+  unlockState,
+  changeStatePassphrase,
   type CfClient,
   type DeploymentState,
   type WorkerSettings,
 } from './cloudflare.js'
+import { PASSPHRASE_ENV, passphraseProblem } from './state-file.js'
 import {
   appCompatibilityFlags,
   applyMigrations,
@@ -56,16 +59,37 @@ cli
   .option('--google-client-id [id]', z.string().optional().describe('Google OAuth client ID for the login provider (asked for on a new deployment)'))
   .option('--google-client-secret [secret]', z.string().optional().describe('Google OAuth client secret for the login provider'))
   .option('--allowed-users [list]', z.string().optional().describe('Email addresses and domains that may sign in, comma-separated (empty: anyone)'))
+  .option('--change-passphrase', 'Encrypt ~/.sigillo/selfhost.json with a new passphrase, then stop')
   .option('--yes', 'Accept all defaults (non-interactive)')
   .example('npx @kldzj/sigillo self-host')
   .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
-  .example('CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes --google-client-id xxx --google-client-secret xxx')
+  .example('CLOUDFLARE_API_TOKEN=xxx SIGILLO_SELFHOST_PASSPHRASE=xxx npx @kldzj/sigillo self-host --yes --google-client-id xxx --google-client-secret xxx')
   .example('# Optional, first deploy only: choose the ENCRYPTION_KEY instead of getting a random one')
   .example('SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx @kldzj/sigillo self-host')
   .action(async (options) => {
     clack.intro(colors.bold('sigillo self-host'))
     const releaseLock = acquireLock()
     try {
+      const warning = await unlockState({
+        envPassphrase: process.env[PASSPHRASE_ENV],
+        interactive: interactive(),
+        askPassphrase,
+        askNewPassphrase,
+        confirmEncrypt: async () => {
+          const answer = await clack.confirm({
+            message: 'Encrypt ~/.sigillo/selfhost.json with a passphrase? It holds the keys to your deployments.',
+          })
+          if (clack.isCancel(answer)) process.exit(0)
+          return answer
+        },
+      })
+      if (warning) clack.log.warn(warning)
+      if (options.changePassphrase) {
+        if (!interactive()) throw new Error('--change-passphrase needs a terminal')
+        changeStatePassphrase(await askNewPassphrase())
+        clack.outro('~/.sigillo/selfhost.json is encrypted with the new passphrase')
+        return
+      }
       await selfHost(options)
     } catch (error) {
       clack.log.error(error instanceof Error ? error.message : String(error))
@@ -74,6 +98,25 @@ cli
       releaseLock()
     }
   })
+
+async function askPassphrase(): Promise<string> {
+  const passphrase = await clack.password({ message: 'Passphrase for ~/.sigillo/selfhost.json' })
+  if (clack.isCancel(passphrase)) process.exit(0)
+  return passphrase
+}
+
+// Asked twice. Losing it loses the file, so it belongs in a password manager.
+async function askNewPassphrase(): Promise<string> {
+  clack.log.info('~/.sigillo/selfhost.json holds the keys to your deployments. Choose a passphrase to encrypt it, and keep it in your password manager.')
+  for (;;) {
+    const passphrase = await clack.password({ message: 'New passphrase', validate: (value) => passphraseProblem(value ?? '') })
+    if (clack.isCancel(passphrase)) process.exit(0)
+    const again = await clack.password({ message: 'Repeat it' })
+    if (clack.isCancel(again)) process.exit(0)
+    if (again === passphrase) return passphrase
+    clack.log.warn('The passphrases differ, try again')
+  }
+}
 
 interface SelfHostOptions {
   name?: string
@@ -86,6 +129,7 @@ interface SelfHostOptions {
   googleClientId?: string
   googleClientSecret?: string
   allowedUsers?: string
+  changePassphrase?: boolean
   yes?: boolean
 }
 

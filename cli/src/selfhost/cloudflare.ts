@@ -20,6 +20,7 @@ import os from 'node:os'
 import path from 'node:path'
 import * as clack from '@clack/prompts'
 import { colors, isAgent, openInBrowser } from 'goke'
+import { deriveStateKey, isSealed, openState, sealState, unlockStateFile, type StateKey } from './state-file.js'
 
 const OAUTH_CLIENT_ID = '54d11594-84e4-41aa-b438-e81b8fa78ee7' // wrangler's public PKCE client
 const OAUTH_AUTH_URL = 'https://dash.cloudflare.com/oauth2/auth'
@@ -96,22 +97,62 @@ export interface SelfhostState {
 const STATE_PATH = path.join(os.homedir(), '.sigillo', 'selfhost.json')
 const LOCK_PATH = path.join(os.homedir(), '.sigillo', 'selfhost.lock')
 
-export function readState(): SelfhostState {
+// The key this run unlocked the state file with (see state-file.ts): null
+// when it stays unencrypted, undefined before unlockState ran
+let stateKey: StateKey | null | undefined
+
+function readStateText(): string | null {
   try {
-    return JSON.parse(readFileSync(STATE_PATH, 'utf-8'))
+    return readFileSync(STATE_PATH, 'utf-8')
+  } catch {
+    return null
+  }
+}
+
+// Unlocks the state file for this run, and encrypts an unencrypted one when
+// the owner agrees. Call it before any readState or writeState.
+export async function unlockState(prompts: Omit<Parameters<typeof unlockStateFile>[0], 'text'>): Promise<string | undefined> {
+  const unlocked = await unlockStateFile({ text: readStateText(), ...prompts })
+  stateKey = unlocked.stateKey
+  if (unlocked.seal) {
+    const text = readStateText()
+    writeState(text ? JSON.parse(text) : {})
+  }
+  return unlocked.warning
+}
+
+// Seals the unlocked file again under a new passphrase
+export function changeStatePassphrase(passphrase: string) {
+  const state = readState()
+  stateKey = deriveStateKey(passphrase)
+  writeState(state)
+}
+
+export function readState(): SelfhostState {
+  const text = readStateText()
+  if (text === null) return {}
+  if (isSealed(text)) {
+    if (!stateKey) throw new Error('~/.sigillo/selfhost.json is encrypted and was not unlocked')
+    return JSON.parse(openState(text, stateKey))
+  }
+  try {
+    return JSON.parse(text)
   } catch {
     return {}
   }
 }
 
 // The state file holds Cloudflare tokens, BETTER_AUTH_SECRET, ENCRYPTION_KEY
-// (the DB encryption key) and the provider's secrets: write it 0600, atomically (tmp + rename so
-// a crash can't truncate the only copy), and re-chmod existing files that
-// were created before this hardening.
+// (the DB encryption key) and the provider's secrets: sealed with the owner's
+// passphrase, written 0600, atomically (tmp + rename so a crash can't
+// truncate the only copy), and re-chmod existing files that were created
+// before this hardening.
 export function writeState(state: SelfhostState) {
+  if (stateKey === undefined) throw new Error('~/.sigillo/selfhost.json was not unlocked')
   mkdirSync(path.dirname(STATE_PATH), { recursive: true })
+  const json = JSON.stringify(state, null, 2) + '\n'
   const tmp = `${STATE_PATH}.tmp`
-  writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+  writeFileSync(tmp, stateKey ? sealState(json, stateKey) : json, { mode: 0o600 })
   renameSync(tmp, STATE_PATH)
   chmodSync(STATE_PATH, 0o600)
 }

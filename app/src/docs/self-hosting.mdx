@@ -64,7 +64,19 @@ Re-runs are **idempotent**: only new database migrations are applied, unchanged 
 
 A deployment that already signs in through another provider, such as one made with upstream Sigillo's `self-host` against `auth.sigillo.dev`, keeps that provider on update: switching would give every user a new login.
 
-New deployments get their own `ENCRYPTION_KEY`, separate from the `BETTER_AUTH_SECRET` that signs sessions. Both are saved in `~/.sigillo/selfhost.json` on the machine that ran the command, together with the login provider's secret and the Google client. **Back up that file.** A database backup cannot be decrypted without the key, and if the worker and the file are both lost, `self-host` refuses to reuse that database. Deployments made before there was an `ENCRYPTION_KEY` keep deriving their key from `BETTER_AUTH_SECRET`.
+New deployments get their own `ENCRYPTION_KEY`, separate from the `BETTER_AUTH_SECRET` that signs sessions. Deployments made before there was an `ENCRYPTION_KEY` keep deriving their key from `BETTER_AUTH_SECRET`.
+
+## Your deploy file
+
+`self-host` saves both keys in `~/.sigillo/selfhost.json` on the machine that ran it, together with the login provider's secret, the Google client and a Cloudflare login from the browser. The file is **encrypted with a passphrase** you choose on the first run, and each run asks for it once. Keep the passphrase in your password manager; the file can then stay where it is.
+
+**Back up the file, and don't lose the passphrase.** A database backup cannot be decrypted without the keys, and if the worker and the file are both lost, `self-host` refuses to reuse that database.
+
+Runs without a terminal, such as CI, read the passphrase from `SIGILLO_SELFHOST_PASSPHRASE`. A file from before encryption is encrypted on the next run in a terminal, if you agree, or right away when the variable is set. To change the passphrase:
+
+```bash
+npx @kldzj/sigillo self-host --change-passphrase
+```
 
 ## Your own encryption key
 
@@ -102,12 +114,13 @@ See the full flag reference at [sigillo self-host](./cli/self-host.mdx).
 | `--allowed-users <list>` | Email addresses and domains that may sign in, comma-separated; `''` lets anyone in |
 | `--domain <hostname>` | Attach a custom domain to the app (the zone must be on your account) |
 | `--skip-domain` | Skip the custom domain prompt |
+| `--change-passphrase` | Encrypt `~/.sigillo/selfhost.json` with a new passphrase, then stop |
 | `--yes` | Accept all defaults, non-interactive |
 
 Non-interactive example for **CI or agents**:
 
 ```bash
-CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes \
+CLOUDFLARE_API_TOKEN=xxx SIGILLO_SELFHOST_PASSPHRASE=xxx npx @kldzj/sigillo self-host --yes \
   --google-client-id xxx.apps.googleusercontent.com --google-client-secret xxx
 ```
 
