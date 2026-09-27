@@ -855,6 +855,58 @@ describe('security — cross-user isolation', () => {
   })
 })
 
+// ── Authorization changes take effect immediately ───────────────────
+
+// Membership and environment lookups used to be memoized in the Cache API
+// (5 min + 10 min stale-while-revalidate) and never invalidated, so removing
+// a member or making an environment admin-only took up to 15 minutes to bite.
+describe('authorization changes take effect immediately', () => {
+  let adminToken: string
+  let memberToken: string
+  let memberUserId: string
+  let orgId: string
+  let projectId: string
+  let devEnvId: string
+
+  beforeAll(async () => {
+    const admin = await createTestUser({ name: 'FreshAdmin' })
+    const member = await createTestUser({ name: 'FreshMember' })
+    adminToken = admin.token
+    memberToken = member.token
+    memberUserId = member.user.id
+    const af = authedFetch(adminToken)
+    orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Fresh Org' } })).id
+    projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Fresh Project', orgId } })).id
+    const envs = assertOk(await af('/api/v0/projects/:pid/environments', { params: { pid: projectId } }))
+    devEnvId = envs.environments.find((e) => e.slug === 'dev')!.id
+    await getDb().insert(schema.orgMember).values({ orgId, userId: memberUserId, role: 'member' })
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST', params: { pid: projectId, eid: devEnvId }, body: { name: 'FRESH', value: 'v' },
+    }))
+  })
+
+  test('making an environment admin-only locks members out on the next request', async () => {
+    const mf = authedFetch(memberToken)
+    const read = () => mf('/api/v0/projects/:pid/environments/:eid/secrets', { params: { pid: projectId, eid: devEnvId } })
+    assertOk(await read())
+    // Same update updateEnvironmentAccessRoleAction runs
+    await getDb().update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, devEnvId))
+    assertErrorStatus(await read(), 403)
+  })
+
+  test('a removed member loses org access on the next request', async () => {
+    const mf = authedFetch(memberToken)
+    const createProject = (name: string) => mf('/api/v0/projects', { method: 'POST', body: { name, orgId } })
+    assertOk(await createProject('Before removal'))
+    // Same delete removeOrgMemberAction runs
+    await getDb().delete(schema.orgMember).where(orm.and(
+      orm.eq(schema.orgMember.orgId, orgId),
+      orm.eq(schema.orgMember.userId, memberUserId),
+    ))
+    assertErrorStatus(await createProject('After removal'), 403)
+  })
+})
+
 // ── Secrets derivation — batching & multi-author ────────────────────
 // deriveEnvironmentSecretsAndNames powers the project secrets page loader.
 // It must (1) derive the selected env's secrets, (2) return the union of
@@ -1531,7 +1583,6 @@ describe('environment access roles', () => {
     prodEnvId = envs.environments.find((e) => e.slug === 'prod')!.id
 
     // Restrict prod environment to admin-only BEFORE any secret operations
-    // (resolveEnvironment is memoized, so the accessRole must be set first)
     await db.update(schema.environment)
       .set({ accessRole: 'admin' })
       .where(orm.eq(schema.environment.id, prodEnvId))

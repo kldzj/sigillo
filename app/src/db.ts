@@ -414,15 +414,16 @@ export async function getAccessibleProjectIds(
 
 // ── Org authorization ───────────────────────────────────────────────
 
-const lookupOrgMember = memoize({
-  namespace: 'org-member',
-  fn: async (userId: string, orgId: string): Promise<{ role: string } | null> => {
-    const db = getDb()
-    const member = await db.query.orgMember.findFirst({ where: { userId, orgId } })
-    if (!member) return null
-    return { role: member.role }
-  },
-})
+// Membership and environment lookups are deliberately NOT memoized: they
+// carry authorization data (role, accessRole), and a Cache API entry cannot be
+// invalidated everywhere (it is per data center), so a removed member or a
+// newly admin-only environment would keep working until the entry expired.
+async function lookupOrgMember(userId: string, orgId: string): Promise<{ role: string } | null> {
+  const db = getDb()
+  const member = await db.query.orgMember.findFirst({ where: { userId, orgId } })
+  if (!member) return null
+  return { role: member.role }
+}
 
 // Removes a member together with what let them keep acting in the org on
 // their own: the API tokens they created for its projects, and the invite
@@ -565,25 +566,23 @@ type ResolvedEnvironment = {
   orgId: string | null
 }
 
-export const resolveEnvironment = memoize({
-  namespace: 'resolve-env',
-  fn: async (identifier: string, projectId?: string | null): Promise<ResolvedEnvironment | null> => {
-    const db = getDb()
-    const byId = await db.query.environment.findFirst({
-      where: { id: identifier },
+// Not memoized: carries accessRole (see lookupOrgMember).
+export async function resolveEnvironment(identifier: string, projectId?: string | null): Promise<ResolvedEnvironment | null> {
+  const db = getDb()
+  const byId = await db.query.environment.findFirst({
+    where: { id: identifier },
+    with: { project: { columns: { orgId: true } } },
+  })
+  if (byId) return { ...byId, orgId: byId.project?.orgId ?? null }
+  if (projectId) {
+    const bySlug = await db.query.environment.findFirst({
+      where: { projectId, slug: identifier },
       with: { project: { columns: { orgId: true } } },
     })
-    if (byId) return { ...byId, orgId: byId.project?.orgId ?? null }
-    if (projectId) {
-      const bySlug = await db.query.environment.findFirst({
-        where: { projectId, slug: identifier },
-        with: { project: { columns: { orgId: true } } },
-      })
-      if (bySlug) return { ...bySlug, orgId: bySlug.project?.orgId ?? null }
-    }
-    return null
-  },
-})
+    if (bySlug) return { ...bySlug, orgId: bySlug.project?.orgId ?? null }
+  }
+  return null
+}
 
 export async function getOrgIdForEnvironment(environmentId: string, projectId?: string | null) {
   const env = await resolveEnvironment(environmentId, projectId)
