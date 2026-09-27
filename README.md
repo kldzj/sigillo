@@ -7,7 +7,9 @@
     <br/>
 </div>
 
-Sigillo replaces `.env` files with a **cloud-based secrets manager** you can self-host. Prefix your commands with `sigillo run` and secrets are injected as environment variables, never written to disk.
+Sigillo replaces `.env` files with a **secrets manager you self-host** on Cloudflare. Prefix your commands with `sigillo run` and secrets are injected as environment variables, never written to disk.
+
+> **This is [kldzj/sigillo](https://github.com/kldzj/sigillo)**, a maintained fork of [remorses/sigillo](https://github.com/remorses/sigillo). There is no hosted service: every instance runs on your own Cloudflare account, including its own Google login, so nothing depends on anyone else's servers. The CLI is published as [`@kldzj/sigillo`](https://www.npmjs.com/package/@kldzj/sigillo), and the fork carries fixes that are still waiting upstream.
 
 ```bash
 # instead of this
@@ -20,7 +22,7 @@ sigillo run -- next dev
 ```diagram
                                                  ┌────────────────┐
   sigillo run -- next dev                        │   App Worker   │
-         │                                       │  (sigillo.dev) │
+         │                                       │ (your account) │
          │  1. fetch secrets                     │                │
          │──────────────────────────────────────▶│  decrypt       │
          │  { DB_URL, API_KEY, ... }             │  AES-256-GCM   │
@@ -73,7 +75,7 @@ Secrets are **automatically redacted** from process output so they never leak in
 ## Install skill for AI agents
 
 ```bash
-npx -y skills add remorses/sigillo
+npx -y skills add kldzj/sigillo
 ```
 
 This installs [skills](https://skills.sh) for AI coding agents like Claude Code, Cursor, Windsurf, and others.
@@ -83,33 +85,39 @@ This installs [skills](https://skills.sh) for AI coding agents like Claude Code,
 **curl** (downloads the native binary to `~/.sigillo/bin`):
 
 ```bash
-curl -fsSL https://sigillo.dev/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kldzj/sigillo/main/app/public/install.sh | bash
 ```
 
 **npm**:
 
 ```bash
-npm i -g sigillo
+npm i -g @kldzj/sigillo
 ```
 
 **Run without installing** via npx or bunx:
 
 ```bash
-npx sigillo run -- next dev
-bunx sigillo run -- next dev
+npx @kldzj/sigillo run -- next dev
+bunx @kldzj/sigillo run -- next dev
 ```
 
 ## Quick start
 
-**1. Add your secrets** at [sigillo.dev](https://sigillo.dev) (or your self-hosted instance). Create a project, add environments, and paste in your secrets from the web UI.
-
-**2. Login from the terminal** (opens a browser for device flow authentication):
+**1. Deploy your instance** to your Cloudflare account (see [Self-hosting](#self-hosting)):
 
 ```bash
-sigillo login
+npx @kldzj/sigillo self-host
 ```
 
-**3. Link your project** (picks the default project and environment for this directory):
+**2. Add your secrets** in your instance's web UI. Create a project, add environments, and paste in your secrets.
+
+**3. Login from the terminal** (opens a browser for device flow authentication):
+
+```bash
+sigillo login --api-url https://sigillo.<your-subdomain>.workers.dev
+```
+
+**4. Link your project** (picks the default project and environment for this directory):
 
 ```bash
 sigillo setup
@@ -117,19 +125,19 @@ sigillo setup
 
 This saves the project and environment for the current directory in `~/.sigillo/config.json` (not in the repo). Run it in the project root if you have a single project, or in each subfolder of a monorepo. Since the config is local to your machine, you need to run `sigillo setup` again after cloning the repo on a new machine. Alternatively, skip setup entirely and always pass `--project` and `--env` (or `-c`) flags.
 
-**4. Run your app** with secrets injected as environment variables:
+**5. Run your app** with secrets injected as environment variables:
 
 ```bash
 sigillo run -- next dev
 ```
 
-That's it. No `.env` files, no copy-pasting keys. Go back to [sigillo.dev](https://sigillo.dev) any time to add, edit, or rotate secrets. The next `sigillo run` picks them up automatically.
+That's it. No `.env` files, no copy-pasting keys. Go back to your instance any time to add, edit, or rotate secrets. The next `sigillo run` picks them up automatically.
 
-Migrating from Doppler? See the [Doppler migration guide](https://github.com/remorses/sigillo/blob/main/docs/doppler-migration.md).
+Migrating from Doppler? See the [Doppler migration guide](https://github.com/kldzj/sigillo/blob/main/docs/doppler-migration.md).
 
 ## Setting up a new project
 
-The Quick Start above assumes you already have a project with secrets. This section walks through creating everything from scratch, either from the CLI or the [dashboard](https://sigillo.dev).
+The Quick Start above assumes you already have a project with secrets. This section walks through creating everything from scratch, either from the CLI or your instance's dashboard.
 
 Sigillo organizes secrets into a simple hierarchy:
 
@@ -167,7 +175,7 @@ Organizations group projects and team members together. You need one before crea
 sigillo orgs create --name my-company
 ```
 
-**Dashboard:** Go to [sigillo.dev](https://sigillo.dev) and click "Create Organization" from the sidebar.
+**Dashboard:** Open your instance and click "Create Organization" from the sidebar.
 
 ### Create a project
 
@@ -229,7 +237,7 @@ sigillo secrets set AUTH_SECRET "$(openssl rand -base64 32)" -c preview
 sigillo secrets set AUTH_SECRET "$(openssl rand -base64 32)" -c prod
 ```
 
-**Dashboard:** Open your project at `sigillo.dev/orgs/<ORG_ID>/projects/<PROJECT_ID>/envs/dev` to add or edit secrets from the web UI. You can toggle between environments using the tabs.
+**Dashboard:** Open your project at `<your-instance>/dash/projects/<PROJECT_ID>/envs/dev` to add or edit secrets from the web UI. You can toggle between environments using the tabs.
 
 ### Verify and run
 
@@ -333,7 +341,7 @@ This also works when running `sigillo run` directly with `pnpm exec` or `bunx`:
 
 ```bash
 pnpm exec sigillo run -- vite dev
-bunx sigillo run -- next build
+bunx @kldzj/sigillo run -- next build
 ```
 
 If you installed Sigillo globally (via `curl` or `npm i -g`), running `sigillo run` outside a package manager script means `node_modules/.bin` is **not** in `PATH`. In that case, use the full path or prefix with `npx`/`pnpm exec` inside the child command, or run Sigillo from a package script instead.
@@ -387,9 +395,9 @@ Most commands that resolve auth, project, or environment from config accept thes
 | Flag | Env var | Description |
 |---|---|---|
 | `--token <sig_xxx>` | `SIGILLO_TOKEN` | Bearer token for auth |
-| `--api-url <url>` | `SIGILLO_API_URL` | API endpoint (default: `https://sigillo.dev`) |
+| `--api-url <url>` | `SIGILLO_API_URL` | Your Sigillo instance (no default; saved by `sigillo login --api-url`) |
 | `--env <slug>` / `--config <slug>` / `-c <slug>` | `SIGILLO_ENVIRONMENT` | Environment slug (e.g. `dev`, `prod`) |
-| `--project <id>` / `-p <id>` | `SIGILLO_PROJECT` | Project ID override |
+| `--project <id>` / `-p <id>` | `SIGILLO_PROJECT` | Project ID or name override |
 
 ### Download formats
 
@@ -510,11 +518,12 @@ Use an API token for non-interactive environments:
 ```yaml
 - name: Run with secrets
   env:
+    SIGILLO_API_URL: ${{ vars.SIGILLO_API_URL }}
     SIGILLO_TOKEN: ${{ secrets.SIGILLO_TOKEN }}
     SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}
     SIGILLO_ENVIRONMENT: ${{ vars.SIGILLO_ENVIRONMENT }}
   run: |
-    npx sigillo run -- next build
+    npx @kldzj/sigillo run -- next build
 ```
 
 ### .NET
@@ -529,36 +538,35 @@ sigillo secrets download --format dotnet-json > appsettings.Secrets.json
 
 ## Self-hosting
 
-Sigillo runs on **Cloudflare Workers + D1**. You only need to deploy the **App Worker**. The Provider Worker (authentication) is optional because your self-hosted instance can use the hosted provider at `auth.sigillo.dev` by default.
+Sigillo runs on **Cloudflare Workers + D1**. Every instance is two Workers on your own account: the **App Worker** with your secrets, and its own **Provider Worker** for Google sign-in. Nothing depends on anyone else's servers.
 
 ```diagram
-Your Cloudflare account              Sigillo Cloud
+Your Cloudflare account
 ┌──────────────────────┐             ┌──────────────────────┐
 │   App Worker         │   OAuth     │  Provider Worker     │
-│   (your secrets)     │────────────▶│  (auth.sigillo.dev)  │
+│   (your secrets)     │────────────▶│  (your login)        │
 │                      │    PKCE     │                      │
-│  You deploy this     │◀────────────│  Already running     │
+│   <name>             │◀────────────│   <name>-auth        │──▶ Google
 └──────────────────────┘             └──────────────────────┘
 ```
-
-This means you don't need Google OAuth credentials and the deployment is a single worker.
 
 ### One command deploy
 
 The fastest way to self-host — no git clone, no build step:
 
 ```bash
-npx sigillo self-host
+npx @kldzj/sigillo self-host
 ```
 
-It logs into Cloudflare (reusing your `wrangler login` when present, or an OAuth browser flow, or a pre-filled API token link that works over SSH), creates the Worker and D1 database, applies migrations, and prints your instance URL. **Re-run the same command anytime to update** — only new migrations are applied and your auth secret is never rotated.
+It logs into Cloudflare (reusing your `wrangler login` when present, or an OAuth browser flow, or a pre-filled API token link that works over SSH), deploys both Workers with their D1 databases, applies migrations, and prints your instance URL. A new deployment needs a **Google OAuth client** for its login provider: the command prints the redirect URI to register at [Google Cloud credentials](https://console.cloud.google.com/apis/credentials) and asks for the client ID and secret. **Re-run the same command anytime to update** — only new migrations are applied and no secret is ever rotated.
 
 ```bash
 # non-interactive (CI/agents)
-CLOUDFLARE_API_TOKEN=xxx npx sigillo self-host --yes
+CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes \
+  --google-client-id xxx.apps.googleusercontent.com --google-client-secret xxx
 
 # custom worker name and domain
-npx sigillo self-host --name sigillo --domain secrets.acme.com
+npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com
 ```
 
 ### Deploy from source
@@ -566,37 +574,11 @@ npx sigillo self-host --name sigillo --domain secrets.acme.com
 1. Clone the repo and install dependencies:
 
 ```bash
-git clone https://github.com/remorses/sigillo.git
+git clone https://github.com/kldzj/sigillo.git
 cd sigillo && pnpm install
 ```
 
-2. Create `app/.dev.vars` with your secrets:
-
-```
-BETTER_AUTH_SECRET=<any random string>
-ENCRYPTION_KEY=<output of: openssl rand -base64 32>
-```
-
-3. Run locally:
-
-```bash
-pnpm --dir app dev
-```
-
-4. Deploy:
-
-```bash
-pnpm --dir app deployment            # deploy preview worker
-pnpm --dir app deployment:prod       # deploy production worker
-```
-
-The app auto-registers with `auth.sigillo.dev` on first request via [RFC 7591](https://tools.ietf.org/html/rfc7591) dynamic client registration. No Google OAuth credentials needed, no manual setup.
-
-### Self-hosting the provider (optional)
-
-By default, your self-hosted app uses `auth.sigillo.dev` for authentication. If you want a fully air-gapped setup with no dependency on Sigillo cloud, you can deploy the Provider Worker yourself.
-
-1. Create `provider/.dev.vars` (requires Google OAuth credentials):
+2. Create `provider/.dev.vars` (requires a Google OAuth client with `<provider-url>/api/auth/callback/google` as redirect URI):
 
 ```
 BETTER_AUTH_SECRET=<any random string>
@@ -604,24 +586,23 @@ GOOGLE_CLIENT_ID=<your Google OAuth client ID>
 GOOGLE_CLIENT_SECRET=<your Google OAuth client secret>
 ```
 
-2. Deploy the provider:
+3. Create `app/.dev.vars`:
+
+```
+BETTER_AUTH_SECRET=<any random string>
+ENCRYPTION_KEY=<output of: openssl rand -base64 32>
+```
+
+4. Run both locally:
 
 ```bash
-pnpm --dir provider deployment       # deploy preview
-pnpm --dir provider deployment:prod  # deploy production
+pnpm --dir provider dev
+pnpm --dir app dev
 ```
 
-3. Point the app at your self-hosted provider by changing `PROVIDER_URL` in `app/wrangler.jsonc`:
+5. To deploy, add an environment for your account to `provider/wrangler.jsonc` and `app/wrangler.jsonc` (your D1 databases, `BETTER_AUTH_URL` for the provider and `PROVIDER_URL` for the app, plus the `global_fetch_strictly_public` compatibility flag on the app when both Workers share a workers.dev subdomain), then deploy the provider first and the app second.
 
-```jsonc
-{
-  "vars": {
-    "PROVIDER_URL": "https://your-provider.your-domain.com"
-  }
-}
-```
-
-Then redeploy the app. It will auto-register with your provider on the next request.
+The app registers itself with its provider on first request via [RFC 7591](https://tools.ietf.org/html/rfc7591) dynamic client registration.
 
 ## How it works
 
@@ -649,7 +630,7 @@ Sigillo is two Cloudflare Workers in a monorepo, each backed by a D1 (SQLite) da
         ▼
 ┌──────────────────────┐         ┌──────────────────────┐
 │   App Worker         │         │  Provider Worker     │
-│   (self-hosted)      │────────▶│  (auth.sigillo.dev)  │
+│   (self-hosted)      │────────▶│  (self-hosted)       │
 │                      │  OAuth  │                      │
 │  • Secrets CRUD      │  PKCE   │  • Google login      │
 │  • AES-256-GCM       │         │  • OAuth2 / OIDC     │
@@ -664,7 +645,7 @@ Sigillo is two Cloudflare Workers in a monorepo, each backed by a D1 (SQLite) da
 
 **App**: the secret manager you self-host. Handles secrets encryption, organizations, projects, environments, and the web UI.
 
-**Provider**: centralized OAuth provider at `auth.sigillo.dev`. Self-hosted instances register automatically via [RFC 7591](https://tools.ietf.org/html/rfc7591) dynamic client registration as public PKCE clients (no client secret needed).
+**Provider**: the instance's own OAuth provider, deployed next to the app. The app registers itself automatically via [RFC 7591](https://tools.ietf.org/html/rfc7591) dynamic client registration as a public PKCE client (no client secret needed).
 
 </details>
 
@@ -672,7 +653,7 @@ Sigillo is two Cloudflare Workers in a monorepo, each backed by a D1 (SQLite) da
 <summary><b>Auth flow</b></summary>
 
 ```diagram
-CLI/Agent                    App (self-hosted)              Provider (auth.sigillo.dev)
+CLI/Agent                    App (self-hosted)              Provider (self-hosted)
    │                              │                                │
    │  POST /api/auth/device/code  │                                │
    │─────────────────────────────▶│                                │
@@ -772,23 +753,23 @@ The app exposes a full REST API with OpenAPI documentation at `/api/v0/openapi.j
 ```bash
 # list secrets
 curl -H "Authorization: Bearer sig_xxx" \
-  https://sigillo.dev/api/v0/projects/{projectId}/environments/{environmentId}/secrets
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets
 
 # set a secret
 curl -X POST -H "Authorization: Bearer sig_xxx" \
   -H "Content-Type: application/json" \
   -d '{"name": "API_KEY", "value": "sk-live-xxx"}' \
-  https://sigillo.dev/api/v0/projects/{projectId}/environments/{environmentId}/secrets
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets
 
 # bulk download as JSON
 curl -H "Authorization: Bearer sig_xxx" \
-  https://sigillo.dev/api/v0/projects/{projectId}/environments/{environmentId}/secrets/download?format=json
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets/download?format=json
 
 # bulk set
 curl -X PUT -H "Authorization: Bearer sig_xxx" \
   -H "Content-Type: application/json" \
   -d '{"secrets": {"KEY1": "val1", "KEY2": "val2"}}' \
-  https://sigillo.dev/api/v0/projects/{projectId}/environments/{environmentId}/secrets
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets
 ```
 
 </details>

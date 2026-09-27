@@ -12,7 +12,7 @@ description: >
 ALWAYS fetch the latest README before doing anything else. NEVER skip this:
 
 ```bash
-curl -s https://raw.githubusercontent.com/remorses/sigillo/main/README.md
+curl -s https://raw.githubusercontent.com/kldzj/sigillo/main/README.md
 ```
 
 **NEVER pipe through `head`, `tail`, `sed -n`, or any truncating command.** Read the full output — agent rules and integration patterns are near the bottom and will be missed if truncated.
@@ -28,7 +28,7 @@ sigillo --help
 If a flag or command documented here is missing from `--help`, the installed binary is likely outdated. Update before proceeding:
 
 ```bash
-npm i -g sigillo@latest
+npm i -g @kldzj/sigillo@latest
 ```
 
 If sigillo is symlinked to a local dev build (check with `which sigillo`), rebuild from source instead:
@@ -48,18 +48,18 @@ This mirrors the Doppler workflow: check auth → link project → list secrets 
 sigillo me
 ```
 
-Shows current user and organizations. If it errors with "not logged in", run `sigillo login` first.
+Shows current user and organizations. If it errors with "not logged in" or "no Sigillo server configured", run `sigillo login` first. Every instance is self-hosted, so ask the user for their instance URL if you don't know it.
 
 **2. Login (opens browser device flow):**
 
 ```bash
-sigillo login
+sigillo login --api-url https://<instance>
 ```
 
 For non-interactive/CI environments, save a token directly:
 
 ```bash
-sigillo login --token sig_xxx --scope .
+sigillo login --api-url https://<instance> --token sig_xxx --scope .
 ```
 
 **3. Link the current directory to a project and environment:**
@@ -132,17 +132,17 @@ sigillo secrets get DATABASE_URL -c preview  # override for a single secrets com
 Deploy Sigillo to the user's own Cloudflare account with one command (npm package only, needs Node.js):
 
 ```bash
-npx sigillo self-host
+npx @kldzj/sigillo self-host
 ```
 
-It provisions a Worker + D1 database, applies migrations, and prints the instance URL. Cloudflare auth is resolved automatically: `CLOUDFLARE_API_TOKEN` env → existing `wrangler login` → OAuth browser flow → pre-filled API token creation link (works over SSH). Re-running the command is idempotent and deploys the latest release.
+It provisions two Workers with their D1 databases, the app and its own login provider (Google sign-in), applies migrations, and prints the instance URL. A new deployment needs a Google OAuth client: the command prints the redirect URI to register and asks for the client ID and secret, or takes `--google-client-id` and `--google-client-secret`. Cloudflare auth is resolved automatically: `CLOUDFLARE_API_TOKEN` env → existing `wrangler login` → OAuth browser flow → pre-filled API token creation link (works over SSH). Re-running the command is idempotent and deploys the latest release.
 
 ```bash
 # non-interactive (agents/CI)
-CLOUDFLARE_API_TOKEN=xxx npx sigillo self-host --yes
+CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes --google-client-id xxx --google-client-secret xxx
 
 # custom worker name and custom domain
-npx sigillo self-host --name sigillo --domain secrets.acme.com
+npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com
 ```
 
 Point the CLI at the deployed instance with `sigillo login --api-url <url>`.
@@ -236,10 +236,11 @@ After setup, `sigillo run` in any subdirectory uses that project + environment a
 ```yaml
 - name: Run with secrets
   env:
+    SIGILLO_API_URL: ${{ vars.SIGILLO_API_URL }}
     SIGILLO_TOKEN: ${{ secrets.SIGILLO_TOKEN }}
     SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}
     SIGILLO_ENVIRONMENT: production
-  run: npx sigillo run -- pnpm build
+  run: npx @kldzj/sigillo run -- pnpm build
 ```
 
 ### Redaction details
@@ -267,10 +268,10 @@ sigillo secrets set DATABASE_URL ""
 This creates the secret as a placeholder. The CLI shows `empty: true` when listing secrets so empty placeholders are visible. After setting the placeholder, always print the dashboard URL so the user can fill it in:
 
 ```
-https://sigillo.dev/dash/projects/<PROJECT_ID>/envs/<ENV_SLUG>
+<INSTANCE_URL>/dash/projects/<PROJECT_ID>/envs/<ENV_SLUG>
 ```
 
-Replace `<PROJECT_ID>` and `<ENV_SLUG>` with the actual values from the current setup. To find them:
+Replace `<INSTANCE_URL>` with the URL the CLI is logged in to (the `--api-url` of `sigillo login`), and `<PROJECT_ID>` and `<ENV_SLUG>` with the actual values from the current setup. To find them:
 
 ```bash
 sigillo secrets
@@ -351,15 +352,15 @@ sigillo secrets set BETTER_AUTH_SECRET "$(openssl rand -base64 32)" -c prod
 After setup, tell the user to open the Sigillo web UI to fill in empty secrets. The URL pattern is:
 
 ```
-https://sigillo.dev/dash/projects/<PROJECT_ID>/envs/<ENV_SLUG>
+<INSTANCE_URL>/dash/projects/<PROJECT_ID>/envs/<ENV_SLUG>
 ```
 
-Always print the actual URLs with real IDs so the user can click them:
+Always print the actual URLs with the real instance URL and IDs so the user can click them:
 
 ```
-https://sigillo.dev/dash/projects/01DEF.../envs/dev
-https://sigillo.dev/dash/projects/01DEF.../envs/preview
-https://sigillo.dev/dash/projects/01DEF.../envs/prod
+https://sigillo.example.com/dash/projects/01DEF.../envs/dev
+https://sigillo.example.com/dash/projects/01DEF.../envs/preview
+https://sigillo.example.com/dash/projects/01DEF.../envs/prod
 ```
 
 ### 7. Verify

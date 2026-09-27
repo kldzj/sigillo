@@ -32,7 +32,7 @@ function XIcon({ size = 12 }: { size?: number }) {
   )
 }
 
-const GITHUB_URL = 'https://github.com/remorses/sigillo'
+const GITHUB_URL = 'https://github.com/kldzj/sigillo'
 const X_URL = 'https://x.com/__morse'
 
 export function HeroSection() {

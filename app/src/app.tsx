@@ -864,7 +864,7 @@ function Navbar({ mobileMenuSlot }: { mobileMenuSlot?: React.ReactNode }) {
           </div>
           <div className="hidden md:flex items-center gap-3">
             <a
-              href="https://github.com/remorses/sigillo/issues/new"
+              href="https://github.com/kldzj/sigillo/issues/new"
               target="_blank"
               rel="noopener noreferrer"
               className="text-sm text-muted-foreground hover:text-foreground transition-colors"
@@ -872,7 +872,7 @@ function Navbar({ mobileMenuSlot }: { mobileMenuSlot?: React.ReactNode }) {
               feedback
             </a>
             <a
-              href="https://github.com/remorses/sigillo"
+              href="https://github.com/kldzj/sigillo"
               target="_blank"
               rel="noopener noreferrer"
               className="text-sm text-muted-foreground hover:text-foreground transition-colors"
@@ -909,7 +909,7 @@ async function Footer() {
             © {new Date().getFullYear()} Sigillo
           </span>
           <a
-            href="https://github.com/remorses/sigillo"
+            href="https://github.com/kldzj/sigillo"
             target="_blank"
             rel="noopener noreferrer"
             className="text-muted-foreground hover:text-foreground transition-colors"
