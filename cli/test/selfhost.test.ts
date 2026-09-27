@@ -5,10 +5,10 @@
 
 import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
+import { CloudflareApiError, parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
 import {
-  appCompatibilityFlags, assertNoStoredSecrets, fetchReleaseInfo, isSigilloProviderWorker, parseBundle, providerSecretsForDeploy,
-  resolveDeploySecrets, uploadWorker,
+  appCompatibilityFlags, assertNoStoredSecrets, fetchReleaseInfo, isSigilloProviderWorker, normalizeAllowedUsers, parseBundle,
+  providerSecretsForDeploy, resolveDeploySecrets, updateAllowedUsersSecret, uploadWorker,
   type SelfhostBundle, type WorkerBundle,
 } from '../src/selfhost/deploy.js'
 
@@ -332,5 +332,39 @@ describe('resolveDeploySecrets', () => {
         },
       }
     `)
+  })
+})
+
+describe('allowed users', () => {
+  test('the list is stored lowercase, without spaces or repeats', () => {
+    expect(normalizeAllowedUsers(' Acme.com,ops@Partner.io  acme.com,, ')).toBe('acme.com,ops@partner.io')
+    expect(normalizeAllowedUsers('')).toBe('')
+  })
+
+  test('anything but an email address or a domain is refused', () => {
+    expect(() => normalizeAllowedUsers('acme.com,localhost,@acme.com,ops@,x@y')).toThrow('Not an email address or a domain: localhost, @acme.com, ops@, x@y')
+  })
+
+  test('an existing worker only gets a changed list', async () => {
+    const calls: string[] = []
+    const client = {
+      async putWorkerSecret({ scriptName, name, text }: { scriptName: string; name: string; text: string }) { calls.push(`put ${scriptName} ${name}=${text}`) },
+      async deleteWorkerSecret({ scriptName, name }: { scriptName: string; name: string }) {
+        calls.push(`delete ${scriptName} ${name}`)
+        if (scriptName === 'gone') throw new CloudflareApiError({ status: 404, errors: [], context: 'secrets' })
+      },
+    } as unknown as CfClient
+    const run = (list: string, saved: string | undefined, scriptName = 'sigillo') =>
+      updateAllowedUsersSecret({ client, accountId: 'acc', scriptName, list, saved })
+    await run('acme.com', 'acme.com')
+    await run('', undefined)
+    await run('acme.com,ops@partner.io', 'acme.com')
+    await run('', 'acme.com')
+    await run('', 'acme.com', 'gone')
+    expect(calls).toEqual([
+      'put sigillo ALLOWED_USERS=acme.com,ops@partner.io',
+      'delete sigillo ALLOWED_USERS',
+      'delete gone ALLOWED_USERS',
+    ])
   })
 })

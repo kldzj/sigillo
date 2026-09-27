@@ -12,6 +12,7 @@ import { Head } from 'spiceflow/react'
 import { getAuth, getDb } from './db.ts'
 import { ConsentButtons } from './components/consent-buttons.tsx'
 import { SigilloLogo } from 'sigillo-app/src/components/logo.tsx'
+import { loginErrorMessage } from 'sigillo-app/src/lib/utils.ts'
 
 
 // Renders OAuth/OIDC errors that BetterAuth redirects to the root in production.
@@ -19,6 +20,8 @@ import { SigilloLogo } from 'sigillo-app/src/components/logo.tsx'
 // in production mode (no customizeDefaultErrorPage set), so the root route and /error
 // route both need to handle these query params and show a human-readable error page.
 function ErrorScreen({ error, errorDescription }: { error: string; errorDescription: string | null }) {
+  // A refusal by ALLOWED_USERS gets its explanation instead of a code
+  const refusal = error.toLowerCase() === 'user_not_allowed' ? loginErrorMessage(error) : null
   return (
     <main className="flex min-h-screen items-center justify-center bg-background px-4 py-10 sm:px-6">
       <section className="w-full max-w-sm">
@@ -31,9 +34,9 @@ function ErrorScreen({ error, errorDescription }: { error: string; errorDescript
 
         <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950">
           <p className="text-sm font-medium text-red-800 dark:text-red-200">
-            {error.replace(/_/g, ' ')}
+            {refusal ?? error.replace(/_/g, ' ')}
           </p>
-          {errorDescription && (
+          {errorDescription && !refusal && (
             <p className="mt-1 text-sm text-red-600 dark:text-red-400">
               {errorDescription}
             </p>

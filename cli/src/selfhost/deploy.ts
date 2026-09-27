@@ -17,7 +17,7 @@
 import { gunzipSync } from 'node:zlib'
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { CfClient, type DeploymentState } from './cloudflare.js'
+import { CfClient, CloudflareApiError, type DeploymentState } from './cloudflare.js'
 
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/kldzj/sigillo/releases?per_page=30'
 export const BUNDLE_ASSET_NAME = 'sigillo-selfhost-bundle.json.gz'
@@ -307,6 +307,41 @@ export function resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv }: 
     encryptionKey: encryptionKey ?? randomBytes(32).toString('base64'),
     generated: true,
   }
+}
+
+// ALLOWED_USERS as self-host stores it: lowercase, no spaces or repeats, and
+// only entries the app can match, an email address or a domain.
+export function normalizeAllowedUsers(input: string): string {
+  const entries = [...new Set(input.split(/[\s,]+/).map((entry) => entry.toLowerCase()).filter(Boolean))]
+  const domain = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/
+  const invalid = entries.filter((entry) => {
+    const at = entry.lastIndexOf('@')
+    return at === -1 ? !domain.test(entry) : at === 0 || !domain.test(entry.slice(at + 1))
+  })
+  if (invalid.length > 0) throw new Error(`Not an email address or a domain: ${invalid.join(', ')}`)
+  return entries.join(',')
+}
+
+// A worker that already exists keeps its secrets (keep_bindings), so a
+// changed list is set or removed on its own. A new worker gets it with its
+// first upload instead.
+export async function updateAllowedUsersSecret({ client, accountId, scriptName, list, saved }: {
+  client: CfClient
+  accountId: string
+  scriptName: string
+  list: string
+  /** what the last run set, unset for deployments older than the list */
+  saved?: string
+}): Promise<void> {
+  if (list === (saved ?? '')) return
+  if (list) {
+    await client.putWorkerSecret({ accountId, scriptName, name: 'ALLOWED_USERS', text: list })
+    return
+  }
+  await client.deleteWorkerSecret({ accountId, scriptName, name: 'ALLOWED_USERS' }).catch((error) => {
+    // Removed by hand already: nothing left to do
+    if (!(error instanceof CloudflareApiError && error.status === 404)) throw error
+  })
 }
 
 // Same rule as resolveDeploySecrets, for the provider: never rotate its

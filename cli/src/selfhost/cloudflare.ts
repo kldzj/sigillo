@@ -73,7 +73,7 @@ export interface DeploymentState {
   workerName: string
   databaseId: string
   betterAuthSecret?: string
-  /** Only set when the user passed SIGILLO_ENCRYPTION_KEY on first deploy */
+  /** Every new deployment's own key (random or SIGILLO_ENCRYPTION_KEY); unset for older ones that derive it */
   encryptionKey?: string
   /** the deployment's own login provider (unset when it uses another one) */
   providerWorkerName?: string
@@ -84,6 +84,8 @@ export interface DeploymentState {
   deployedVersion?: string
   url?: string
   customDomain?: string
+  /** ALLOWED_USERS on both workers: email addresses and domains, comma-separated; empty lets anyone in */
+  allowedUsers?: string
 }
 
 export interface SelfhostState {
@@ -309,6 +311,22 @@ export class CfClient {
       method: 'PUT',
       path: `/accounts/${accountId}/workers/subdomain`,
       body: { subdomain },
+    })
+  }
+
+  // One secret on a deployed worker, without uploading it again
+  putWorkerSecret({ accountId, scriptName, name, text }: { accountId: string; scriptName: string; name: string; text: string }) {
+    return this.fetch<unknown>({
+      method: 'PUT',
+      path: `/accounts/${accountId}/workers/scripts/${scriptName}/secrets`,
+      body: { name, text, type: 'secret_text' },
+    })
+  }
+
+  deleteWorkerSecret({ accountId, scriptName, name }: { accountId: string; scriptName: string; name: string }) {
+    return this.fetch<unknown>({
+      method: 'DELETE',
+      path: `/accounts/${accountId}/workers/scripts/${scriptName}/secrets/${name}`,
     })
   }
 

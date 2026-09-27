@@ -28,8 +28,10 @@ import {
   fetchReleaseInfo,
   isSigilloProviderWorker,
   isSigilloWorker,
+  normalizeAllowedUsers,
   providerSecretsForDeploy,
   resolveDeploySecrets,
+  updateAllowedUsersSecret,
   loadBundle,
   syncAssets,
   uploadWorker,
@@ -53,6 +55,7 @@ cli
   .option('--skip-domain', 'Skip the custom domain prompt')
   .option('--google-client-id [id]', z.string().optional().describe('Google OAuth client ID for the login provider (asked for on a new deployment)'))
   .option('--google-client-secret [secret]', z.string().optional().describe('Google OAuth client secret for the login provider'))
+  .option('--allowed-users [list]', z.string().optional().describe('Email addresses and domains that may sign in, comma-separated (empty: anyone)'))
   .option('--yes', 'Accept all defaults (non-interactive)')
   .example('npx @kldzj/sigillo self-host')
   .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
@@ -82,6 +85,7 @@ interface SelfHostOptions {
   skipDomain?: boolean
   googleClientId?: string
   googleClientSecret?: string
+  allowedUsers?: string
   yes?: boolean
 }
 
@@ -156,6 +160,10 @@ async function selfHost(options: SelfHostOptions) {
 
   // Validate before touching anything: a bad SIGILLO_ENCRYPTION_KEY must fail early.
   const { generated, ...secrets } = resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv: process.env.SIGILLO_ENCRYPTION_KEY })
+  // Who may sign in: the flag wins, then the saved list; a new deployment asks
+  const allowedUsers = normalizeAllowedUsers(
+    options.allowedUsers ?? saved?.allowedUsers ?? (workerExists ? '' : await askAllowedUsers(options)),
+  )
 
   // ── workers.dev subdomain ─────────────────────────────────────────
   // Resolved before any upload: both workers are told the provider's URL.
@@ -186,7 +194,7 @@ async function selfHost(options: SelfHostOptions) {
   const currentProviderUrl = plainTextBinding(appSettings, 'PROVIDER_URL')
   const provider = currentProviderUrl && currentProviderUrl !== ownProviderUrl
     ? undefined
-    : await deployProvider({ client, accountId, bundle, options, saved, spinner, workerName: providerWorkerName, url: ownProviderUrl })
+    : await deployProvider({ client, accountId, bundle, options, saved, spinner, workerName: providerWorkerName, url: ownProviderUrl, allowedUsers })
   if (!provider) {
     clack.log.warn(`This deployment signs in through ${currentProviderUrl} — keeping it, since a new provider would change every user's login`)
   }
@@ -200,6 +208,8 @@ async function selfHost(options: SelfHostOptions) {
     betterAuthSecret: secrets.betterAuthSecret ?? saved?.betterAuthSecret,
     encryptionKey: secrets.encryptionKey ?? saved?.encryptionKey,
     ...provider,
+    // Recorded once both workers have the new list, so a failed run retries
+    allowedUsers: saved?.allowedUsers,
     deployedVersion: saved?.deployedVersion,
     url: workersDevUrl,
     customDomain: saved?.customDomain,
@@ -228,14 +238,22 @@ async function selfHost(options: SelfHostOptions) {
     assetsJwt,
     vars: { PROVIDER_URL: providerUrl },
     secrets: secrets.betterAuthSecret
-      ? { BETTER_AUTH_SECRET: secrets.betterAuthSecret, ...(secrets.encryptionKey ? { ENCRYPTION_KEY: secrets.encryptionKey } : {}) }
+      ? {
+          BETTER_AUTH_SECRET: secrets.betterAuthSecret,
+          ...(secrets.encryptionKey ? { ENCRYPTION_KEY: secrets.encryptionKey } : {}),
+          ...(allowedUsers ? { ALLOWED_USERS: allowedUsers } : {}),
+        }
       : undefined,
     compatibilityFlags: appCompatibilityFlags(bundle.app.compatibilityFlags),
   })
+  if (!secrets.betterAuthSecret) {
+    await updateAllowedUsersSecret({ client, accountId, scriptName: workerName, list: allowedUsers, saved: saved?.allowedUsers })
+  }
   await client.enableWorkersDev(accountId, workerName)
   spinner.stop('Worker deployed')
 
   deployment.deployedVersion = bundle.version
+  deployment.allowedUsers = allowedUsers
   writeState({ ...readState(), deployments: { ...readState().deployments, [stateKey]: deployment } })
 
   spinner.start('Waiting for the deployment to become healthy')
@@ -257,13 +275,34 @@ async function selfHost(options: SelfHostOptions) {
       `${colors.bold('Version:')}    v${bundle.version}`,
       '',
       `${colors.bold('Login:')}      ${providerUrl} (Google)`,
+      `${colors.bold('Sign-in:')}    ${allowedUsers ? allowedUsers.split(',').join(', ') : 'anyone with a Google account'}`,
       `Point the CLI at your instance:  sigillo login --api-url ${primaryUrl}`,
       '',
       'Re-run `npx @kldzj/sigillo self-host` anytime to deploy updates.',
     ].join('\n'),
     'Sigillo is self-hosted 🎉',
   )
+  if (!allowedUsers) {
+    clack.log.warn('Anyone with a Google account can sign in. Limit it: npx @kldzj/sigillo self-host --allowed-users acme.com')
+  }
   clack.outro('Done')
+}
+
+async function askAllowedUsers(options: SelfHostOptions): Promise<string> {
+  if (!interactive() || options.yes) return ''
+  const input = await clack.text({
+    message: 'Who may sign in? Email addresses and domains, comma-separated',
+    placeholder: 'acme.com, ops@partner.io (empty: anyone with a Google account)',
+    validate: (value) => {
+      try {
+        normalizeAllowedUsers(value ?? '')
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error)
+      }
+    },
+  })
+  if (clack.isCancel(input)) process.exit(0)
+  return String(input)
 }
 
 function plainTextBinding(settings: WorkerSettings | null, name: string): string | undefined {
@@ -339,7 +378,7 @@ async function askGoogleClient({ options, redirectUri }: {
 
 // Deploys (or updates) the deployment's own login provider: a second worker
 // with its own D1, reachable at `url`. Returns what the state file keeps.
-async function deployProvider({ client, accountId, bundle, options, saved, spinner, workerName, url }: {
+async function deployProvider({ client, accountId, bundle, options, saved, spinner, workerName, url, allowedUsers }: {
   client: CfClient
   accountId: string
   bundle: SelfhostBundle
@@ -348,6 +387,8 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
   spinner: ReturnType<typeof clack.spinner>
   workerName: string
   url: string
+  /** the app's ALLOWED_USERS, applied by the provider too */
+  allowedUsers: string
 }): Promise<Pick<DeploymentState, 'providerWorkerName' | 'providerDatabaseId' | 'providerAuthSecret' | 'googleClientId' | 'googleClientSecret'>> {
   const settings = await client.getWorkerSettings(accountId, workerName)
   const providerExists = settings != null
@@ -364,6 +405,7 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
     : await askGoogleClient({ options, redirectUri: `${url}/api/auth/callback/google` })
 
   const secrets = providerSecretsForDeploy({ providerExists, saved, google })
+  if (secrets && allowedUsers) secrets.ALLOWED_USERS = allowedUsers
 
   spinner.start('Deploying the login provider')
   const databaseId =
@@ -387,6 +429,9 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
     vars: { BETTER_AUTH_URL: url },
     secrets,
   })
+  if (!secrets) {
+    await updateAllowedUsersSecret({ client, accountId, scriptName: workerName, list: allowedUsers, saved: saved?.allowedUsers })
+  }
   await client.enableWorkersDev(accountId, workerName)
   // The app needs the provider's discovery document before it can boot
   const healthy = await waitForHealth(url, '/api/auth/.well-known/openid-configuration')

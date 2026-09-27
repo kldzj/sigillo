@@ -14,6 +14,8 @@ import * as schema from './schema.ts'
 import { betterAuth } from 'better-auth/minimal'
 import { jwt } from 'better-auth/plugins'
 import { oauthProvider } from '@better-auth/oauth-provider'
+import { APIError } from 'better-auth/api'
+import { isUserAllowed } from 'sigillo-app/src/lib/utils.ts'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 
 // ── Drizzle client via D1 ───────────────────────────────────────────
@@ -46,6 +48,14 @@ export function getDb() {
 
 // ── BetterAuth ──────────────────────────────────────────────────────
 
+// Optional, so not in the generated Env type: self-host sets it as a secret
+const allowedUsers = () => (env as { ALLOWED_USERS?: string }).ALLOWED_USERS
+
+// Same code as the app's, so the /error page can explain a refusal
+function notAllowedError(): APIError {
+  return new APIError('FORBIDDEN', { message: 'user not allowed', code: 'USER_NOT_ALLOWED' })
+}
+
 export function getAuth() {
   const db = getDb()
   return betterAuth({
@@ -55,6 +65,25 @@ export function getAuth() {
     // Google's OAuth tokens are encrypted in D1. Rows written
     // before this stay readable: better-auth passes unencrypted values through.
     account: { encryptOAuthTokens: true },
+    // The app's ALLOWED_USERS, applied here too: nobody off the list gets a
+    // provider account or session, so they never reach the app at all.
+    databaseHooks: {
+      user: {
+        create: {
+          before: async (user) => {
+            if (!isUserAllowed(user, allowedUsers())) throw notAllowedError()
+          },
+        },
+      },
+      session: {
+        create: {
+          before: async (session) => {
+            const user = await db.query.user.findFirst({ where: { id: session.userId }, columns: { email: true, emailVerified: true } })
+            if (!user || !isUserAllowed(user, allowedUsers())) throw notAllowedError()
+          },
+        },
+      },
+    },
     session: {
       cookieCache: {
         enabled: true,

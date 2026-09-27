@@ -78,13 +78,15 @@ It must be 32 bytes, base64-encoded. It is bound as the worker's `ENCRYPTION_KEY
 
 ## Limit who can sign in
 
-By default, anyone who can sign in with Google gets an account. To let in only certain people, set `ALLOWED_USERS` on the Worker to a comma-separated list of email addresses and domains:
+By default, anyone who can sign in with Google gets an account. To let in only certain people, pass a comma-separated list of email addresses and domains:
 
 ```bash
-echo "acme.com,ops@partner.io" | npx wrangler secret put ALLOWED_USERS --name sigillo
+npx @kldzj/sigillo self-host --allowed-users acme.com,ops@partner.io
 ```
 
-Only verified emails match: an address matches itself, a domain matches exactly that domain, not its subdomains. Nobody else can sign up or sign in, in the browser or with the CLI, and a signed-in user taken off the list is signed out on their next request. Set it as a secret so that `self-host` updates keep it.
+A new deployment asks for the list. Only verified emails match: an address matches itself, a domain matches exactly that domain, not its subdomains. Nobody else can sign up or sign in, in the browser or with the CLI, and a signed-in user taken off the list is signed out on their next request. The app and its login provider both check it.
+
+Updates keep the list saved in `~/.sigillo/selfhost.json`. Pass `--allowed-users` again to change it, or `--allowed-users ''` to let anyone in.
 
 ## Options
 
@@ -97,6 +99,7 @@ See the full flag reference at [sigillo self-host](./cli/self-host.mdx).
 | `--api-token <token>` | Cloudflare API token |
 | `--google-client-id <id>` | Google OAuth client ID for a new login provider |
 | `--google-client-secret <secret>` | Google OAuth client secret for a new login provider |
+| `--allowed-users <list>` | Email addresses and domains that may sign in, comma-separated; `''` lets anyone in |
 | `--domain <hostname>` | Attach a custom domain to the app (the zone must be on your account) |
 | `--skip-domain` | Skip the custom domain prompt |
 | `--yes` | Accept all defaults, non-interactive |
