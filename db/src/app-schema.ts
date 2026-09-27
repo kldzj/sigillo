@@ -92,6 +92,10 @@ export const orgMember = sqliteCore.sqliteTable('org_member', {
   orgId: sqliteCore.text('org_id').notNull().references(() => org.id, { onDelete: 'cascade' }),
   userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   role: sqliteCore.text('role', { enum: ['admin', 'member'] }).notNull().default('member'),
+  // 'selected' = only projects in member_access (zero rows = no projects).
+  // Explicit because deleting a project cascades its member_access rows: when
+  // "zero rows" meant "all", deleting a member's last project unlocked all.
+  projectAccess: sqliteCore.text('project_access', { enum: ['all', 'selected'] }).notNull().default('all'),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
 }, (table) => [
   sqliteCore.index('org_member_org_id_idx').on(table.orgId),
@@ -215,11 +219,8 @@ export const apiTokenEnvironment = sqliteCore.sqliteTable('api_token_environment
 ])
 
 // ── Member access (project-level permissions) ──────────────────────
-// Scopes a member's access to specific projects within their org.
-// If a member has ZERO memberAccess rows, they have access to ALL projects
-// (backwards compatible with the current all-or-nothing model).
-// If a member has ANY memberAccess rows, they only see listed projects.
-// Admins always bypass all restrictions regardless of memberAccess rows.
+// Projects a member with orgMember.projectAccess = 'selected' can access.
+// Ignored for projectAccess = 'all' and for admins.
 
 export const memberAccess = sqliteCore.sqliteTable('member_access', {
   id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),

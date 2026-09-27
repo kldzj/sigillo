@@ -357,6 +357,8 @@ cp db/drizzle-app/20260422093421_curved_sauron/migration.sql db/drizzle-app/0003
 
 Use sequential numbering (`0001_`, `0002_`, ...) matching the existing files. Keep the subdirectories around for drizzle-kit's snapshot tracking.
 
+In this fork, a migration that is not on upstream `main` yet is named after its folder instead (`20260927133031_auto-join-domain-unique.sql`), and its SQL must be safe to run twice (`IF NOT EXISTS`, `IF EXISTS`). D1 records a migration by its file name, so a released one can never be renamed. A number would collide with upstream's next migration, and a timestamp name sorts after all numbered ones. When upstream merges the same change under its own name, keep both files: the second run changes nothing.
+
 The `db/generate` and provider `db:generate` scripts already run the flatten step automatically via `db/scripts/flatten-migrations.ts`. You can also run it manually:
 
 ```bash

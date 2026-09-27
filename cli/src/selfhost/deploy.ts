@@ -120,19 +120,13 @@ export function isSigilloProviderWorker(settings: { bindings?: Array<{ type: str
  * (nothing in local state), verify it actually belongs to Sigillo before
  * applying migrations into it: an empty database is fine, a database whose
  * `d1_migrations` history starts with our first migration is ours, anything
- * else is an unrelated database that must not be touched. A Sigillo database
- * that already stores secrets is only adopted when the existing worker keeps
- * its secrets: new ones would make every stored secret unreadable.
+ * else is an unrelated database that must not be touched.
  */
-export async function ensureDatabase({ client, accountId, name, firstMigrationName, dataTable, secretsKept }: {
+export async function ensureDatabase({ client, accountId, name, firstMigrationName }: {
   client: CfClient
   accountId: string
   name: string
   firstMigrationName?: string
-  /** a table whose rows only the old keys can read: secret_event (app) or jwks (provider) */
-  dataTable: string
-  /** false when this deploy generates new secrets (see secretsForDeploy) */
-  secretsKept: boolean
 }): Promise<string> {
   const existing = await client.findD1ByName(accountId, name)
   if (!existing) {
@@ -155,26 +149,41 @@ export async function ensureDatabase({ client, accountId, name, firstMigrationNa
       sql: 'SELECT name FROM d1_migrations ORDER BY id LIMIT 1;',
     })
     const first = appliedResult?.results?.[0]?.name
-    if (first === undefined) return existing.uuid
-    if (first === firstMigrationName) {
-      if (secretsKept) return existing.uuid
-      const [secretsResult] = await client.d1Query({
-        accountId,
-        databaseId: existing.uuid,
-        sql: `SELECT 1 FROM ${dataTable} LIMIT 1;`,
-      })
-      if (!secretsResult?.results?.length) return existing.uuid
-      throw new Error(
-        `The D1 database "${name}" already stores secrets from an earlier deployment, but its worker and ` +
-          `~/.sigillo/selfhost.json are gone, so new keys would leave them unreadable. Restore selfhost.json ` +
-          'from the machine that deployed it, or re-run with --name <other-name> to start a new deployment.',
-      )
-    }
+    if (first === undefined || first === firstMigrationName) return existing.uuid
   }
 
   throw new Error(
     `A D1 database named "${name}" already exists on this account and does not look like a Sigillo database. ` +
       'Re-run with --name <other-name> to deploy under a different name.',
+  )
+}
+
+/**
+ * Refuse to deploy a freshly generated BETTER_AUTH_SECRET onto a database that
+ * already stores secrets: they were encrypted with a key that is gone (worker
+ * deleted, and the secret is not in selfhost.json), so every one of them
+ * would silently become unreadable. Covers adopted-by-name databases and
+ * databases remembered in state whose worker was adopted without its secret.
+ */
+export async function assertNoStoredSecrets({ client, accountId, databaseId, dataTable = 'secret_event' }: {
+  client: CfClient
+  accountId: string
+  databaseId: string
+  /** secret_event for the app, jwks for its login provider */
+  dataTable?: string
+}): Promise<void> {
+  const [tablesResult] = await client.d1Query({
+    accountId,
+    databaseId,
+    sql: `SELECT name FROM sqlite_master WHERE type='table' AND name = '${dataTable}';`,
+  })
+  if (!tablesResult?.results?.length) return
+  const [secretsResult] = await client.d1Query({ accountId, databaseId, sql: `SELECT 1 AS found FROM ${dataTable} LIMIT 1;` })
+  if (!secretsResult?.results?.length) return
+  throw new Error(
+    'This D1 database already stores secrets, but its worker is gone and ~/.sigillo/selfhost.json has no saved ' +
+      'BETTER_AUTH_SECRET for it. Deploying would generate a new secret and make every stored secret unreadable. ' +
+      'Restore the original ~/.sigillo/selfhost.json and re-run, or deploy under --name <other-name>.',
   )
 }
 
@@ -267,26 +276,40 @@ export function generateBetterAuthSecret(): string {
   return randomBytes(32).toString('base64')
 }
 
-// Never rotate either secret. ENCRYPTION_KEY is the AES key for all stored
-// secrets, and without it the app derives that key from BETTER_AUTH_SECRET.
-// Existing worker → NEVER send secrets, inherit everything via keep_bindings
-// (sending would delete user-added secrets and make stored data unreadable).
-// New worker → reuse what the state file saved (worker deleted but D1
-// survived), else generate both. Only a brand-new deployment gets its own
-// ENCRYPTION_KEY: one that stored data before this keeps its derived key.
-export function secretsForDeploy({ workerExists, saved }: {
+/**
+ * Secrets to bind on this deploy. A new deployment gets its own
+ * ENCRYPTION_KEY, separate from the BETTER_AUTH_SECRET that signs sessions:
+ * SIGILLO_ENCRYPTION_KEY if set, a random key otherwise. Neither is ever
+ * rotated, since a new key would make every stored secret unreadable, so a
+ * deployment without an ENCRYPTION_KEY keeps deriving it from BETTER_AUTH_SECRET.
+ * Returns {} for an existing worker (inherit everything via keep_bindings).
+ */
+export function resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv }: {
   workerExists: boolean
-  saved?: DeploymentState
-}): { betterAuthSecret?: string; encryptionKey?: string } {
-  if (workerExists) return {}
-  if (saved) {
-    return { betterAuthSecret: saved.betterAuthSecret ?? generateBetterAuthSecret(), encryptionKey: saved.encryptionKey }
+  saved?: { betterAuthSecret?: string; encryptionKey?: string }
+  encryptionKeyEnv?: string
+}): { betterAuthSecret?: string; encryptionKey?: string; generated?: boolean } {
+  const encryptionKey = encryptionKeyEnv?.trim() || undefined
+  if (encryptionKey && Buffer.from(encryptionKey, 'base64').length !== 32) {
+    throw new Error('SIGILLO_ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32)')
   }
-  // 32 random bytes, base64: the format the app's ENCRYPTION_KEY expects
-  return { betterAuthSecret: generateBetterAuthSecret(), encryptionKey: randomBytes(32).toString('base64') }
+  const isNew = !workerExists && !saved?.betterAuthSecret
+  if (!isNew && encryptionKey && encryptionKey !== saved?.encryptionKey) {
+    throw new Error(
+      'SIGILLO_ENCRYPTION_KEY can only be set on the first deploy. Changing the key of an existing ' +
+        'deployment would make its stored secrets unreadable. Unset it to update.',
+    )
+  }
+  if (workerExists) return {}
+  if (!isNew) return { betterAuthSecret: saved?.betterAuthSecret, encryptionKey: saved?.encryptionKey }
+  return {
+    betterAuthSecret: generateBetterAuthSecret(),
+    encryptionKey: encryptionKey ?? randomBytes(32).toString('base64'),
+    generated: true,
+  }
 }
 
-// Same rule as secretsForDeploy, for the provider: never rotate its
+// Same rule as resolveDeploySecrets, for the provider: never rotate its
 // BETTER_AUTH_SECRET (it encrypts the JWT signing keys in its D1). An
 // existing provider keeps everything via keep_bindings, a recreated one
 // reuses what the state file saved, and only a brand-new one needs a Google

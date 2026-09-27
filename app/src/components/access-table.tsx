@@ -22,6 +22,7 @@ type Member = {
   id: string
   createdAt: number
   role: "admin" | "member"
+  projectAccess: "all" | "selected"
   accessRules: { projectId: string }[]
   user: {
     id: string
@@ -96,7 +97,7 @@ export function AccessTable() {
 
   function getProjectAccessLabel(member: Member) {
     if (getRole(member) === 'admin') return 'All (admin)'
-    if (member.accessRules.length === 0) return 'All'
+    if (member.projectAccess === 'all') return 'All'
     return `${member.accessRules.length} of ${orgProjects.length}`
   }
 
@@ -234,7 +235,7 @@ function ManageAccessDialog({
   onClose: () => void
 }) {
   const existingRuleIds = new Set((member?.accessRules ?? []).map((r) => r.projectId))
-  const hasExistingRules = (member?.accessRules ?? []).length > 0
+  const hasExistingRules = member?.projectAccess === 'selected'
 
   // State: which projects are checked
   const [fullAccess, setFullAccess] = useState(!hasExistingRules)
@@ -253,7 +254,7 @@ function ManageAccessDialog({
     setError(null)
     try {
       if (fullAccess) {
-        await updateMemberAccessAction({ memberId: member.id, projectIds: [] })
+        await updateMemberAccessAction({ memberId: member.id, projectIds: null })
       } else {
         const selectedIds = orgProjects.filter((p) => projectChecked[p.id]).map((p) => p.id)
         await updateMemberAccessAction({ memberId: member.id, projectIds: selectedIds })

@@ -62,9 +62,19 @@ npx @kldzj/sigillo self-host
 
 Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and no secret is ever rotated, so your stored secrets stay decryptable and your users stay signed in.
 
-New deployments get their own `ENCRYPTION_KEY`, separate from the auth secret that signs sessions. The keys, the login provider's secret and the Google client are saved in `~/.sigillo/selfhost.json` on the machine that ran the command. Keep a copy in your password manager: a database backup cannot be decrypted without the key.
-
 A deployment that already signs in through another provider, such as one made with upstream Sigillo's `self-host` against `auth.sigillo.dev`, keeps that provider on update: switching would give every user a new login.
+
+New deployments get their own `ENCRYPTION_KEY`, separate from the `BETTER_AUTH_SECRET` that signs sessions. Both are saved in `~/.sigillo/selfhost.json` on the machine that ran the command, together with the login provider's secret and the Google client. **Back up that file.** A database backup cannot be decrypted without the key, and if the worker and the file are both lost, `self-host` refuses to reuse that database. Deployments made before there was an `ENCRYPTION_KEY` keep deriving their key from `BETTER_AUTH_SECRET`.
+
+## Your own encryption key
+
+Optional. To choose the key yourself instead of getting a random one, set `SIGILLO_ENCRYPTION_KEY` on the **first** deploy:
+
+```bash
+SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx @kldzj/sigillo self-host
+```
+
+It must be 32 bytes, base64-encoded. It is bound as the worker's `ENCRYPTION_KEY` secret and saved in `~/.sigillo/selfhost.json`. It cannot be set on an existing deployment, because a new key would make its stored secrets unreadable.
 
 ## Options
 

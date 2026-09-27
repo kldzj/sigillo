@@ -1491,9 +1491,8 @@ describe('auto-join by email domain', () => {
 
 // ── Member access — granular project + secret restrictions ──────────
 // Tests for the memberAccess table that gates per-member project access
-// and per-secret read/write restrictions. Admins always bypass all
-// restrictions. Members with zero access rules have full access
-// (backwards compatible). Members with access rules only see listed projects.
+// restrictions. Admins always bypass them. orgMember.projectAccess 'all'
+// ignores the rules; 'selected' only allows listed projects (none if empty).
 
 describe('member access — project scoping', () => {
   let adminToken: string
@@ -1547,7 +1546,18 @@ describe('member access — project scoping', () => {
     }))
   })
 
-  test('no access rules = full access (backwards compatible)', async () => {
+  const restrictTo = async (projectIds: string[]) => {
+    const db = getDb()
+    await db.update(schema.orgMember).set({ projectAccess: 'selected' }).where(orm.eq(schema.orgMember.id, memberId))
+    for (const projectId of projectIds) await db.insert(schema.memberAccess).values({ orgMemberId: memberId, projectId })
+  }
+  const unrestrict = async () => {
+    const db = getDb()
+    await db.update(schema.orgMember).set({ projectAccess: 'all' }).where(orm.eq(schema.orgMember.id, memberId))
+    await db.delete(schema.memberAccess).where(orm.eq(schema.memberAccess.orgMemberId, memberId))
+  }
+
+  test('projectAccess all = full access', async () => {
     const mf = authedFetch(memberToken)
     // Member with no access rules can see all projects
     const projects = assertOk(await mf('/api/v0/projects'))
@@ -1567,12 +1577,7 @@ describe('member access — project scoping', () => {
   })
 
   test('access rules restrict to listed projects only', async () => {
-    const db = getDb()
-    // Give member access to only Project A
-    await db.insert(schema.memberAccess).values({
-      orgMemberId: memberId,
-      projectId: projectAId,
-    })
+    await restrictTo([projectAId])
 
     const mf = authedFetch(memberToken)
 
@@ -1593,8 +1598,7 @@ describe('member access — project scoping', () => {
       params: { pid: projectBId, eid: projectBDevEnvId },
     }), 403)
 
-    // Clean up access rules for next test
-    await db.delete(schema.memberAccess).where(orm.eq(schema.memberAccess.orgMemberId, memberId))
+    await unrestrict()
   })
 
   test('admin always has full access regardless of access rules', async () => {
@@ -1614,17 +1618,21 @@ describe('member access — project scoping', () => {
   })
 
   test('getAccessibleProjectIds returns project list for restricted member', async () => {
-    const db = getDb()
-    await db.insert(schema.memberAccess).values({
-      orgMemberId: memberId,
-      projectId: projectAId,
-    })
+    await restrictTo([projectAId])
+    expect(await getAccessibleProjectIds(memberUserId, orgId)).toEqual([projectAId])
+    await unrestrict()
+  })
 
-    const ids = await getAccessibleProjectIds(memberUserId, orgId)
-    expect(ids).toEqual([projectAId])
-
-    // Cleanup
-    await db.delete(schema.memberAccess).where(orm.eq(schema.memberAccess.orgMemberId, memberId))
+  // Regression: zero member_access rows used to mean "all projects", so
+  // deleting a member's last allowed project (FK cascade) unlocked every project.
+  test('deleting the last allowed project does not unlock the others', async () => {
+    const af = authedFetch(adminToken)
+    const temp = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Temp', orgId } }))
+    await restrictTo([temp.id])
+    assertOk(await authedFetch(memberToken)('/api/v0/projects/:id', { method: 'DELETE', params: { id: temp.id } }))
+    expect(await getAccessibleProjectIds(memberUserId, orgId)).toEqual([])
+    assertErrorStatus(await authedFetch(memberToken)('/api/v0/projects/:id', { params: { id: projectBId } }), 403)
+    await unrestrict()
   })
 })
 
@@ -1679,6 +1687,23 @@ describe('environment access roles', () => {
       params: { pid: projectId, eid: devEnvId },
     }))
     expect(result.secrets.length).toBeGreaterThanOrEqual(1)
+    // Regression: allNames included names from every env, even admin-only ones.
+    expect(result.allNames).toContain('DEV_SECRET')
+    expect(result.allNames).not.toContain('PROD_SECRET')
+    const admin = assertOk(await authedFetch(adminToken)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      params: { pid: projectId, eid: devEnvId },
+    }))
+    expect(admin.allNames).toContain('PROD_SECRET')
+  })
+
+  test('env-scoped token only sees names from its own envs', async () => {
+    const db = getDb()
+    const admin = await db.query.orgMember.findFirst({ where: { orgId, role: 'admin' }, columns: { userId: true } })
+    const { key } = await insertApiToken({ name: 'dev-only', projectId, createdBy: admin!.userId, environmentIds: [devEnvId] })
+    const result = assertOk(await authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      params: { pid: projectId, eid: devEnvId },
+    }))
+    expect(result.allNames).not.toContain('PROD_SECRET')
   })
 
   test('member cannot access prod environment (accessRole=admin) — 403', async () => {
@@ -1788,6 +1813,7 @@ describe('authorization — project scoping and admin-only environments', () => 
     const [scopedRow] = await db.insert(schema.orgMember)
       .values({ orgId, userId: scoped.user.id, role: 'member' })
       .returning({ id: schema.orgMember.id })
+    await db.update(schema.orgMember).set({ projectAccess: 'selected' }).where(orm.eq(schema.orgMember.id, scopedRow!.id))
     await db.insert(schema.memberAccess).values({ orgMemberId: scopedRow!.id, projectId: projectBId })
     await db.update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, aProdEnvId))
   })

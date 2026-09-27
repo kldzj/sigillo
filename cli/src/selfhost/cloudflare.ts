@@ -73,7 +73,7 @@ export interface DeploymentState {
   workerName: string
   databaseId: string
   betterAuthSecret?: string
-  /** unset for deployments made before self-host generated one */
+  /** Only set when the user passed SIGILLO_ENCRYPTION_KEY on first deploy */
   encryptionKey?: string
   /** the deployment's own login provider (unset when it uses another one) */
   providerWorkerName?: string

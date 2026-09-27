@@ -23,12 +23,13 @@ import {
 import {
   appCompatibilityFlags,
   applyMigrations,
+  assertNoStoredSecrets,
   ensureDatabase,
   fetchReleaseInfo,
   isSigilloProviderWorker,
   isSigilloWorker,
   providerSecretsForDeploy,
-  secretsForDeploy,
+  resolveDeploySecrets,
   loadBundle,
   syncAssets,
   uploadWorker,
@@ -56,6 +57,8 @@ cli
   .example('npx @kldzj/sigillo self-host')
   .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
   .example('CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes --google-client-id xxx --google-client-secret xxx')
+  .example('# Optional, first deploy only: choose the ENCRYPTION_KEY instead of getting a random one')
+  .example('SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx @kldzj/sigillo self-host')
   .action(async (options) => {
     clack.intro(colors.bold('sigillo self-host'))
     const releaseLock = acquireLock()
@@ -151,6 +154,9 @@ async function selfHost(options: SelfHostOptions) {
       : `Release v${bundle.version}${saved?.deployedVersion ? ` (updating from v${saved.deployedVersion})` : ''}`,
   )
 
+  // Validate before touching anything: a bad SIGILLO_ENCRYPTION_KEY must fail early.
+  const { generated, ...secrets } = resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv: process.env.SIGILLO_ENCRYPTION_KEY })
+
   // ── workers.dev subdomain ─────────────────────────────────────────
   // Resolved before any upload: both workers are told the provider's URL.
   const subdomain = await ensureWorkersDevSubdomain({ client, accountId, workerName, options })
@@ -161,18 +167,14 @@ async function selfHost(options: SelfHostOptions) {
   const firstMigrationName = Object.keys(bundle.app.migrations).sort()[0]
   const databaseId =
     saved?.databaseId ??
-    (await ensureDatabase({
-      client, accountId, name: `${workerName}-db`, firstMigrationName, dataTable: 'secret_event', secretsKept: workerExists,
-    }))
+    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName }))
+  if (generated) await assertNoStoredSecrets({ client, accountId, databaseId })
   const applied = await applyMigrations({ client, accountId, databaseId, migrations: bundle.app.migrations })
   spinner.stop(
     applied.length > 0
       ? `D1 ready — applied ${applied.length} migration${applied.length > 1 ? 's' : ''}`
       : 'D1 ready — no new migrations',
   )
-
-  // ── Secret handling (see secretsForDeploy) ────────────────────────
-  const { betterAuthSecret, encryptionKey } = secretsForDeploy({ workerExists, saved })
 
   // ── Login provider ────────────────────────────────────────────────
   // Every deployment signs in through its own provider worker. An app that
@@ -195,8 +197,8 @@ async function selfHost(options: SelfHostOptions) {
     accountId,
     workerName,
     databaseId,
-    betterAuthSecret: betterAuthSecret ?? saved?.betterAuthSecret,
-    encryptionKey: encryptionKey ?? saved?.encryptionKey,
+    betterAuthSecret: secrets.betterAuthSecret ?? saved?.betterAuthSecret,
+    encryptionKey: secrets.encryptionKey ?? saved?.encryptionKey,
     ...provider,
     deployedVersion: saved?.deployedVersion,
     url: workersDevUrl,
@@ -225,8 +227,8 @@ async function selfHost(options: SelfHostOptions) {
     databaseId,
     assetsJwt,
     vars: { PROVIDER_URL: providerUrl },
-    secrets: betterAuthSecret
-      ? { BETTER_AUTH_SECRET: betterAuthSecret, ...(encryptionKey ? { ENCRYPTION_KEY: encryptionKey } : {}) }
+    secrets: secrets.betterAuthSecret
+      ? { BETTER_AUTH_SECRET: secrets.betterAuthSecret, ...(secrets.encryptionKey ? { ENCRYPTION_KEY: secrets.encryptionKey } : {}) }
       : undefined,
     compatibilityFlags: appCompatibilityFlags(bundle.app.compatibilityFlags),
   })
@@ -361,6 +363,8 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
     ? undefined
     : await askGoogleClient({ options, redirectUri: `${url}/api/auth/callback/google` })
 
+  const secrets = providerSecretsForDeploy({ providerExists, saved, google })
+
   spinner.start('Deploying the login provider')
   const databaseId =
     saved?.providerDatabaseId ??
@@ -369,11 +373,10 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
       accountId,
       name: `${workerName}-db`,
       firstMigrationName: Object.keys(bundle.provider.migrations).sort()[0],
-      dataTable: 'jwks',
-      secretsKept: providerExists,
     }))
+  // A new provider secret must not meet signing keys encrypted with a lost one
+  if (secrets && !saved?.providerAuthSecret) await assertNoStoredSecrets({ client, accountId, databaseId, dataTable: 'jwks' })
   await applyMigrations({ client, accountId, databaseId, migrations: bundle.provider.migrations })
-  const secrets = providerSecretsForDeploy({ providerExists, saved, google })
   const assetsJwt = await syncAssets({ client, accountId, scriptName: workerName, worker: bundle.provider })
   await uploadWorker(client, {
     accountId,

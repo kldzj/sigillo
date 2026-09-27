@@ -7,8 +7,8 @@ import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
 import {
-  appCompatibilityFlags, ensureDatabase, fetchReleaseInfo, isSigilloProviderWorker, parseBundle, providerSecretsForDeploy,
-  secretsForDeploy, uploadWorker,
+  appCompatibilityFlags, assertNoStoredSecrets, fetchReleaseInfo, isSigilloProviderWorker, parseBundle, providerSecretsForDeploy,
+  resolveDeploySecrets, uploadWorker,
   type SelfhostBundle, type WorkerBundle,
 } from '../src/selfhost/deploy.js'
 
@@ -136,32 +136,6 @@ describe('TOKEN_TEMPLATE_URL', () => {
   })
 })
 
-describe('secretsForDeploy', () => {
-  const saved = (fields: Partial<DeploymentState>): DeploymentState => ({
-    accountId: 'acc', workerName: 'sigillo', databaseId: 'db', ...fields,
-  })
-
-  test('a new deployment gets its own ENCRYPTION_KEY, separate from BETTER_AUTH_SECRET', () => {
-    const { betterAuthSecret, encryptionKey } = secretsForDeploy({ workerExists: false })
-    expect(Buffer.from(encryptionKey!, 'base64')).toHaveLength(32)
-    expect(encryptionKey).not.toBe(betterAuthSecret)
-  })
-
-  test('an existing worker keeps the secrets it has, nothing is sent', () => {
-    expect(secretsForDeploy({ workerExists: true, saved: saved({ betterAuthSecret: 's', encryptionKey: 'k' }) })).toEqual({})
-  })
-
-  test('a recreated worker reuses the saved keys, so stored data stays readable', () => {
-    expect(secretsForDeploy({ workerExists: false, saved: saved({ betterAuthSecret: 's', encryptionKey: 'k' }) }))
-      .toEqual({ betterAuthSecret: 's', encryptionKey: 'k' })
-  })
-
-  test('a deployment from before ENCRYPTION_KEY keeps its derived key', () => {
-    expect(secretsForDeploy({ workerExists: false, saved: saved({ betterAuthSecret: 's' }) }))
-      .toEqual({ betterAuthSecret: 's', encryptionKey: undefined })
-  })
-})
-
 describe('uploadWorker', () => {
   const worker = {
     mainModule: 'index.js',
@@ -245,37 +219,29 @@ describe('providerSecretsForDeploy', () => {
   })
 })
 
-describe('ensureDatabase', () => {
-  // A D1 named like ours that already holds a Sigillo deployment with stored secrets
+describe('assertNoStoredSecrets', () => {
   const queries: string[] = []
-  const fakeClient = ({ secretRows }: { secretRows: number }) => ({
-    async findD1ByName() { return { uuid: 'db-1' } },
+  const fakeClient = ({ rows }: { rows: number }) => ({
     async d1Query({ sql }: { sql: string }) {
       queries.push(sql)
-      if (sql.includes('sqlite_master')) return [{ results: [{ name: 'd1_migrations' }, { name: 'secret_event' }] }]
-      if (sql.includes('d1_migrations')) return [{ results: [{ name: '0001_initial.sql' }] }]
-      return [{ results: Array.from({ length: secretRows }, () => ({ 1: 1 })) }]
+      if (sql.includes('sqlite_master')) return [{ results: [{ name: 'found' }] }]
+      return [{ results: Array.from({ length: rows }, () => ({ found: 1 })) }]
     },
   }) as unknown as CfClient
-  const args = { accountId: 'acc', name: 'sigillo-db', firstMigrationName: '0001_initial.sql', dataTable: 'secret_event' }
+  const args = { accountId: 'acc', databaseId: 'db-1' }
 
   test('refuses to put new secrets in front of stored ones', async () => {
-    await expect(ensureDatabase({ client: fakeClient({ secretRows: 1 }), ...args, secretsKept: false }))
-      .rejects.toThrow(/unreadable/)
+    await expect(assertNoStoredSecrets({ client: fakeClient({ rows: 1 }), ...args })).rejects.toThrow(/unreadable/)
+    expect(queries.at(-1)).toBe('SELECT 1 AS found FROM secret_event LIMIT 1;')
   })
 
-  test('adopts it when the existing worker keeps its secrets', async () => {
-    expect(await ensureDatabase({ client: fakeClient({ secretRows: 1 }), ...args, secretsKept: true })).toBe('db-1')
-  })
-
-  test('adopts it when no secret was ever stored', async () => {
-    expect(await ensureDatabase({ client: fakeClient({ secretRows: 0 }), ...args, secretsKept: false })).toBe('db-1')
+  test('allows it when no secret was ever stored', async () => {
+    await expect(assertNoStoredSecrets({ client: fakeClient({ rows: 0 }), ...args })).resolves.toBeUndefined()
   })
 
   test('guards the provider database by its signing keys', async () => {
-    await expect(ensureDatabase({ client: fakeClient({ secretRows: 1 }), ...args, name: 'sigillo-auth-db', dataTable: 'jwks', secretsKept: false }))
-      .rejects.toThrow(/unreadable/)
-    expect(queries.at(-1)).toBe('SELECT 1 FROM jwks LIMIT 1;')
+    await expect(assertNoStoredSecrets({ client: fakeClient({ rows: 1 }), ...args, dataTable: 'jwks' })).rejects.toThrow(/unreadable/)
+    expect(queries.at(-1)).toBe('SELECT 1 AS found FROM jwks LIMIT 1;')
   })
 })
 
@@ -295,5 +261,76 @@ describe('fetchReleaseInfo', () => {
     })
     expect(await fetchReleaseInfo()).toEqual({ version: '0.14.0', url: 'https://example.com/0.14.0.json.gz' })
     expect(requested).toEqual(['https://api.github.com/repos/kldzj/sigillo/releases?per_page=30'])
+  })
+})
+
+describe('resolveDeploySecrets', () => {
+  const key = Buffer.alloc(32, 7).toString('base64')
+  const other = Buffer.alloc(32, 9).toString('base64')
+  const run = (args: Parameters<typeof resolveDeploySecrets>[0]) => {
+    try {
+      const r = resolveDeploySecrets(args)
+      const label = (value: string | undefined, savedValue: string | undefined) =>
+        value === undefined ? undefined : value === savedValue ? 'saved' : value === args.encryptionKeyEnv ? 'env' : 'generated'
+      return {
+        betterAuthSecret: label(r.betterAuthSecret, args.saved?.betterAuthSecret),
+        encryptionKey: label(r.encryptionKey, args.saved?.encryptionKey),
+        generated: r.generated,
+      }
+    } catch (error) {
+      return (error as Error).message
+    }
+  }
+
+  test('a new deployment gets its own key; an existing one never gets a new one', () => {
+    expect({
+      defaultNew: run({ workerExists: false }),
+      newWithKey: run({ workerExists: false, encryptionKeyEnv: key }),
+      recreatedFromState: run({ workerExists: false, saved: { betterAuthSecret: 's', encryptionKey: key } }),
+      recreatedDerivedKey: run({ workerExists: false, saved: { betterAuthSecret: 's' } }),
+      recreatedDerivedKeyNewKey: run({ workerExists: false, saved: { betterAuthSecret: 's' }, encryptionKeyEnv: key }),
+      recreatedDifferentKey: run({ workerExists: false, saved: { betterAuthSecret: 's', encryptionKey: key }, encryptionKeyEnv: other }),
+      existing: run({ workerExists: true, saved: { betterAuthSecret: 's' } }),
+      existingSameKey: run({ workerExists: true, saved: { betterAuthSecret: 's', encryptionKey: key }, encryptionKeyEnv: key }),
+      existingNewKey: run({ workerExists: true, saved: { betterAuthSecret: 's' }, encryptionKeyEnv: key }),
+      invalidKey: run({ workerExists: false, encryptionKeyEnv: 'short' }),
+    }).toMatchInlineSnapshot(`
+      {
+        "defaultNew": {
+          "betterAuthSecret": "generated",
+          "encryptionKey": "generated",
+          "generated": true,
+        },
+        "existing": {
+          "betterAuthSecret": undefined,
+          "encryptionKey": undefined,
+          "generated": undefined,
+        },
+        "existingNewKey": "SIGILLO_ENCRYPTION_KEY can only be set on the first deploy. Changing the key of an existing deployment would make its stored secrets unreadable. Unset it to update.",
+        "existingSameKey": {
+          "betterAuthSecret": undefined,
+          "encryptionKey": undefined,
+          "generated": undefined,
+        },
+        "invalidKey": "SIGILLO_ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32)",
+        "newWithKey": {
+          "betterAuthSecret": "generated",
+          "encryptionKey": "env",
+          "generated": true,
+        },
+        "recreatedDerivedKey": {
+          "betterAuthSecret": "saved",
+          "encryptionKey": undefined,
+          "generated": undefined,
+        },
+        "recreatedDerivedKeyNewKey": "SIGILLO_ENCRYPTION_KEY can only be set on the first deploy. Changing the key of an existing deployment would make its stored secrets unreadable. Unset it to update.",
+        "recreatedDifferentKey": "SIGILLO_ENCRYPTION_KEY can only be set on the first deploy. Changing the key of an existing deployment would make its stored secrets unreadable. Unset it to update.",
+        "recreatedFromState": {
+          "betterAuthSecret": "saved",
+          "encryptionKey": "saved",
+          "generated": undefined,
+        },
+      }
+    `)
   })
 })

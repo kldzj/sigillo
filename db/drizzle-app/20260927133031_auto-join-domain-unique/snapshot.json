@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "da711ae2-308e-48e4-86c0-e7b85ef9aa62",
+  "id": "cfbe5a44-31ed-43da-9170-dea3552b4b90",
   "prevIds": [
-    "bf978307-8b13-4085-8afd-6bb0cfcc571f"
+    "d743a4c4-fe2b-4895-992a-96b43fd55874"
   ],
   "ddl": [
     {
@@ -723,6 +723,16 @@
       "default": "'member'",
       "generated": null,
       "name": "role",
+      "entityType": "columns",
+      "table": "org_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'all'",
+      "generated": null,
+      "name": "project_access",
       "entityType": "columns",
       "table": "org_member"
     },
