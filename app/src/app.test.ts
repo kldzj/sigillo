@@ -17,7 +17,7 @@ import * as orm from 'drizzle-orm'
 import { app } from './app.js'
 import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds } from './db.js'
 import { schema } from 'db'
-import { formatAbsoluteDate, formatTime } from './lib/utils.js'
+import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
 
@@ -1832,5 +1832,64 @@ describe('formatTime', () => {
     const ts = ssr - 119_600
     expect(formatTime({ ts, now: ssr, timeZone: 'UTC' })).toMatchInlineSnapshot(`"1m ago"`)
     expect(formatTime({ ts, now: hydration, timeZone: 'UTC' })).toMatchInlineSnapshot(`"2m ago"`)
+  })
+})
+
+describe('sign-in allowlist (ALLOWED_USERS)', () => {
+  // Assigning undefined to process.env stores the string "undefined": delete instead
+  const setAllowed = (value: string | undefined) => {
+    if (value === undefined) delete process.env.ALLOWED_USERS
+    else process.env.ALLOWED_USERS = value
+  }
+  const withAllowed = async (value: string, fn: () => Promise<void>) => {
+    const before = process.env.ALLOWED_USERS
+    setAllowed(value)
+    try { await fn() } finally { setAllowed(before) }
+  }
+  const me = (token: string) => app.handle(new Request('http://e.ly/api/v0/me', { headers: { authorization: `Bearer ${token}` } }))
+
+  test('only verified emails match: an address itself, a domain exactly', () => {
+    const list = 'Ops@Partner.io, acme.com'
+    expect({
+      address: isUserAllowed({ email: 'ops@partner.io', emailVerified: true }, list),
+      otherAddress: isUserAllowed({ email: 'dev@partner.io', emailVerified: true }, list),
+      domain: isUserAllowed({ email: 'Jane@ACME.com', emailVerified: true }, list),
+      subdomain: isUserAllowed({ email: 'jane@eu.acme.com', emailVerified: true }, list),
+      unverified: isUserAllowed({ email: 'jane@acme.com', emailVerified: false }, list),
+      emptyList: isUserAllowed({ email: 'anyone@example.com', emailVerified: false }, ' , '),
+      unset: isUserAllowed({ email: 'anyone@example.com', emailVerified: false }, undefined),
+    }).toEqual({ address: true, otherAddress: false, domain: true, subdomain: false, unverified: false, emptyList: true, unset: true })
+  })
+
+  test('a refused sign-in explains itself on /login, whichever way the callback spells it', () => {
+    const refused = loginErrorMessage('USER_NOT_ALLOWED')
+    expect({
+      sessionRefused: refused,
+      newUserRefused: loginErrorMessage('user_not_allowed') === refused,
+      other: loginErrorMessage('state_not_found'),
+    }).toMatchInlineSnapshot(`
+      {
+        "newUserRefused": true,
+        "other": "Signing in failed (state_not_found).",
+        "sessionRefused": "This account may not sign in here. Ask whoever runs this Sigillo instance to add your email address or domain.",
+      }
+    `)
+  })
+
+  test('someone not on the list cannot sign up', async () => {
+    await withAllowed('allowed.example', async () => {
+      const auth = await getTestAuth()
+      const result = await auth.api.signUpEmail({ body: { email: `x-${Date.now()}@elsewhere.example`, name: 'X', password: 'test-password-123' } }).catch((error) => error)
+      expect(result).toBeInstanceOf(Error)
+    })
+  })
+
+  test('an existing session stops working once its user is off the list', async () => {
+    const { user, token } = await createTestUser({ email: `listed-${Date.now()}@allowed.example` })
+    await getDb().update(schema.user).set({ emailVerified: true }).where(orm.eq(schema.user.id, user.id))
+    const statuses: Record<string, number> = {}
+    await withAllowed('allowed.example', async () => { statuses.listed = (await me(token)).status })
+    await withAllowed('other.example', async () => { statuses.unlisted = (await me(token)).status })
+    expect(statuses).toEqual({ listed: 200, unlisted: 401 })
   })
 })

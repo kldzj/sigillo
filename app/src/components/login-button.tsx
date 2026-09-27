@@ -15,6 +15,8 @@ export function LoginButton({ callbackURL = "/dash" }: { callbackURL?: string })
     await authClient.signIn.social({
       provider: "sigillo",
       callbackURL,
+      // Failed sign-ins come back here with ?error= instead of a bare error page
+      errorCallbackURL: "/login",
     })
   }
 

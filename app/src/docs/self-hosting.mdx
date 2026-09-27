@@ -66,6 +66,16 @@ SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx sigillo self-host
 
 It is bound as the worker's `ENCRYPTION_KEY` secret and saved in `~/.sigillo/selfhost.json`. It cannot be set on an existing deployment, because a new key would make its stored secrets unreadable.
 
+## Limit who can sign in
+
+By default, anyone who can sign in with Google gets an account. To let in only certain people, set `ALLOWED_USERS` on the Worker to a comma-separated list of email addresses and domains:
+
+```bash
+echo "acme.com,ops@partner.io" | npx wrangler secret put ALLOWED_USERS --name sigillo
+```
+
+Only verified emails match: an address matches itself, a domain matches exactly that domain, not its subdomains. Nobody else can sign up or sign in, in the browser or with the CLI, and a signed-in user taken off the list is signed out on their next request. Set it as a secret so that `self-host` updates keep it.
+
 ## Options
 
 See the full flag reference at [sigillo self-host](./cli/self-host.mdx).

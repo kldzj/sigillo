@@ -40,6 +40,27 @@ export function formatTime({ ts, now, timeZone }: { ts: number; now: number; tim
   return formatAbsoluteDate({ ts, timeZone })
 }
 
+// Who may sign up and sign in, from ALLOWED_USERS: comma-separated email
+// addresses and domains. Empty lets in anyone the provider signs in. Only
+// verified emails match; a domain matches exactly, not its subdomains.
+// Pure, so the login provider can apply the same list.
+export function isUserAllowed(user: { email: string; emailVerified: boolean }, allowed: string | undefined): boolean {
+  const entries = (allowed ?? '').split(',').map((entry) => entry.trim().toLowerCase()).filter(Boolean)
+  if (entries.length === 0) return true
+  if (!user.emailVerified) return false
+  const email = user.email.trim().toLowerCase()
+  const domain = email.slice(email.lastIndexOf('@') + 1)
+  return entries.some((entry) => entry === (entry.includes('@') ? email : domain))
+}
+
+// Text for /login?error=, where a failed sign-in lands
+export function loginErrorMessage(error: string): string {
+  if (error.toLowerCase() === 'user_not_allowed') {
+    return 'This account may not sign in here. Ask whoever runs this Sigillo instance to add your email address or domain.'
+  }
+  return `Signing in failed (${error}).`
+}
+
 // ── Email domain helpers (client-safe) ──────────────────────────────
 // These are used by both server code (db.ts, actions.ts) and client
 // components (create-org-form, settings-page), so they must not import
