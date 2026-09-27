@@ -18,8 +18,7 @@ import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { CfClient, type DeploymentState } from './cloudflare.js'
 
-export const RELEASE_INFO_URL = 'https://sigillo.dev/api/selfhost/release/latest'
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/remorses/sigillo/releases?per_page=30'
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/kldzj/sigillo/releases?per_page=30'
 export const BUNDLE_ASSET_NAME = 'sigillo-selfhost-bundle.json.gz'
 
 // Keep in sync with app/scripts/build-selfhost-bundle.ts
@@ -42,20 +41,10 @@ export interface ReleaseInfo {
 }
 
 /**
- * Resolve the latest release bundle. Goes through sigillo.dev (so paid update
- * gating can be added server-side later without CLI changes) and falls back
- * to the GitHub releases API directly.
+ * Resolve the latest release bundle straight from the fork's GitHub releases,
+ * so a deploy never depends on anyone's hosted service.
  */
 export async function fetchReleaseInfo(): Promise<ReleaseInfo> {
-  try {
-    const res = await fetch(RELEASE_INFO_URL)
-    if (res.ok) {
-      const info = (await res.json()) as ReleaseInfo
-      if (info.version && info.url) return info
-    }
-  } catch {
-    // fall through to GitHub
-  }
   const res = await fetch(GITHUB_RELEASES_URL, {
     headers: { 'User-Agent': 'sigillo-cli', Accept: 'application/vnd.github+json' },
   })

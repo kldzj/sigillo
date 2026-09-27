@@ -4,9 +4,9 @@
 // account (network + credentials required), not here.
 
 import { gzipSync } from 'node:zlib'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
-import { ensureDatabase, parseBundle, secretsForDeploy, uploadWorker, type SelfhostBundle } from '../src/selfhost/deploy.js'
+import { ensureDatabase, fetchReleaseInfo, parseBundle, secretsForDeploy, uploadWorker, type SelfhostBundle } from '../src/selfhost/deploy.js'
 
 describe('parseWranglerToml', () => {
   const sample = [
@@ -196,5 +196,24 @@ describe('ensureDatabase', () => {
 
   test('adopts it when no secret was ever stored', async () => {
     expect(await ensureDatabase({ client: fakeClient({ secretRows: 0 }), ...args, secretsKept: false })).toBe('db-1')
+  })
+})
+
+describe('fetchReleaseInfo', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  test('reads the newest release with a bundle straight from kldzj/sigillo on GitHub', async () => {
+    const requested: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      requested.push(String(url))
+      return Response.json([
+        { tag_name: 'sigillo@0.15.0', assets: [] },
+        { tag_name: 'sigillo@0.14.0', assets: [{ name: 'sigillo-selfhost-bundle.json.gz', browser_download_url: 'https://example.com/0.14.0.json.gz' }] },
+      ])
+    })
+    expect(await fetchReleaseInfo()).toEqual({ version: '0.14.0', url: 'https://example.com/0.14.0.json.gz' })
+    expect(requested).toEqual(['https://api.github.com/repos/kldzj/sigillo/releases?per_page=30'])
   })
 })

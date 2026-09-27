@@ -48,7 +48,7 @@ jobs:
       # (which lack lockfile integrity fields and break a full workspace
       # install under CI's frozen-lockfile default).
       - name: Install dependencies
-        run: pnpm install --filter sigillo --frozen-lockfile
+        run: pnpm install --filter @kldzj/sigillo --frozen-lockfile
 
       - name: Build all targets
         working-directory: cli
@@ -77,6 +77,11 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    env:
+      # Releases (npm and GitHub) start once the RELEASE_ENABLED repository
+      # variable is true. Until then pushes to main only build and test.
+      RELEASE_ENABLED: ${{ vars.RELEASE_ENABLED == 'true' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -118,7 +123,7 @@ jobs:
         working-directory: cli
         run: |
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
-          PUBLISHED_VERSION=$(npm show sigillo version 2>/dev/null || echo "0.0.0")
+          PUBLISHED_VERSION=$(npm show @kldzj/sigillo version 2>/dev/null || echo "0.0.0")
           echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
           echo "published_version=$PUBLISHED_VERSION" >> "$GITHUB_OUTPUT"
           if [ "$PACKAGE_VERSION" = "$PUBLISHED_VERSION" ]; then
@@ -129,27 +134,32 @@ jobs:
             echo "Will publish $PACKAGE_VERSION (current: $PUBLISHED_VERSION)"
           fi
 
-      # The npm publish token (NPM_TOKEN) is stored in Sigillo, not as a GitHub
-      # secret, so when it expires we only update it once in the Sigillo web UI.
-      # CI only needs the long-lived SIGILLO_TOKEN here. We use the linux-x64
-      # binary just built in the build job to fetch + inject NPM_TOKEN, then map
-      # it to NODE_AUTH_TOKEN (which the setup-node .npmrc reads) for npm publish.
-      - name: Publish to npm
-        if: steps.version-check.outputs.skip == 'false'
-        working-directory: cli
-        env:
-          SIGILLO_TOKEN: ${{ secrets.SIGILLO_TOKEN }}
-          SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}
-          SIGILLO_ENVIRONMENT: prod
-        run: |
-          chmod +x dist/linux-x64/sigillo
-          dist/linux-x64/sigillo run --command 'NODE_AUTH_TOKEN=$NPM_TOKEN npm publish --access public'
+      - name: Releases are off
+        if: env.RELEASE_ENABLED != 'true'
+        run: echo "::notice::The RELEASE_ENABLED repository variable is not true, so nothing is published to npm or GitHub releases"
 
+      # Trusted publishing, stage only: npm authenticates with this workflow's
+      # OIDC token (no npm token is stored anywhere) and the version waits in
+      # npm's stage queue until a maintainer approves it with 2FA:
+      #   npm stage approve <stage-id>   (or npmjs.com → Staged Packages)
+      # npm stage needs npm 11.15.0 or later.
+      - name: Stage npm release
+        if: env.RELEASE_ENABLED == 'true' && steps.version-check.outputs.skip == 'false'
+        working-directory: cli
+        run: |
+          npm install -g npm@^11.15.0
+          npm stage publish --access public --provenance
+
+      # The release starts as a draft, which self-host cannot see, so its
+      # bundle only goes out once a maintainer publishes the draft after
+      # approving the staged npm version.
+      #
       # Runs on every push (not just fresh publishes) so a failed upload on a
       # previous run can heal itself: only assets MISSING from the release are
       # uploaded. Existing assets are never replaced, so later commits with the
       # same package version can't silently swap binaries out from under npm.
       - name: Upload binaries to GitHub Release
+        if: env.RELEASE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -160,7 +170,7 @@ jobs:
           if ! gh release view "$TAG" &>/dev/null; then
             git tag "$TAG" || true
             git push origin "$TAG" || true
-            gh release create "$TAG" --title "sigillo@${VERSION}" --notes "Release published by CI. Update these notes after CI completes." --latest
+            gh release create "$TAG" --title "sigillo@${VERSION}" --notes "Release drafted by CI. Publish it after approving the staged npm version." --draft
           fi
 
           # Create platform tarballs (unix)

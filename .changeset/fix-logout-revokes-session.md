@@ -1,5 +1,5 @@
 ---
-'sigillo': patch
+'@kldzj/sigillo': patch
 ---
 
 `sigillo logout` now signs the session out on the server, not only on your machine.

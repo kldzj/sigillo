@@ -1,5 +1,5 @@
 ---
-'sigillo': minor
+'@kldzj/sigillo': minor
 'sigillo-app': patch
 ---
 

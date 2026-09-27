@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP="sigillo"
-REPO="remorses/sigillo"
+REPO="kldzj/sigillo"
 
 MUTED='\033[0;2m'
 RED='\033[0;31m'
@@ -292,5 +292,5 @@ echo -e ""
 echo -e "cd <project>  ${MUTED}# Open directory${NC}"
 echo -e "sigillo      ${MUTED}# Run command${NC}"
 echo -e ""
-echo -e "${MUTED}For more information visit ${NC}https://github.com/remorses/sigillo"
+echo -e "${MUTED}For more information visit ${NC}https://github.com/kldzj/sigillo"
 echo -e ""
