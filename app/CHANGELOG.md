@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.0
+
+### Minor Changes
+
+- 7b96c4f: API tokens can now cover more than one environment.
+
+  Create a token for **dev** and **preview** without also granting **prod**. Project-wide tokens still mean every environment. The CLI setup picker only lists the environments the token can use.
+
+  Fixes remorses/sigillo#7
+
+### Patch Changes
+
+- 904fad4: An API token used on an admin-only environment now needs its creator to still be an org admin, so demoting someone also stops their tokens from reading admin-only environments.
+- dbd5d25: Device login needs an explicit **Approve**.
+
+  `/device?user_code=…` used to approve the code in one click, so a link sent by someone else could sign them in as you. The page now checks the code, then shows a warning with **Approve** and **Deny** buttons.
+
+- 9a975e3: Deleting a project no longer unlocks every project for members limited to it, and secret names from other environments no longer leak.
+
+  - A member limited to some projects used to get access to **every** project when their last allowed project was deleted. Restriction is now stored on the membership, so it stays in place, with access to no projects.
+  - The secrets list returned `allNames` from every environment in the project. A member now only gets names from environments they can read, and an environment-scoped token only gets names from its own environments.
+
+- 904fad4: `.env` downloads can no longer run shell commands, and secret names are validated.
+
+  Values are now single-quoted, so `source .env` does not expand `$(…)`, backticks or `$VAR`:
+
+  ```sh
+  SUBSHELL='$(touch /tmp/pwned)'
+  QUOTE="it's"
+  ```
+
+  New and renamed secrets must match `^[A-Za-z_][A-Za-z0-9_]*$`. Names that could inject extra lines are dropped from env, docker and yaml downloads. The web **Download .env** button uses the same safe format.
+
 ## 0.0.3
 
 ### Patch Changes

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.14.1
+
+### Patch Changes
+
+- d59fe56: `sigillo environments rename` works with only `--name` or only `--slug`. The CLI sent the missing field as `null`, which the API rejects, so the rename failed with `(422): unknown error`.
+- bc2d56b: The CLI never sends your saved token to another server, and `run --mount` is safer.
+
+  - If `SIGILLO_API_URL` or `--api-url` points somewhere other than the server the token was saved for, the token is withheld with a warning. `--token` and `SIGILLO_TOKEN` still work as given.
+  - Authenticated requests no longer follow redirects. Point `--api-url` at the final URL, for example `https://`.
+  - `run --mount` creates the file owner-only (`0600`), refuses to overwrite an existing file or follow a symlink, and deletes it even when sigillo gets `SIGTERM` or `SIGHUP`. These signals are forwarded to the child instead of killing sigillo.
+
+- f363db2: `self-host` can take a new deployment's encryption key from `SIGILLO_ENCRYPTION_KEY`.
+
+  - New deployments still get their own random `ENCRYPTION_KEY`. To choose it yourself, set `SIGILLO_ENCRYPTION_KEY` on the first deploy. It cannot be set on an existing deployment, because a new key would make its stored secrets unreadable.
+
+    ```bash
+    SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx @kldzj/sigillo self-host
+    ```
+
+  - `self-host` also stops before generating new secrets for a database that `~/.sigillo/selfhost.json` remembers without its secret, not only for one it finds by name. Before, every stored secret in it would have become unreadable.
+
 ## 0.14.0
 
 ### Minor Changes
