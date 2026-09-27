@@ -1698,7 +1698,6 @@ describe('authorization — project scoping and admin-only environments', () => 
       .values({ orgId: org.id, userId: scoped.user.id, role: 'member' })
       .returning({ id: schema.orgMember.id })
     await db.insert(schema.memberAccess).values({ orgMemberId: scopedRow!.id, projectId: projectBId })
-    // Before any lookup, because resolveEnvironment is memoized
     await db.update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, aProdEnvId))
     assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', {
       method: 'PUT', params: { pid: projectAId, eid: aProdEnvId },
