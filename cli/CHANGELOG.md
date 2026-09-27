@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.14.0
+
+### Minor Changes
+
+- 8de9c27: `--project` now accepts a project name as well as its ID.
+
+  ```bash
+  sigillo run --project website --env dev -- npm start
+  sigillo setup --project website --env dev
+  ```
+
+  Before, a name was sent to the API as if it were an ID, and the command failed with `env dev was not found in project website`. Now a value that isn't a project ID is looked up among the projects you can access. If no project has that name, the error says the project was not found and lists the ones you can use. If several projects share the name, it lists them so you can pick one by ID. `setup` saves the resolved ID, so renaming the project later doesn't break the directory's config.
+
+  An unknown project ID is also reported as a missing project now, instead of as a missing env.
+
+- The CLI is now published as `@kldzj/sigillo` from [kldzj/sigillo](https://github.com/kldzj/sigillo), a maintained fork of Sigillo with no hosted service. The command is still `sigillo`.
+
+  ```bash
+  npm i -g @kldzj/sigillo
+  npx @kldzj/sigillo self-host
+  ```
+
+  `self-host` downloads its release bundles from kldzj/sigillo's GitHub releases, and the install script and docs point there too.
+
+- 8cc4c01: The CLI no longer has a default server. Every Sigillo instance is self-hosted, so run `sigillo login --api-url https://<your-instance>` once; every other command uses the saved URL.
+
+  Without a configured server, commands stop with `no Sigillo server configured` instead of contacting sigillo.dev.
+
+- `npx @kldzj/sigillo self-host` now deploys each instance with its own login provider, instead of signing in through auth.sigillo.dev.
+
+  The provider runs as a second Worker next to the app (`<name>-auth`) with its own D1 database, and people sign in with Google through it. A new deployment needs a Google OAuth client: self-host prints the redirect URI to register at Google Cloud and asks for the client ID and secret, or takes `--google-client-id` and `--google-client-secret`. The provider's secret and the Google client are saved in `~/.sigillo/selfhost.json` and never rotated on updates. The first sign-in to an instance asks once to allow it.
+
+  A deployment that already signs in through another provider, such as one made with upstream Sigillo's self-host, keeps that provider on update, since a new one would give every user a new login.
+
+- 76c9072: `npx @kldzj/sigillo self-host` now gives new deployments their own `ENCRYPTION_KEY`.
+
+  Until now self-host only set `BETTER_AUTH_SECRET`, so the key that encrypts every stored secret was derived from the same secret that signs login sessions. New deployments now get a separate, random 32-byte `ENCRYPTION_KEY`. It is saved next to the auth secret in `~/.sigillo/selfhost.json`, so a worker recreated from that state keeps reading its data.
+
+  Existing deployments are not changed: re-runs still never send or rotate secrets, and deployments made before this keep their derived key. If self-host finds a database that already stores secrets but neither its worker nor the saved state, it now stops and explains how to recover instead of starting over with new keys that would leave those secrets unreadable. The self-hosting docs now say to back up both secrets, since a database backup cannot be decrypted without the key.
+
+  Fixes remorses/sigillo#18
+
+### Patch Changes
+
+- 654dfe4: `sigillo logout` now signs the session out on the server, not only on your machine.
+
+  Before, logout only deleted the local config entry and the session stayed valid until it expired, so any copy of the token (a backup, synced dotfiles) kept working. If the server cannot be reached, logout still removes the local entry and prints a warning. `sig_` API tokens are not affected; revoke those in the dashboard.
+
+- 2b8f7c1: `npx @kldzj/sigillo self-host` now exits with status 1 when the deploy fails. It used to print the error and still exit 0, so a CI job running `CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host --yes` passed even when nothing was deployed.
+
 <!-- https://github.com/remorses/sigillo/releases -->
 
 ## 0.13.0
@@ -64,6 +114,7 @@
    ```
 
    Affected commands and their piped output:
+
    - `sigillo secrets` — one secret name per line
    - `sigillo secrets set` — secret ID per environment
    - `sigillo orgs create` — new org ID
