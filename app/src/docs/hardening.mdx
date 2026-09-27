@@ -1,0 +1,100 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Harden your self-hosted Sigillo'
+sidebarTitle: 'Hardening'
+description: 'Who can reach the secrets on a self-hosted Sigillo, and the steps that narrow it: the Cloudflare account, the deploy file, sign-in, access inside the app, and a history you can verify.'
+icon: lucide:shield-check
+---
+
+Sigillo encrypts every secret, but the key lives in the Worker that decrypts them. Whoever controls **your Cloudflare account**, **your deploy file**, **who can sign in** or **an admin role** can get at the secrets. The steps below narrow each of those, most important first.
+
+## Who can reach your secrets
+
+| Who | What they can do | What limits it |
+|-----|------------------|----------------|
+| Anyone who can edit Workers on the Cloudflare account | Deploy code that reads every secret | [A dedicated account](#1-give-sigillo-its-own-cloudflare-account) |
+| Anyone who can edit the D1 databases | Make any account that can sign in an org admin, change the history | A dedicated account, [protected environments](#4-limit-access-inside-sigillo), [the signed history](#5-check-the-history) |
+| Anyone with `~/.sigillo/selfhost.json` | Decrypt a database export and use the sessions in it, sign history rows, and with a saved login deploy to the account | [Keep the file like a key](#2-keep-selfhostjson-like-a-key) |
+| Anyone who can sign in | What their org role and project access allow | [The sign-in allowlist](#3-decide-who-can-sign-in) |
+| Org admins | Every project and environment of their org | [Few admins](#4-limit-access-inside-sigillo) |
+
+## 1. Give Sigillo its own Cloudflare account
+
+Cloudflare hides a secret's value once it's set, in the dashboard and in Wrangler. Code running in the Worker can still read it, so **anyone who can deploy Workers on the account can read every secret**. Anyone who can edit its D1 databases can make any account that signs in an org admin.
+
+- Deploy into an account that holds nothing but Sigillo: `npx @kldzj/sigillo self-host --account <id>`.
+- Keep its members few. Under **Manage Account → Members**, a Super Administrator can turn on **2FA Enforcement**, so every member needs two-factor authentication.
+- Give people who only need to look a read-only role, such as **Administrator Read Only** or **Workers Platform (Read-only)**. **Administrator** and **Workers Platform Admin** can deploy Workers.
+
+## 2. Keep `selfhost.json` like a key
+
+`npx @kldzj/sigillo self-host` saves everything it needs to update your instance in `~/.sigillo/selfhost.json` on the machine that ran it:
+
+- `BETTER_AUTH_SECRET`, which signs every session
+- `ENCRYPTION_KEY`, which decrypts every secret
+- the login provider's secret and your Google OAuth client
+- the Cloudflare login, if you signed in with the browser
+
+It is the only copy outside the Workers: Cloudflare doesn't hand secrets back. Keep it in a password manager, and don't leave it on shared machines.
+
+Deploy with an API token instead of the browser login, and the file holds no Cloudflare login:
+
+```bash
+CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host
+```
+
+When you create the token under **My Profile → API Tokens**, set a **TTL** so it stops working on its own, and **Client IP Address Filtering** for the machine you deploy from. A browser login, once saved, stays in the file until you remove its `cloudflare` entry.
+
+## 3. Decide who can sign in
+
+By default anyone with a Google account can create an account on your instance. Pass the addresses and domains that may sign in:
+
+```bash
+npx @kldzj/sigillo self-host --allowed-users acme.com,ops@partner.io
+```
+
+The app and its login provider both check the list, and someone taken off it is signed out on their next request. See [Limit who can sign in](./self-hosting.mdx#limit-who-can-sign-in).
+
+If your team is a Google Cloud organization, through Google Workspace or Cloud Identity, create the Google OAuth client in a project that belongs to it and set its audience to **Internal** (**Google Auth Platform → Audience**). Google then only signs in members of your organization, before Sigillo's own list is checked.
+
+Everyone can see and end their own sessions under **user menu → Sessions**: every browser and CLI login, with its device, IP address and sign-in time.
+
+## 4. Limit access inside Sigillo
+
+- **Few admins.** An org admin reaches every project and environment of the org, and manages its members.
+- **Project access.** On a project's **Access** tab, limit a member to selected projects. Invitations can be limited to projects too.
+- **Admin-only environments.** On the **Environments** tab, set **Min Role** to **Admin** for production. Members then can't open it, and an API token for it works only while its creator is still an admin.
+- **Protected environments.** On the **Environments** tab, set **Protected** to **On**. Every read of its values is recorded before they leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see the reads on the **Read Log** tab. Turning protection off is recorded too.
+- **API tokens.** Anyone who can open a project's environments can create tokens for them. A token belongs to one project, optionally only some of its environments, and expires after 7, 30, 90 or 365 days. The **Tokens** tab shows when each was last used, to the hour. Prefer one token per machine or pipeline, scoped to the environment it needs.
+
+The secrets page never loads values up front: a value reaches the browser when someone reveals, downloads or copies it, and in a protected environment that is what the Read Log shows.
+
+## 5. Check the history
+
+The secret changes and the reads of each environment form hash chains, and the Worker signs every row. Editing, removing or adding a row in the database breaks the chain at that row. Check an environment as an org admin:
+
+```bash
+sigillo audit verify -c prod
+```
+
+```
+✔ changes: 42 rows, intact
+✔ reads: 7 rows, intact
+```
+
+The CLI keeps the newest row of each chain in `~/.sigillo/audit.json`, so the next check also notices rows removed or rewritten since. Run it regularly, from more than one admin's machine: each one is a witness the database can't change.
+
+What it can't catch: the signing key comes from `BETTER_AUTH_SECRET`, so someone who can deploy code to the Worker, or who has `selfhost.json`, can sign new rows or stop writing them. The history makes tampering by a database writer visible; it doesn't replace [steps 1](#1-give-sigillo-its-own-cloudflare-account) and [2](#2-keep-selfhostjson-like-a-key).
+
+## 6. When someone leaves
+
+1. On any project's **Access** tab, remove them. That removes them from the organization: every project at once, the API tokens they created there, and their open invitations.
+2. Take their address off the allowlist if it's listed, and remove them from your Google Workspace.
+3. Rotate the secrets they could read. They may have copies. In protected environments, the **Read Log** shows which values they read.
+4. If they could reach the Cloudflare account or `selfhost.json`, remove their account membership and rotate the secrets of every environment. `self-host` can't rotate `BETTER_AUTH_SECRET` or `ENCRYPTION_KEY` yet.
+
+## 7. Know what else keeps data
+
+- **Workers Logs.** Both workers have Cloudflare's Workers Logs on, and `self-host` turns them on again with every deploy. A request's log holds its method, URL and headers: the name of a secret fetched on its own, and the client's IP address. Cloudflare replaces credentials such as the `Authorization` header with `REDACTED`, as `wrangler tail` shows. Logs are kept for 3 days on the Free plan or 7 on Workers Paid, and anyone who can read logs on the account can see them.
+- **`workers.dev`.** Both workers keep their `workers.dev` URLs, also with a custom domain (`--domain`): `self-host` uses them, and the login provider only has that one.
+- **Backups.** Cloudflare keeps a point-in-time history of each D1 database for 30 days on Workers Paid, 7 on Free. `wrangler d1 time-travel restore sigillo-db --timestamp=<unix time>` overwrites the database with that point and prints a bookmark that undoes it. Restored data is only readable with the keys in `selfhost.json`. If the last `sigillo audit verify` came after the point you restored, it then reports the history as shorter.
