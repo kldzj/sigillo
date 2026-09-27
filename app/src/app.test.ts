@@ -18,7 +18,7 @@ import { app } from './app.js'
 import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
-import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey } from './audit.js'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
@@ -2355,6 +2355,41 @@ describe('tamper-evident history', () => {
     await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: false, author })
     await get(admin.token, `${envId}/secrets/X`)
     expect(await readKinds(envId)).toEqual(['protected', 'value', 'unprotected'])
+  })
+
+  test('the web UI gets a value when it is revealed, and only that is recorded', async () => {
+    const envId = await newEnv()
+    for (const [name, value] of [['X', 'x1'], ['X', 'x2'], ['Y', 'y']] as const) await setSecret(admin.token, envId, name, value)
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    const request = new Request('http://e.ly', { headers: { 'cf-connecting-ip': '203.0.113.5' } })
+    const revealed = await readSecretValues({ request, userId: admin.user.id, environmentId: envId, names: ['X'], kind: 'value' })
+    const downloaded = await readSecretValues({ request, userId: admin.user.id, environmentId: envId, names: null, kind: 'download' })
+    const old = await readEventValue({ request, userId: admin.user.id, eventId: (await eventRow(envId, 1)).id })
+    const rows = await getDb().query.secretRead.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } })
+    expect({ revealed, downloaded, old, reads: rows.map(({ kind, names, ipAddress }) => ({ kind, names, ipAddress })) }).toEqual({
+      revealed: { X: 'x2' },
+      downloaded: { X: 'x2', Y: 'y' },
+      old: 'x1',
+      reads: [
+        { kind: 'protected', names: [], ipAddress: null },
+        { kind: 'value', names: ['X'], ipAddress: '203.0.113.5' },
+        { kind: 'download', names: ['X', 'Y'], ipAddress: '203.0.113.5' },
+        { kind: 'event-log', names: ['X'], ipAddress: '203.0.113.5' },
+      ],
+    })
+  })
+
+  test('revealing needs the same access as the environment, and records nothing when refused', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'admins-only')
+    await getDb().update(schema.environment).set({ accessRole: 'admin' }).where(orm.eq(schema.environment.id, envId))
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: envId, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    const request = new Request('http://e.ly')
+    const value = await readSecretValues({ request, userId: member.user.id, environmentId: envId, names: null, kind: 'value' }).catch((error: Error) => error.message)
+    const old = await readEventValue({ request, userId: member.user.id, eventId: (await eventRow(envId, 1)).id }).catch((error: Error) => error.message)
+    expect({ value, old, reads: await readKinds(envId) }).toEqual({
+      value: 'admin access required for this environment', old: 'admin access required for this environment', reads: ['protected'],
+    })
   })
 
   test('only org admins with a login get the audit chains', async () => {

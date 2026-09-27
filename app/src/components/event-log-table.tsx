@@ -1,5 +1,6 @@
 // Event log table — shows the append-only secretEvent audit trail.
-// Env select filters events. Eye icon toggles value visibility (set events only).
+// Env select filters events. Eye icon fetches and shows an old value (set
+// events only), which protected environments record in the read log.
 // Badges: green for "set", red for "delete".
 
 "use client";
@@ -9,6 +10,7 @@ import { cn } from "sigillo-app/src/lib/utils";
 import { AdminOnlyEnvironment, EmptyState } from "sigillo-app/src/components/ui/empty-state";
 import { useState } from "react";
 import { router, useLoaderData } from "spiceflow/react";
+import { revealEventValueAction } from "../actions.ts";
 import { Badge } from "sigillo-app/src/components/ui/badge";
 import { Frame } from "sigillo-app/src/components/ui/frame";
 import {
@@ -40,9 +42,19 @@ export function EventLogTable() {
     projectId,
   } = useLoaderData('/dash/projects/:projectId/envs/:envSlug/event-log');
   const [visibleValues, setVisibleValues] = useState<Record<string, boolean>>({});
+  const [values, setValues] = useState<Record<string, string | null>>({});
 
-  const toggleValue = (id: string) => {
-    setVisibleValues((prev) => ({ ...prev, [id]: !prev[id] }));
+  const toggleValue = async (id: string) => {
+    const show = !visibleValues[id];
+    setVisibleValues((prev) => ({ ...prev, [id]: show }));
+    if (!show || id in values) return;
+    try {
+      const value = await revealEventValueAction({ eventId: id });
+      setValues((prev) => ({ ...prev, [id]: value }));
+    } catch (e: any) {
+      setVisibleValues((prev) => ({ ...prev, [id]: false }));
+      alert(e?.message || "Failed to load the value");
+    }
   };
 
   return (
@@ -102,7 +114,8 @@ export function EventLogTable() {
             <TableBody>
               {events.map((evt) => {
                 const isVisible = visibleValues[evt.id] ?? false;
-                const hasValue = evt.operation === "set" && evt.value != null;
+                const hasValue = evt.hasValue;
+                const loaded = evt.id in values;
                 return (
                   <TableRow key={evt.id}>
                     <TableCell>
@@ -128,10 +141,10 @@ export function EventLogTable() {
                               !isVisible && "text-security-disc",
                             )}
                           >
-                            {isVisible ? evt.value : "••••••••••••"}
+                            {!isVisible ? "••••••••••••" : loaded ? values[evt.id] : "Loading…"}
                           </span>
                           <button
-                            onClick={() => toggleValue(evt.id)}
+                            onClick={() => void toggleValue(evt.id)}
                             className="text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
                             title={isVisible ? "Hide value" : "Reveal value"}
                           >
