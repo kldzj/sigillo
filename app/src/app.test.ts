@@ -524,6 +524,47 @@ describe('api tokens', () => {
     expect(result.value).toBe('secret-value')
   })
 
+  // Regression: secret_event.api_token_id was ON DELETE CASCADE, so deleting
+  // a token deleted the secrets it wrote and reverted overwritten values.
+  test('deleting a token or user keeps the secrets it wrote', async () => {
+    const user = await createTestUser({ name: 'TokenDeleteUser' })
+    const { key, tokenId } = await insertApiToken({ name: 'writer', projectId, createdBy: user.user.id })
+    assertOk(await authedFetch(userToken)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'POST',
+      params: { pid: projectId, eid: devEnvId },
+      body: { name: 'TOKEN_OVERWRITE', value: 'written-by-user' },
+    }))
+    assertOk(await authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets', {
+      method: 'PUT',
+      params: { pid: projectId, eid: devEnvId },
+      body: { secrets: { TOKEN_OVERWRITE: 'overwritten-by-token', TOKEN_ONLY: 'written-by-token' } },
+    }))
+
+    // Same for a deleted user (user_id was also ON DELETE CASCADE).
+    const author = await createTestUser({ name: 'DeletedAuthor' })
+    const enc = await encrypt('written-by-deleted-user')
+    await getDb().insert(schema.secretEvent).values({
+      environmentId: devEnvId, name: 'USER_ONLY', operation: 'set', valueEncrypted: enc.encrypted, iv: enc.iv, userId: author.user.id,
+    })
+
+    await getDb().delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
+    await getDb().delete(schema.user).where(orm.eq(schema.user.id, author.user.id))
+
+    const derived = await deriveSecrets(devEnvId)
+    const values = Object.fromEntries(await Promise.all(
+      derived
+        .filter((d) => ['TOKEN_OVERWRITE', 'TOKEN_ONLY', 'USER_ONLY'].includes(d.name))
+        .map(async (d) => [d.name, await decrypt(d.valueEncrypted!, d.iv!)] as const),
+    ))
+    expect(values).toMatchInlineSnapshot(`
+      {
+        "TOKEN_ONLY": "written-by-token",
+        "TOKEN_OVERWRITE": "overwritten-by-token",
+        "USER_ONLY": "written-by-deleted-user",
+      }
+    `)
+  })
+
   test('env-scoped token cannot access other environments', async () => {
     const user = await createTestUser({ name: 'ScopedTokenUser' })
     const { key } = await insertApiToken({

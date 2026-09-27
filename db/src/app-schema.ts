@@ -166,10 +166,12 @@ export const secretEvent = sqliteCore.sqliteTable('secret_event', {
   valueEncrypted: sqliteCore.text('value_encrypted'),
   // AES-GCM initialization vector, stored as base64. Null for delete events.
   iv: sqliteCore.text('iv'),
-  // Exactly one of userId/apiTokenId is set — identifies who performed the action.
-  // userId for human users (session auth), apiTokenId for programmatic access (bearer token).
-  userId: sqliteCore.text('user_id').references(() => user.id, { onDelete: 'cascade' }),
-  apiTokenId: sqliteCore.text('api_token_id').references(() => apiToken.id, { onDelete: 'cascade' }),
+  // Who performed the action: userId for session auth, apiTokenId for bearer
+  // tokens. SET NULL, never CASCADE: deleting a token or user must not delete
+  // the secrets it wrote (cascade used to revert values to older versions).
+  // Both null = author was deleted.
+  userId: sqliteCore.text('user_id').references(() => user.id, { onDelete: 'set null' }),
+  apiTokenId: sqliteCore.text('api_token_id').references(() => apiToken.id, { onDelete: 'set null' }),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
 }, (table) => [
   sqliteCore.index('secret_event_env_name_idx').on(table.environmentId, table.name, table.createdAt),
@@ -199,8 +201,8 @@ export const apiToken = sqliteCore.sqliteTable('api_token', {
 // Env allowlist for a token. Zero rows = all envs in the project.
 // One or more rows = only those envs. Migration 0007 adds a trigger that
 // revokes the token when its last row is deleted, so cascade cannot widen
-// a scoped token to all. D1 keeps foreign_keys ON, so that migration also
-// parks secret_event before DROP TABLE api_token (api_token_id CASCADE).
+// a scoped token to all. D1 keeps foreign_keys ON (PRAGMA foreign_keys=OFF
+// is ignored), so any DROP TABLE of a parent fires child ON DELETE actions.
 export const apiTokenEnvironment = sqliteCore.sqliteTable('api_token_environment', {
   id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
   tokenId: sqliteCore.text('token_id').notNull().references(() => apiToken.id, { onDelete: 'cascade' }),
