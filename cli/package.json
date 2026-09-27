@@ -3,7 +3,9 @@
   "version": "0.13.0",
   "type": "module",
   "description": "CLI for Sigillo — self-hostable secret manager. Manage secrets, environments, and configs from the terminal.",
-  "bin": "./dist/bin.js",
+  "bin": {
+    "sigillo": "dist/bin.js"
+  },
   "files": [
     "dist",
     "zig",
