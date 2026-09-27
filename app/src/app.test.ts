@@ -2402,3 +2402,48 @@ describe('tamper-evident history', () => {
     }).toEqual({ member: 403, token: 403, admin: 200 })
   })
 })
+
+describe('remembered environment', () => {
+  let token: string
+  let projectId: string
+  beforeAll(async () => {
+    const user = await createTestUser({ name: 'Env Rememberer' })
+    token = user.token
+    const af = authedFetch(token)
+    const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Env Org' } }))
+    projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Env Project', orgId: org.id } })).id
+  })
+  const get = (path: string, cookie = '') => app.handle(new Request(`http://e.ly${path}`, {
+    headers: { authorization: `Bearer ${token}`, ...(cookie ? { cookie } : {}) },
+    redirect: 'manual',
+  }))
+
+  test('the tabs without an environment go back to the one last opened, while it exists', async () => {
+    const where = async (path: string, cookie?: string) => new URL((await get(path, cookie)).headers.get('location') ?? '', 'http://e.ly').pathname
+    expect({
+      none: await where(`/dash/projects/${projectId}/event-log`),
+      remembered: await where(`/dash/projects/${projectId}/read-log`, `sigillo-env-${projectId}=prod`),
+      deleted: await where(`/dash/projects/${projectId}/event-log`, `sigillo-env-${projectId}=gone`),
+      otherProject: await where(`/dash/projects/${projectId}/event-log`, `sigillo-env-other=prod`),
+    }).toEqual({
+      none: `/dash/projects/${projectId}/envs/dev/event-log`,
+      remembered: `/dash/projects/${projectId}/envs/prod/read-log`,
+      deleted: `/dash/projects/${projectId}/envs/dev/event-log`,
+      otherProject: `/dash/projects/${projectId}/envs/dev/event-log`,
+    })
+  })
+
+  test('the dashboard goes to the one last opened too', async () => {
+    let path = '/dash'
+    for (let hop = 0; hop < 3 && !path.includes('/envs/'); hop++) {
+      path = new URL((await get(path, `sigillo-env-${projectId}=prod`)).headers.get('location') ?? '', 'http://e.ly').pathname
+    }
+    expect(path).toBe(`/dash/projects/${projectId}/envs/prod`)
+  })
+
+  test('opening an environment page remembers it', async () => {
+    const res = await get(`/dash/projects/${projectId}/envs/preview/event-log`)
+    expect({ status: res.status, cookie: res.headers.getSetCookie().find((c) => c.startsWith('sigillo-env-')) })
+      .toEqual({ status: 200, cookie: `sigillo-env-${projectId}=preview; Path=/dash; Max-Age=31536000; SameSite=Lax; HttpOnly` })
+  })
+})

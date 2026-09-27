@@ -140,8 +140,8 @@ function SidebarContent({
         <nav className="flex flex-col gap-0.5">
           {projects.map((project) => {
             const isActive = currentProjectId === project.id;
-            const href = project.firstEnvSlug
-              ? router.href('/dash/projects/:projectId/envs/:envSlug', { projectId: project.id, envSlug: project.firstEnvSlug })
+            const href = project.envSlug
+              ? router.href('/dash/projects/:projectId/envs/:envSlug', { projectId: project.id, envSlug: project.envSlug })
               : router.href('/dash/projects/:projectId', { projectId: project.id })
             return (
               <Link

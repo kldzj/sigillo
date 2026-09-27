@@ -54,6 +54,31 @@ function hasCookie(args: { cookieHeader: string; name: string }) {
     .some((part) => part.trim().startsWith(`${args.name}=`))
 }
 
+// ── Remembered environment ─────────────────────────────────────────
+// Each project remembers the environment last opened (secrets, event log or
+// read log) in a cookie, so its tabs and links return there instead of
+// jumping to the first environment.
+const envPagePath = /^\/dash\/projects\/([^/]+)\/envs\/([^/]+)(?:\/(?:event-log|read-log))?$/
+
+function envCookieName(projectId: string) {
+  return `sigillo-env-${projectId}`
+}
+
+function getCookie(cookieHeader: string, name: string): string | null {
+  for (const part of cookieHeader.split(';')) {
+    const [key, ...value] = part.trim().split('=')
+    if (key === name) return decodeURIComponent(value.join('='))
+  }
+  return null
+}
+
+// The project's remembered environment while it still exists, else its first
+function projectEnvSlug(request: Request, projectId: string, environments: { slug: string; createdAt: number }[]): string | null {
+  const sorted = [...environments].sort((a, b) => a.createdAt - b.createdAt)
+  const remembered = getCookie(request.headers.get('cookie') ?? '', envCookieName(projectId))
+  return sorted.find((env) => env.slug === remembered)?.slug ?? sorted[0]?.slug ?? null
+}
+
 // Strada observability (strada.sh). trace.getTracer returns a proxy that
 // delegates to the provider registered by initStrada() in the fetch handler,
 // so module-level creation is safe. Self-hosted instances have no
@@ -73,6 +98,22 @@ export const app = new Spiceflow({ tracer })
       if (res.ok || res.status !== 404) return res
     }
     return next()
+  })
+
+  // Remember the environment of every environment page that loads
+  .use(async ({ request }, next) => {
+    const response = await next()
+    const url = new URL(request.url)
+    const match = request.method === 'GET' ? envPagePath.exec(url.pathname) : null
+    if (!match || !(response instanceof Response) || response.status !== 200) return response
+    const [, projectId, envSlug] = match
+    const headers = new Headers(response.headers)
+    headers.append('Set-Cookie', [
+      `${envCookieName(decodeURIComponent(projectId!))}=${envSlug}`,
+      'Path=/dash', 'Max-Age=31536000', 'SameSite=Lax', 'HttpOnly',
+      ...(url.protocol === 'https:' ? ['Secure'] : []),
+    ].join('; '))
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   })
 
   // ── Layout: Dashboard routes (HTML shell + sidebar chrome) ──────
@@ -117,7 +158,7 @@ export const app = new Spiceflow({ tracer })
       orgs,
       projectId,
       pathname,
-      currentProjectFirstEnvSlug: null,
+      currentProjectEnvSlug: null,
       user: { name: session.user.name || 'User', email: session.user.email || '' },
     }
   })
@@ -136,17 +177,14 @@ export const app = new Spiceflow({ tracer })
 
     const projects = allProjects
       .filter((p) => accessibleIds === null || accessibleIds.includes(p.id))
-      .map((p) => {
-        const sortedEnvs = [...(p.environments || [])].sort((a, b) => a.createdAt - b.createdAt)
-        return { id: p.id, name: p.name, firstEnvSlug: sortedEnvs[0]?.slug ?? null }
-      })
+      .map((p) => ({ id: p.id, name: p.name, envSlug: projectEnvSlug(request, p.id, p.environments || []) }))
 
     return {
       orgId: params.orgId,
       projectId: null,
       projects,
       environments: [],
-      currentProjectFirstEnvSlug: null,
+      currentProjectEnvSlug: null,
     }
   })
 
@@ -175,10 +213,7 @@ export const app = new Spiceflow({ tracer })
 
     const projects = allProjects
       .filter((p) => accessibleIds === null || accessibleIds.includes(p.id))
-      .map((p) => {
-        const sortedEnvs = [...(p.environments || [])].sort((a, b) => a.createdAt - b.createdAt)
-        return { id: p.id, name: p.name, firstEnvSlug: sortedEnvs[0]?.slug ?? null }
-      })
+      .map((p) => ({ id: p.id, name: p.name, envSlug: projectEnvSlug(request, p.id, p.environments || []) }))
     const currentProject = allProjects.find((project) => project.id === projectId)
     const environments = [...(currentProject?.environments || [])].sort((a, b) => a.createdAt - b.createdAt)
 
@@ -189,7 +224,7 @@ export const app = new Spiceflow({ tracer })
       pathname: url.pathname,
       projects,
       environments,
-      currentProjectFirstEnvSlug: projects.find((project) => project.id === projectId)?.firstEnvSlug ?? null,
+      currentProjectEnvSlug: projects.find((project) => project.id === projectId)?.envSlug ?? null,
     }
   })
 
@@ -204,7 +239,7 @@ export const app = new Spiceflow({ tracer })
             <TabBar
               projectId={projectId}
               pathname={loaderData.pathname}
-              firstEnvSlug={loaderData.currentProjectFirstEnvSlug}
+              envSlug={loaderData.currentProjectEnvSlug}
             />
             <div className="border-t border-border" />
           </>
@@ -248,8 +283,7 @@ export const app = new Spiceflow({ tracer })
       orderBy: { createdAt: 'desc' },
     })
     if (firstProject) {
-      const sortedEnvs = [...(firstProject.environments || [])].sort((a, b) => a.createdAt - b.createdAt)
-      const envSlug = sortedEnvs[0]?.slug ?? '_'
+      const envSlug = projectEnvSlug(request, firstProject.id, firstProject.environments || []) ?? '_'
       const href = `/dash/projects/${encodeURIComponent(firstProject.id)}/envs/${encodeURIComponent(envSlug)}`
       return Response.redirect(new URL(href, request.url).toString(), 302)
     }
@@ -268,8 +302,7 @@ export const app = new Spiceflow({ tracer })
       orderBy: { createdAt: 'desc' },
     })
     if (firstProject) {
-      const sortedEnvs = [...(firstProject.environments || [])].sort((a, b) => a.createdAt - b.createdAt)
-      const envSlug = sortedEnvs[0]?.slug ?? '_'
+      const envSlug = projectEnvSlug(request, firstProject.id, firstProject.environments || []) ?? '_'
       const href = `/dash/projects/${encodeURIComponent(firstProject.id)}/envs/${encodeURIComponent(envSlug)}`
       return Response.redirect(new URL(href, request.url).toString(), 302)
     }
@@ -327,8 +360,8 @@ export const app = new Spiceflow({ tracer })
       where: { projectId: params.projectId },
       orderBy: { createdAt: 'asc' },
     })
-    const firstEnvSlug = environments[0]?.slug || '_'
-    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}`)
+    const envSlug = projectEnvSlug(request, params.projectId, environments) || '_'
+    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(envSlug)}`)
   })
 
   .loader('/dash/projects/:projectId/envs/:envSlug', async ({ request, params, redirect }) => {
@@ -448,14 +481,14 @@ export const app = new Spiceflow({ tracer })
   })
 
   // ── Event Log page ─────────────────────────────────────────────
-  .get('/dash/projects/:projectId/event-log', async ({ params, redirect }) => {
+  .get('/dash/projects/:projectId/event-log', async ({ params, request, redirect }) => {
     const db = getDb()
     const environments = await db.query.environment.findMany({
       where: { projectId: params.projectId },
       orderBy: { createdAt: 'asc' },
     })
-    const firstEnvSlug = environments[0]?.slug || '_'
-    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}/event-log`)
+    const envSlug = projectEnvSlug(request, params.projectId, environments) || '_'
+    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(envSlug)}/event-log`)
   })
 
   .loader('/dash/projects/:projectId/envs/:envSlug/event-log', async ({ params, request, redirect }) => {
@@ -522,14 +555,14 @@ export const app = new Spiceflow({ tracer })
 
   // ── Read Log page ──────────────────────────────────────────────
   // Reads of a protected environment's values, for org admins
-  .get('/dash/projects/:projectId/read-log', async ({ params, redirect }) => {
+  .get('/dash/projects/:projectId/read-log', async ({ params, request, redirect }) => {
     const db = getDb()
     const environments = await db.query.environment.findMany({
       where: { projectId: params.projectId },
       orderBy: { createdAt: 'asc' },
     })
-    const firstEnvSlug = environments[0]?.slug || '_'
-    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(firstEnvSlug)}/read-log`)
+    const envSlug = projectEnvSlug(request, params.projectId, environments) || '_'
+    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(envSlug)}/read-log`)
   })
 
   .loader('/dash/projects/:projectId/envs/:envSlug/read-log', async ({ params, request, redirect }) => {
@@ -840,15 +873,15 @@ function GitHubIcon({ className }: { className?: string }) {
 function TabBar({
   projectId,
   pathname,
-  firstEnvSlug,
+  envSlug: rememberedEnvSlug,
 }: {
   projectId: string
   pathname: string
-  firstEnvSlug: string | null
+  envSlug: string | null
 }) {
   const base = `/dash/projects/${projectId}`
   const envMatch = pathname.match(new RegExp(`^${base}/envs/([^/]+)`))
-  const envSlug = envMatch?.[1] ?? firstEnvSlug
+  const envSlug = envMatch?.[1] ?? rememberedEnvSlug
   const secretsHref = envSlug
     ? router.href('/dash/projects/:projectId/envs/:envSlug', { projectId, envSlug })
     : router.href('/dash/projects/:projectId', { projectId })
