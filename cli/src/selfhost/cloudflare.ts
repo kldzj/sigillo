@@ -68,6 +68,8 @@ export interface DeploymentState {
   workerName: string
   databaseId: string
   betterAuthSecret?: string
+  /** unset for deployments made before self-host generated one */
+  encryptionKey?: string
   deployedVersion?: string
   url?: string
   customDomain?: string
@@ -89,8 +91,8 @@ export function readState(): SelfhostState {
   }
 }
 
-// The state file holds Cloudflare tokens and BETTER_AUTH_SECRET (which
-// derives the DB encryption key): write it 0600, atomically (tmp + rename so
+// The state file holds Cloudflare tokens, BETTER_AUTH_SECRET and
+// ENCRYPTION_KEY (the DB encryption key): write it 0600, atomically (tmp + rename so
 // a crash can't truncate the only copy), and re-chmod existing files that
 // were created before this hardening.
 export function writeState(state: SelfhostState) {
