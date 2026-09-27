@@ -106,5 +106,5 @@
     "/dash/*",
     "/api/*"
   ],
-  // "decorativeLines": "none"
+  "decorativeLines": "none"
 }
