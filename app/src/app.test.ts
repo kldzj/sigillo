@@ -15,7 +15,7 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, deleteOrgMember, resolveEnvironment, requireEnvironmentAccess, ForbiddenError } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, deleteOrgMember, resolveEnvironment, requireEnvironmentAccess, ForbiddenError, getClaimableAutoJoinDomain } from './db.js'
 import { schema } from 'db'
 import { formatAbsoluteDate, formatTime } from './lib/utils.js'
 
@@ -1318,6 +1318,48 @@ describe('auto-join by email domain', () => {
       userId: gmailUser.user.id,
       user: { id: gmailUser.user.id, name: 'GmailSkip', email: 'someone@gmail.com', emailVerified: true },
     })
+  })
+
+  // AGENTS.md: "First user to claim a domain gets it." Without a unique claim,
+  // any verified colleague could create a second org for the same domain and
+  // silently enroll everyone who signs in next.
+  test('a second org cannot claim a domain another org already auto-joins', async () => {
+    const db = getDb()
+    const first = await createTestUser({ email: 'it@claimed-test.com', name: 'FirstClaim' })
+    const second = await createTestUser({ email: 'mallory@claimed-test.com', name: 'SecondClaim' })
+    await db.update(schema.user).set({ emailVerified: true }).where(orm.inArray(schema.user.id, [first.user.id, second.user.id]))
+    const org = assertOk(await authedFetch(first.token)('/api/v0/orgs', {
+      method: 'POST', body: { name: 'Claimed Co', enableAutoJoin: true },
+    }))
+    assertErrorStatus(await authedFetch(second.token)('/api/v0/orgs', {
+      method: 'POST', body: { name: 'Claimed Co (new)', enableAutoJoin: true },
+    }), 400)
+
+    // The next colleague to sign in joins the first claimant's org only
+    const colleague = await createTestUser({ email: 'dev@claimed-test.com', name: 'Colleague' })
+    await autoJoinOrgsByDomain({
+      userId: colleague.user.id,
+      user: { id: colleague.user.id, name: 'Colleague', email: 'dev@claimed-test.com', emailVerified: true },
+    })
+    const memberships = await db.query.orgMember.findMany({ where: { userId: colleague.user.id } })
+    expect(memberships.map((m) => m.orgId)).toEqual([org.id])
+  })
+
+  test('only the org that owns a domain may turn auto-join back on', async () => {
+    const db = getDb()
+    const owner = await createTestUser({ email: 'owner@reclaim-test.com', name: 'Owner' })
+    await db.update(schema.user).set({ emailVerified: true }).where(orm.eq(schema.user.id, owner.user.id))
+    const org = assertOk(await authedFetch(owner.token)('/api/v0/orgs', {
+      method: 'POST', body: { name: 'Reclaim Co', enableAutoJoin: true },
+    }))
+    const session = {
+      userId: owner.user.id,
+      user: { id: owner.user.id, name: 'Owner', email: 'owner@reclaim-test.com', emailVerified: true },
+    }
+    expect(await getClaimableAutoJoinDomain({ session, orgId: org.id })).toBe('reclaim-test.com')
+    expect(await getClaimableAutoJoinDomain({ session })).toBeInstanceOf(Error)
+    // The unique index also stops two claims that race past the check
+    await expect(db.insert(schema.org).values({ name: 'Racer', autoJoinDomain: 'reclaim-test.com' })).rejects.toThrow()
   })
 })
 

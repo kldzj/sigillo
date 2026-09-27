@@ -29,12 +29,11 @@ import {
   deriveEnvironmentSecretsAndNames,
   encrypt,
   decrypt,
-  getEmailDomain,
-  COMMON_EMAIL_DOMAINS,
   getMemberProjectAccess,
   getAccessibleProjectIds,
   requireApiProjectAccess,
   requireApiEnvironmentAccess,
+  getClaimableAutoJoinDomain,
 } from './db.ts'
 import { memoize } from './lib/memoize.ts'
 
@@ -383,13 +382,8 @@ export const apiApp = new Spiceflow()
 
       let autoJoinDomain: string | null = null
       if (body.enableAutoJoin) {
-        if (!session.user.emailVerified) {
-          throw json({ error: 'Email must be verified to enable auto-join' }, { status: 400 })
-        }
-        const domain = getEmailDomain(session.user.email)
-        if (!domain || COMMON_EMAIL_DOMAINS.has(domain)) {
-          throw json({ error: 'Cannot enable auto-join for public email domains' }, { status: 400 })
-        }
+        const domain = await getClaimableAutoJoinDomain({ session })
+        if (domain instanceof Error) throw json({ error: domain.message }, { status: 400 })
         autoJoinDomain = domain
       }
 
