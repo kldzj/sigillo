@@ -24,6 +24,7 @@ import {
   getAccessibleProjectIds,
   getEnvironmentAccessError,
   getProjectMemberAccess,
+  listUserSessions,
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
@@ -522,6 +523,20 @@ export const app = new Spiceflow({ tracer })
     return (
       <div className="flex flex-col gap-3 w-full">
         <EventLogTable />
+      </div>
+    )
+  })
+
+  // ── Your sessions ──────────────────────────────────────────────────
+  .loader('/dash/sessions', async ({ request }) => {
+    return { sessions: await listUserSessions(request) }
+  })
+
+  .page('/dash/sessions', async () => {
+    const { SessionsPage } = await import('sigillo-app/src/components/sessions-page')
+    return (
+      <div className="flex flex-col gap-3 w-full">
+        <SessionsPage />
       </div>
     )
   })
