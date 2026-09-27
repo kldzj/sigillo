@@ -119,13 +119,11 @@ export function isSigilloWorker(settings: { bindings?: Array<{ type: string; nam
  * `d1_migrations` history starts with our first migration is ours, anything
  * else is an unrelated database that must not be touched.
  */
-export async function ensureDatabase({ client, accountId, name, firstMigrationName, newSecrets }: {
+export async function ensureDatabase({ client, accountId, name, firstMigrationName }: {
   client: CfClient
   accountId: string
   name: string
   firstMigrationName?: string
-  /** This deploy generates a new BETTER_AUTH_SECRET (no worker, no saved state) */
-  newSecrets: boolean
 }): Promise<string> {
   const existing = await client.findD1ByName(accountId, name)
   if (!existing) {
@@ -148,30 +146,39 @@ export async function ensureDatabase({ client, accountId, name, firstMigrationNa
       sql: 'SELECT name FROM d1_migrations ORDER BY id LIMIT 1;',
     })
     const first = appliedResult?.results?.[0]?.name
-    if (first === undefined || first === firstMigrationName) {
-      // Adopting a database with stored secrets under a freshly generated
-      // BETTER_AUTH_SECRET makes every one of them undecryptable, silently.
-      if (newSecrets && tables.includes('secret_event')) {
-        const [secretsResult] = await client.d1Query({
-          accountId,
-          databaseId: existing.uuid,
-          sql: 'SELECT 1 AS found FROM secret_event LIMIT 1;',
-        })
-        if (secretsResult?.results?.length) {
-          throw new Error(
-            `The D1 database "${name}" already stores secrets, but its worker and the saved keys in ` +
-              '~/.sigillo/selfhost.json are gone. A new deploy would generate a new secret and make them unreadable. ' +
-              'Restore ~/.sigillo/selfhost.json and re-run, or deploy under --name <other-name>.',
-          )
-        }
-      }
-      return existing.uuid
-    }
+    if (first === undefined || first === firstMigrationName) return existing.uuid
   }
 
   throw new Error(
     `A D1 database named "${name}" already exists on this account and does not look like a Sigillo database. ` +
       'Re-run with --name <other-name> to deploy under a different name.',
+  )
+}
+
+/**
+ * Refuse to deploy a freshly generated BETTER_AUTH_SECRET onto a database that
+ * already stores secrets: they were encrypted with a key that is gone (worker
+ * deleted, and the secret is not in selfhost.json), so every one of them
+ * would silently become unreadable. Covers adopted-by-name databases and
+ * databases remembered in state whose worker was adopted without its secret.
+ */
+export async function assertNoStoredSecrets({ client, accountId, databaseId }: {
+  client: CfClient
+  accountId: string
+  databaseId: string
+}): Promise<void> {
+  const [tablesResult] = await client.d1Query({
+    accountId,
+    databaseId,
+    sql: "SELECT name FROM sqlite_master WHERE type='table' AND name = 'secret_event';",
+  })
+  if (!tablesResult?.results?.length) return
+  const [secretsResult] = await client.d1Query({ accountId, databaseId, sql: 'SELECT 1 AS found FROM secret_event LIMIT 1;' })
+  if (!secretsResult?.results?.length) return
+  throw new Error(
+    'This D1 database already stores secrets, but its worker is gone and ~/.sigillo/selfhost.json has no saved ' +
+      'BETTER_AUTH_SECRET for it. Deploying would generate a new secret and make every stored secret unreadable. ' +
+      'Restore the original ~/.sigillo/selfhost.json and re-run, or deploy under --name <other-name>.',
   )
 }
 
@@ -275,7 +282,7 @@ export function resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv }: 
   workerExists: boolean
   saved?: { betterAuthSecret?: string; encryptionKey?: string }
   encryptionKeyEnv?: string
-}): { betterAuthSecret?: string; encryptionKey?: string } {
+}): { betterAuthSecret?: string; encryptionKey?: string; generated?: boolean } {
   const encryptionKey = encryptionKeyEnv?.trim() || undefined
   if (encryptionKey && Buffer.from(encryptionKey, 'base64').length !== 32) {
     throw new Error('SIGILLO_ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32)')
@@ -296,6 +303,7 @@ export function resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv }: 
   return {
     betterAuthSecret: saved?.betterAuthSecret ?? generateBetterAuthSecret(),
     encryptionKey: encryptionKey ?? saved?.encryptionKey,
+    generated: !saved?.betterAuthSecret,
   }
 }
 

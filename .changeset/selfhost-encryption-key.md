@@ -10,6 +10,6 @@
   SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx sigillo self-host
   ```
 
-- If the worker and `~/.sigillo/selfhost.json` are gone but the D1 database still stores secrets, `self-host` now stops instead of deploying with a new secret that would make them all unreadable.
+- If a deploy would generate a new `BETTER_AUTH_SECRET` for a D1 database that already stores secrets (worker gone, and no saved secret in `~/.sigillo/selfhost.json`), `self-host` now stops. Before, it deployed anyway and every stored secret became unreadable.
 
 Fixes #18

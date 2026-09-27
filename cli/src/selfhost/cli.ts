@@ -18,6 +18,7 @@ import {
 } from './cloudflare.js'
 import {
   applyMigrations,
+  assertNoStoredSecrets,
   ensureDatabase,
   fetchReleaseInfo,
   isSigilloWorker,
@@ -146,10 +147,11 @@ async function selfHost(options: SelfHostOptions) {
   spinner.start('Provisioning D1 database')
   const firstMigrationName = Object.keys(bundle.migrations).sort()[0]
   // Validate before touching anything: a bad SIGILLO_ENCRYPTION_KEY must fail early.
-  const secrets = resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv: process.env.SIGILLO_ENCRYPTION_KEY })
+  const { generated, ...secrets } = resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv: process.env.SIGILLO_ENCRYPTION_KEY })
   const databaseId =
     saved?.databaseId ??
-    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName, newSecrets: !workerExists }))
+    (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName }))
+  if (generated) await assertNoStoredSecrets({ client, accountId, databaseId })
   const applied = await applyMigrations({ client, accountId, databaseId, migrations: bundle.migrations })
   spinner.stop(
     applied.length > 0
