@@ -14,7 +14,7 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
-import { describeUserAgent } from "sigillo-app/src/lib/utils"
+import { describeUserAgent, formatIp } from "sigillo-app/src/lib/utils"
 import { endSessionAction, endOtherSessionsAction } from "../actions.ts"
 
 export function SessionsPage() {
@@ -96,8 +96,8 @@ export function SessionsPage() {
                   </span>
                 </TableCell>
                 <TableCell>
-                  <code className="text-xs text-muted-foreground mono-sm">
-                    {session.ipAddress ?? "—"}
+                  <code className="block truncate text-xs text-muted-foreground mono-sm" title={session.ipAddress ?? undefined}>
+                    {formatIp(session.ipAddress) ?? "—"}
                   </code>
                 </TableCell>
                 <TableCell>

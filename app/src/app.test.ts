@@ -18,7 +18,7 @@ import { app } from './app.js'
 import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
-import { formatAbsoluteDate, formatTime, describeUserAgent } from './lib/utils.js'
+import { formatAbsoluteDate, formatTime, describeUserAgent, formatIp } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
 
@@ -1930,6 +1930,26 @@ describe('your sessions', () => {
     const [browserSession] = (await listUserSessions(as(other))).filter((row) => !row.isCurrent)
     await endUserSession(as(other), browserSession!.id)
     expect({ before, after: (await me({ cookie })).status }).toEqual({ before: 200, after: 401 })
+  })
+})
+
+describe('formatIp', () => {
+  test('writes IPv6 short, and leaves IPv4 and short forms as they are', () => {
+    expect([
+      '2a01:04f8:0c17:6611:0000:0000:0000:0000',
+      '2001:0db8:0000:0000:0001:0000:0000:0001',
+      '2001:0db8:0001:0002:0003:0004:0005:0006',
+      '2a01:4f8:c17:6611::1',
+      '203.0.113.7',
+      null,
+    ].map(formatIp)).toEqual([
+      '2a01:4f8:c17:6611::',
+      '2001:db8::1:0:0:1',
+      '2001:db8:1:2:3:4:5:6',
+      '2a01:4f8:c17:6611::1',
+      '203.0.113.7',
+      null,
+    ])
   })
 })
 
