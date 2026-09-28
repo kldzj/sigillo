@@ -231,6 +231,13 @@ CLOUDFLARE_ENV=preview sigillo run -c preview --command 'vite build && wrangler 
 
 After setup, `sigillo run` in any subdirectory uses that project + environment automatically.
 
+**Git worktrees** inherit the setup of their main checkout at the same relative path. Setup in `~/repo` and `~/repo/app` also applies to `/tmp/feature` and `/tmp/feature/app` when `/tmp/feature` is a worktree of `~/repo`. A setup saved inside the worktree overrides the main checkout for that worktree only.
+
+```bash
+# from inside a worktree: configure the main checkout, so every worktree gets it
+sigillo setup --scope /path/to/main/checkout --project proj_abc --env dev
+```
+
 ### CI environment variables
 
 ```yaml

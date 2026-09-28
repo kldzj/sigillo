@@ -195,37 +195,93 @@ pub fn clearScope(allocator: std.mem.Allocator, scope_input: []const u8) !void {
 
 pub const default_api_url = "https://sigillo.dev";
 
-// Longest-scope-wins accumulator. A saved token remembers the api_url of the
-// record it came from so it is only ever sent to the server that issued it.
+/// A linked git worktree and the main checkout it belongs to.
+pub const GitWorktree = struct {
+    root: []const u8,
+    main_root: []const u8,
+
+    /// Path inside the main checkout that mirrors `path` inside this worktree.
+    pub fn toMain(self: GitWorktree, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.main_root, relativeTo(path, self.root).? });
+    }
+};
+
+/// How specific a matching scope is. Compared field by field:
+/// 1. scopes inside the repo (worktree or main checkout) beat ancestors like `/`
+/// 2. deeper scopes win (repo-relative depth, so worktree and main paths compare fairly)
+/// 3. on a tie, the worktree's own scope beats the main checkout's
+const ScopeRank = struct {
+    in_repo: bool = false,
+    len: usize = 0,
+    worktree: bool = false,
+
+    fn beats(self: ScopeRank, other: ?ScopeRank) bool {
+        const o = other orelse return true;
+        if (self.in_repo != o.in_repo) return self.in_repo;
+        if (self.len != o.len) return self.len > o.len;
+        return self.worktree and !o.worktree;
+    }
+};
+
+/// Rank of `scope` for `cwd`, or null if it does not apply. Inside a linked
+/// worktree, scopes of the main checkout apply at the same relative path, so
+/// `sigillo setup` in the main repo (and its subfolders) covers every worktree.
+fn scopeRank(scope: []const u8, cwd: []const u8, worktree: ?GitWorktree) ?ScopeRank {
+    const wt = worktree orelse {
+        return if (scopeMatches(cwd, scope)) .{ .len = scope.len } else null;
+    };
+    const cwd_rel = relativeTo(cwd, wt.root).?;
+    if (relativeTo(scope, wt.root)) |scope_rel| {
+        if (!scopeMatches(cwd_rel, scope_rel)) return null;
+        return .{ .in_repo = true, .len = scope_rel.len, .worktree = true };
+    }
+    if (relativeTo(scope, wt.main_root)) |scope_rel| {
+        if (scopeMatches(cwd_rel, scope_rel)) return .{ .in_repo = true, .len = scope_rel.len };
+    }
+    // Ancestors of either checkout, e.g. `/` holding the login token. Also
+    // covers a worktree nested inside the main checkout (`<main>/.worktrees/x`).
+    if (scopeMatches(cwd, scope) or scopeMatches(wt.main_root, scope)) return .{ .len = scope.len };
+    return null;
+}
+
+/// `path` relative to `root` ("" or "/sub/dir"), or null if outside it.
+fn relativeTo(path: []const u8, root: []const u8) ?[]const u8 {
+    if (!scopeMatches(path, root)) return null;
+    if (std.mem.eql(u8, root, "/")) return path;
+    return path[root.len..];
+}
+
+// Most-specific-scope-wins accumulator. A saved token remembers the api_url of
+// the record it came from so it is only ever sent to the server that issued it.
 const ScopeResolution = struct {
     result: ResolvedConfig = .{},
     token_api_url: ?[]const u8 = null,
-    best_token_len: usize = 0,
-    best_api_url_len: usize = 0,
-    best_project_len: usize = 0,
-    best_environment_len: usize = 0,
+    token_rank: ?ScopeRank = null,
+    api_url_rank: ?ScopeRank = null,
+    project_rank: ?ScopeRank = null,
+    environment_rank: ?ScopeRank = null,
 
-    fn apply(self: *ScopeResolution, config: *const ConfigFile, path: []const u8) void {
+    fn apply(self: *ScopeResolution, config: *const ConfigFile, cwd: []const u8, worktree: ?GitWorktree) void {
         for (config.scopes.items) |record| {
-            if (!scopeMatches(path, record.scope)) continue;
+            const rank = scopeRank(record.scope, cwd, worktree) orelse continue;
 
-            if (record.entry.token != null and record.scope.len >= self.best_token_len) {
+            if (record.entry.token != null and rank.beats(self.token_rank)) {
                 self.result.token = record.entry.token;
                 self.token_api_url = record.entry.api_url;
-                self.best_token_len = record.scope.len;
+                self.token_rank = rank;
             }
-            if (record.entry.api_url != null and record.scope.len >= self.best_api_url_len) {
+            if (record.entry.api_url != null and rank.beats(self.api_url_rank)) {
                 self.result.api_url = record.entry.api_url;
-                self.best_api_url_len = record.scope.len;
+                self.api_url_rank = rank;
             }
-            if (record.entry.project != null and record.scope.len >= self.best_project_len) {
+            if (record.entry.project != null and rank.beats(self.project_rank)) {
                 self.result.project = record.entry.project;
                 self.result.project_name = record.entry.project_name;
-                self.best_project_len = record.scope.len;
+                self.project_rank = rank;
             }
-            if (record.entry.environment != null and record.scope.len >= self.best_environment_len) {
+            if (record.entry.environment != null and rank.beats(self.environment_rank)) {
                 self.result.environment = record.entry.environment;
-                self.best_environment_len = record.scope.len;
+                self.environment_rank = rank;
             }
         }
     }
@@ -286,11 +342,7 @@ pub fn resolve(allocator: std.mem.Allocator, cwd_input: []const u8, flags: Resol
     const cwd = try normalizeScope(allocator, cwd_input);
 
     var scoped: ScopeResolution = .{};
-    scoped.apply(&config, cwd);
-    // Worktree fallback: re-match scopes against the main repo root so
-    // `sigillo setup` in the main repo applies to all its worktrees. Longer
-    // (more specific) main-repo scopes override broader first-pass matches.
-    if (findGitMainWorktree(allocator, cwd)) |main_root| scoped.apply(&config, main_root);
+    scoped.apply(&config, cwd, findGitWorktree(allocator, cwd));
 
     const resolved = applyOverrides(scoped, .{
         .env = .{
@@ -348,7 +400,10 @@ fn normalizeScope(allocator: std.mem.Allocator, scope_input: []const u8) ![]cons
         break :blk try std.fs.path.join(allocator, &.{ cwd, scope_input });
     };
 
-    return std.fs.path.resolve(allocator, &.{absolute});
+    const resolved = try std.fs.path.resolve(allocator, &.{absolute});
+    // Canonical spelling (e.g. /tmp -> /private/tmp) so scopes match getcwd()
+    // and git's gitdir paths. Keep the lexical path if it does not exist yet.
+    return std.fs.cwd().realpathAlloc(allocator, resolved) catch resolved;
 }
 
 fn scopeMatches(cwd: []const u8, scope: []const u8) bool {
@@ -364,96 +419,74 @@ pub const ChildScope = struct {
     entry: ScopedEntry,
 };
 
-/// Find all configured scopes that are direct children (subfolders) of the
-/// given directory. Returns scopes where the scope path starts with `parent_dir/`.
+/// Configured scopes with a project strictly below `parent_dir`. Inside a
+/// linked worktree, subfolders set up in the main checkout are included too;
+/// a worktree's own scope wins over the main checkout's for the same subfolder.
 pub fn findChildScopes(allocator: std.mem.Allocator, parent_dir: []const u8) ![]const ChildScope {
     const cfg = try readConfig(allocator);
-    const normalized_parent = try normalizeScope(allocator, parent_dir);
+    const parent = try normalizeScope(allocator, parent_dir);
 
     var results = std.ArrayListUnmanaged(ChildScope).empty;
-
-    for (cfg.scopes.items) |record| {
-        // Must be strictly under parent_dir (not equal to it)
-        if (record.scope.len <= normalized_parent.len) continue;
-        if (!std.mem.startsWith(u8, record.scope, normalized_parent)) continue;
-        if (record.scope[normalized_parent.len] != std.fs.path.sep) continue;
-
-        // Only include scopes that have a project configured
-        if (record.entry.project == null) continue;
-
-        const relative = record.scope[normalized_parent.len + 1 ..];
-        try results.append(allocator, .{
-            .relative_path = relative,
-            .entry = record.entry,
-        });
+    try appendChildScopes(allocator, &results, &cfg, parent);
+    if (findGitWorktree(allocator, parent)) |wt| {
+        try appendChildScopes(allocator, &results, &cfg, try wt.toMain(allocator, parent));
     }
-
     return results.items;
 }
 
-/// Detect if `dir` is inside a git worktree. If so, return the main
-/// worktree's root directory. Returns null if not in a worktree (normal
-/// repo or no git repo at all).
+fn appendChildScopes(
+    allocator: std.mem.Allocator,
+    results: *std.ArrayListUnmanaged(ChildScope),
+    cfg: *const ConfigFile,
+    parent: []const u8,
+) !void {
+    outer: for (cfg.scopes.items) |record| {
+        if (record.entry.project == null) continue;
+        const relative = relativeTo(record.scope, parent) orelse continue;
+        const trimmed = std.mem.trimLeft(u8, relative, std.fs.path.sep_str);
+        if (trimmed.len == 0) continue;
+        for (results.items) |existing| {
+            if (std.mem.eql(u8, existing.relative_path, trimmed)) continue :outer;
+        }
+        try results.append(allocator, .{ .relative_path = trimmed, .entry = record.entry });
+    }
+}
+
+/// Detect if `dir` is inside a linked git worktree and return its root plus
+/// the main checkout root. Null for a normal checkout or no git repo.
 ///
-/// Git worktrees have a `.git` *file* (not directory) containing:
+/// A linked worktree has a `.git` *file* (not directory) containing:
 ///   gitdir: /path/to/main-repo/.git/worktrees/<worktree-name>
-///
-/// We parse that path and strip the `.git/worktrees/<name>` suffix to
-/// recover the main repo root. This lets `resolve()` fall back to
-/// scopes configured for the main repo when running inside a worktree.
-pub fn findGitMainWorktree(allocator: std.mem.Allocator, dir: []const u8) ?[]const u8 {
-    // Walk up from dir looking for a .git entry
+/// Stripping the `.git/worktrees/<name>` suffix gives the main checkout.
+pub fn findGitWorktree(allocator: std.mem.Allocator, dir: []const u8) ?GitWorktree {
     var current = dir;
     while (true) {
         const dot_git_path = std.fs.path.join(allocator, &.{ current, ".git" }) catch return null;
+        const content = std.fs.cwd().readFileAlloc(allocator, dot_git_path, 4096) catch |err| switch (err) {
+            error.FileNotFound => {
+                const parent = std.fs.path.dirname(current) orelse return null;
+                current = parent;
+                continue;
+            },
+            // `.git` is a directory: a normal checkout, not a linked worktree.
+            else => return null,
+        };
 
-        // Try to open as a file first (worktree indicator)
-        if (std.fs.openFileAbsolute(dot_git_path, .{})) |file| {
-            defer file.close();
-            const content = file.readToEndAlloc(allocator, 4096) catch return null;
-            const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        const prefix = "gitdir: ";
+        if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+        // Relative when worktree.useRelativePaths=true. resolve() also turns
+        // Git-for-Windows forward slashes into native separators.
+        const gitdir = std.fs.path.resolve(allocator, &.{ current, trimmed[prefix.len..] }) catch return null;
 
-            // Must start with "gitdir: "
-            const prefix = "gitdir: ";
-            if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
-            const raw_gitdir = trimmed[prefix.len..];
-
-            // Resolve relative gitdir paths against the directory containing
-            // the .git file. Git writes relative paths when
-            // worktree.useRelativePaths=true.
-            const gitdir = if (std.fs.path.isAbsolute(raw_gitdir))
-                raw_gitdir
-            else
-                std.fs.path.resolve(allocator, &.{ current, raw_gitdir }) catch return null;
-
-            // The gitdir looks like /path/to/main-repo/.git/worktrees/<name>
-            // Find "/.git/worktrees/" and extract the main repo root.
-            // Also accept forward slashes for Git-for-Windows compat.
-            const marker = std.fs.path.sep_str ++ ".git" ++ std.fs.path.sep_str ++ "worktrees" ++ std.fs.path.sep_str;
-            if (std.mem.indexOf(u8, gitdir, marker)) |idx| {
-                return allocator.dupe(u8, gitdir[0..idx]) catch return null;
-            }
-            // Try forward-slash variant for cross-platform Git paths
-            if (comptime std.fs.path.sep != '/') {
-                if (std.mem.indexOf(u8, gitdir, "/.git/worktrees/")) |idx| {
-                    return allocator.dupe(u8, gitdir[0..idx]) catch return null;
-                }
-            }
-            // gitdir exists but doesn't match the worktree pattern (e.g. submodule)
-            return null;
-        } else |_| {}
-
-        // Check if .git is a directory (normal repo, not a worktree) — stop walking
-        if (std.fs.openDirAbsolute(dot_git_path, .{})) |d| {
-            var git_dir = d;
-            git_dir.close();
-            return null; // normal repo, not a worktree
-        } else |_| {}
-
-        // Walk up one level
-        const parent = std.fs.path.dirname(current) orelse return null;
-        if (std.mem.eql(u8, parent, current)) return null; // reached root
-        current = parent;
+        const marker = std.fs.path.sep_str ++ ".git" ++ std.fs.path.sep_str ++ "worktrees" ++ std.fs.path.sep_str;
+        // Anything else (e.g. a submodule's .git/modules/<name>) is not a worktree.
+        const idx = std.mem.indexOf(u8, gitdir, marker) orelse return null;
+        const main_root = gitdir[0..idx];
+        return .{
+            .root = current,
+            .main_root = std.fs.cwd().realpathAlloc(allocator, main_root) catch main_root,
+        };
     }
 }
 
@@ -483,7 +516,7 @@ test "resolve prefers the longest matching scope" {
     try config_file.scopes.append(allocator, .{ .scope = "/tmp/project", .entry = .{ .project = "project" } });
 
     var scoped: ScopeResolution = .{};
-    scoped.apply(&config_file, "/tmp/project/subdir");
+    scoped.apply(&config_file, "/tmp/project/subdir", null);
 
     try std.testing.expectEqualStrings("global", scoped.result.token.?);
     try std.testing.expectEqualStrings("project", scoped.result.project.?);
@@ -497,7 +530,7 @@ test "saved token is only sent to the api url it was saved with" {
     var config_file: ConfigFile = .{};
     try config_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .token = "saved", .api_url = "https://secrets.acme.com" } });
     var scoped: ScopeResolution = .{};
-    scoped.apply(&config_file, "/repo");
+    scoped.apply(&config_file, "/repo", null);
 
     // No overrides: saved token goes to its own server (trailing slash ignored).
     const plain = applyOverrides(scoped, .{ .flags = .{ .api_url = "https://secrets.acme.com/" } });
@@ -519,137 +552,121 @@ test "saved token is only sent to the api url it was saved with" {
     var legacy_file: ConfigFile = .{};
     try legacy_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .token = "legacy" } });
     var legacy: ScopeResolution = .{};
-    legacy.apply(&legacy_file, "/repo");
+    legacy.apply(&legacy_file, "/repo", null);
     try std.testing.expectEqualStrings("legacy", applyOverrides(legacy, .{}).config.token.?);
     try std.testing.expect(applyOverrides(legacy, .{ .env = .{ .api_url = "http://localhost:5188" } }).config.token == null);
 }
 
-test "findGitMainWorktree returns null for non-git directory" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    // /tmp is not a git repo, so this should return null
-    try std.testing.expect(findGitMainWorktree(allocator, "/tmp") == null);
-}
-
-test "findGitMainWorktree returns null for normal git repo" {
-    // The sigillo repo itself has a .git directory (not a file), so it should
-    // return null — we're not in a worktree.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    // Use the test binary's own directory — it's inside the sigillo repo
-    // which has a real .git directory.
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = std.process.getCwd(&buf) catch return;
-    try std.testing.expect(findGitMainWorktree(allocator, cwd) == null);
-}
-
-test "findGitMainWorktree parses worktree .git file" {
-    // Create a temp directory structure that mimics a git worktree:
-    //   /tmp/xxx/main-repo/.git/worktrees/my-wt/   (directory)
-    //   /tmp/xxx/my-wt/.git                         (file containing gitdir)
+test "findGitWorktree returns null outside a linked worktree" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var tmp_base = std.testing.tmpDir(.{});
     defer tmp_base.cleanup();
-
-    // Create main-repo/.git/worktrees/my-wt/ directory tree
-    try tmp_base.dir.makePath("main-repo/.git/worktrees/my-wt");
-
-    // Create the worktree directory with a .git file
-    try tmp_base.dir.makePath("my-wt");
-
-    // Get absolute path of the tmp dir
+    try tmp_base.dir.makePath("repo/.git");
+    try tmp_base.dir.makePath("repo/app");
     const tmp_path = try tmp_base.dir.realpathAlloc(allocator, ".");
 
-    // Write the .git file in the worktree
-    const gitdir_target = try std.fs.path.join(allocator, &.{ tmp_path, "main-repo", ".git", "worktrees", "my-wt" });
-    const git_file_content = try std.fmt.allocPrint(allocator, "gitdir: {s}\n", .{gitdir_target});
-    {
-        const git_file = try tmp_base.dir.createFile("my-wt/.git", .{});
-        defer git_file.close();
-        try git_file.writeAll(git_file_content);
-    }
-
-    const worktree_dir = try std.fs.path.join(allocator, &.{ tmp_path, "my-wt" });
-    const result = findGitMainWorktree(allocator, worktree_dir);
-
-    try std.testing.expect(result != null);
-    const expected_main = try std.fs.path.join(allocator, &.{ tmp_path, "main-repo" });
-    try std.testing.expectEqualStrings(expected_main, result.?);
+    // Normal checkout: `.git` is a directory.
+    try std.testing.expect(findGitWorktree(allocator, try std.fs.path.join(allocator, &.{ tmp_path, "repo", "app" })) == null);
 }
 
-test "findGitMainWorktree parses relative gitdir path" {
-    // Git can write relative paths when worktree.useRelativePaths=true:
-    //   gitdir: ../main-repo/.git/worktrees/my-wt
+test "findGitWorktree parses absolute and relative gitdir from a subfolder" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     var tmp_base = std.testing.tmpDir(.{});
     defer tmp_base.cleanup();
-
-    try tmp_base.dir.makePath("main-repo/.git/worktrees/my-wt");
-    try tmp_base.dir.makePath("my-wt");
-
-    // Write a relative gitdir path
-    {
-        const git_file = try tmp_base.dir.createFile("my-wt/.git", .{});
-        defer git_file.close();
-        try git_file.writeAll("gitdir: ../main-repo/.git/worktrees/my-wt\n");
-    }
-
+    try tmp_base.dir.makePath("main-repo/.git/worktrees/abs");
+    try tmp_base.dir.makePath("main-repo/.git/worktrees/rel");
+    try tmp_base.dir.makePath("abs/app");
+    try tmp_base.dir.makePath("rel/app");
     const tmp_path = try tmp_base.dir.realpathAlloc(allocator, ".");
-    const worktree_dir = try std.fs.path.join(allocator, &.{ tmp_path, "my-wt" });
-    const result = findGitMainWorktree(allocator, worktree_dir);
+    const main_root = try std.fs.path.join(allocator, &.{ tmp_path, "main-repo" });
 
-    try std.testing.expect(result != null);
-    const expected_main = try tmp_base.dir.realpathAlloc(allocator, "main-repo");
-    try std.testing.expectEqualStrings(expected_main, result.?);
+    const abs_gitdir = try std.fs.path.join(allocator, &.{ main_root, ".git", "worktrees", "abs" });
+    try tmp_base.dir.writeFile(.{ .sub_path = "abs/.git", .data = try std.fmt.allocPrint(allocator, "gitdir: {s}\n", .{abs_gitdir}) });
+    // Git writes relative paths when worktree.useRelativePaths=true.
+    try tmp_base.dir.writeFile(.{ .sub_path = "rel/.git", .data = "gitdir: ../main-repo/.git/worktrees/rel\n" });
+
+    for ([_][]const u8{ "abs", "rel" }) |name| {
+        const wt = findGitWorktree(allocator, try std.fs.path.join(allocator, &.{ tmp_path, name, "app" })).?;
+        try std.testing.expectEqualStrings(try std.fs.path.join(allocator, &.{ tmp_path, name }), wt.root);
+        try std.testing.expectEqualStrings(main_root, wt.main_root);
+    }
 }
 
-test "worktree fallback: main repo scope overrides broad global scope" {
-    // "/" sets environment=dev, "/project" sets project + environment=prod.
-    // A worktree of /project at /project-feature must get prod, not dev.
+test "worktree resolution mirrors the main checkout at the same relative path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+
+    // Worktree path is shorter than the main checkout on purpose: specificity
+    // must come from the repo-relative depth, not the raw path length.
+    const wt: GitWorktree = .{ .root = "/wt", .main_root = "/Users/me/GitHub/repo" };
 
     var config_file: ConfigFile = .{};
-    try config_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .environment = "dev" } });
-    try config_file.scopes.append(allocator, .{ .scope = "/project", .entry = .{ .project = "proj_x", .environment = "prod" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/", .entry = .{ .token = "tok", .environment = "global-env" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/Users/me/GitHub/repo", .entry = .{ .project = "root_proj", .environment = "dev" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/Users/me/GitHub/repo/app", .entry = .{ .project = "app_proj", .environment = "dev" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/wt", .entry = .{ .environment = "staging" } });
+
+    // Worktree root: main root project, worktree env override.
+    var at_root: ScopeResolution = .{};
+    at_root.apply(&config_file, "/wt", wt);
+    try std.testing.expectEqualStrings("tok", at_root.result.token.?);
+    try std.testing.expectEqualStrings("root_proj", at_root.result.project.?);
+    try std.testing.expectEqualStrings("staging", at_root.result.environment.?);
+
+    // Subfolder: main checkout's `app` scope applies; it is deeper than the
+    // worktree root override, so its env wins too.
+    var at_app: ScopeResolution = .{};
+    at_app.apply(&config_file, "/wt/app/src", wt);
+    try std.testing.expectEqualStrings("app_proj", at_app.result.project.?);
+    try std.testing.expectEqualStrings("dev", at_app.result.environment.?);
+
+    // A worktree scope at the same depth beats the main checkout.
+    try config_file.scopes.append(allocator, .{ .scope = "/wt/app", .entry = .{ .environment = "prod" } });
+    var overridden: ScopeResolution = .{};
+    overridden.apply(&config_file, "/wt/app/src", wt);
+    try std.testing.expectEqualStrings("app_proj", overridden.result.project.?);
+    try std.testing.expectEqualStrings("prod", overridden.result.environment.?);
+}
+
+test "worktree resolution: repo scopes beat long ancestor scopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const wt: GitWorktree = .{ .root = "/home/me/.worktrees/some-long-worktree-name/repo", .main_root = "/r" };
+    var config_file: ConfigFile = .{};
+    try config_file.scopes.append(allocator, .{ .scope = "/home/me/.worktrees", .entry = .{ .environment = "ancestor" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/r", .entry = .{ .project = "p", .environment = "dev" } });
+    // Sibling of the main checkout with a shared prefix must not match.
+    try config_file.scopes.append(allocator, .{ .scope = "/r-other", .entry = .{ .project = "wrong" } });
 
     var scoped: ScopeResolution = .{};
-    scoped.apply(&config_file, "/project-feature");
+    scoped.apply(&config_file, "/home/me/.worktrees/some-long-worktree-name/repo", wt);
+    try std.testing.expectEqualStrings("p", scoped.result.project.?);
     try std.testing.expectEqualStrings("dev", scoped.result.environment.?);
-    try std.testing.expect(scoped.result.project == null);
-
-    scoped.apply(&config_file, "/project");
-    try std.testing.expectEqualStrings("proj_x", scoped.result.project.?);
-    try std.testing.expectEqualStrings("prod", scoped.result.environment.?);
 }
 
-test "worktree fallback: worktree-specific scope wins over main repo" {
+test "worktree nested inside the main checkout keeps its ancestor scopes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    const wt: GitWorktree = .{ .root = "/r/.worktrees/feat", .main_root = "/r" };
     var config_file: ConfigFile = .{};
-    try config_file.scopes.append(allocator, .{ .scope = "/project", .entry = .{ .project = "proj_main", .environment = "prod" } });
-    try config_file.scopes.append(allocator, .{ .scope = "/project-feature", .entry = .{ .environment = "staging" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/r/.worktrees", .entry = .{ .token = "nested" } });
+    try config_file.scopes.append(allocator, .{ .scope = "/r/app", .entry = .{ .project = "app_p" } });
 
     var scoped: ScopeResolution = .{};
-    scoped.apply(&config_file, "/project-feature");
-    try std.testing.expectEqualStrings("staging", scoped.result.environment.?);
-    try std.testing.expect(scoped.result.project == null);
-
-    // Project inherited from main repo; "/project-feature" (len 16) beats "/project" (len 8).
-    scoped.apply(&config_file, "/project");
-    try std.testing.expectEqualStrings("proj_main", scoped.result.project.?);
-    try std.testing.expectEqualStrings("staging", scoped.result.environment.?);
+    scoped.apply(&config_file, "/r/.worktrees/feat/app", wt);
+    try std.testing.expectEqualStrings("nested", scoped.result.token.?);
+    try std.testing.expectEqualStrings("app_p", scoped.result.project.?);
+    try std.testing.expectEqualStrings("/r/app", try wt.toMain(allocator, "/r/.worktrees/feat/app"));
+    try std.testing.expectEqualStrings("/r", try wt.toMain(allocator, "/r/.worktrees/feat"));
 }
