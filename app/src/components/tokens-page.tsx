@@ -3,7 +3,7 @@
 // (zero rows = all envs), and expires after a lifetime picked at creation.
 // The full key is only shown once at creation (never stored), so the
 // create dialog has a "copy key" step before closing. Admins can make a
-// machine token, which reads protected environments without a passkey: it
+// machine token, which uses protected environments without a passkey: it
 // takes their own passkey approval for those environments first, and expires
 // after 90 days at most.
 
@@ -109,7 +109,7 @@ function TokensTable() {
                 <span className="flex items-center gap-2 text-sm font-medium">
                   <span className="truncate">{token.name}</span>
                   {token.protectedAccess && (
-                    <Badge variant="secondary" title="Reads protected environments without a passkey">Machine</Badge>
+                    <Badge variant="secondary" title="Reads and changes protected environments without a passkey">Machine</Badge>
                   )}
                 </span>
               </TableCell>
@@ -154,7 +154,7 @@ function TokensTable() {
                   onClick={async () => {
                     if (confirm(`Delete token "${token.name}"? This cannot be undone.`)) {
                       try {
-                        await deleteTokenAction({ tokenId: token.id })
+                        await withStepUp(() => deleteTokenAction({ tokenId: token.id }))
                       } catch (e: any) {
                         alert(e?.message || "Failed to delete token")
                       }
@@ -262,7 +262,7 @@ function CreateTokenDialog({
             </div>
             <p className="text-xs text-muted-foreground mt-2">
               {machine
-                ? "Store this key securely. It reads this project's protected environments without a passkey."
+                ? "Store this key securely. It reads and changes this project's protected environments without a passkey."
                 : "Store this key securely. It grants access to secrets in this project."}
             </p>
             <DialogFooter variant="bare" className="mt-4">
@@ -434,8 +434,8 @@ function CreateTokenDialog({
               <span className="flex flex-col gap-0.5">
                 <span className="text-sm font-medium">Machine token</span>
                 <span className="text-xs text-muted-foreground">
-                  Reads protected environments without a passkey, for CI and servers. Needs your passkey
-                  now, and expires after {MACHINE_TOKEN_MAX_DAYS} days at most.
+                  Reads and changes protected environments without a passkey, for CI and servers. Takes your
+                  passkey once the organization has a protected environment, and expires after {MACHINE_TOKEN_MAX_DAYS} days at most.
                 </span>
               </span>
             </label>

@@ -1744,7 +1744,7 @@
         "tags": [
           "Step-up"
         ],
-        "summary": "Ask to read protected environments",
+        "summary": "Ask for access to protected environments",
         "requestBody": {
           "required": true,
           "content": {

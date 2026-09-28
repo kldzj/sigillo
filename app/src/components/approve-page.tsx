@@ -1,8 +1,8 @@
-// /approve: the CLI or an agent asks to read protected environments and
-// prints this page with a code. The code is typed here, never part of the
+// /approve: the CLI or an agent asks for access to protected environments
+// and prints this page with a code. The code is typed here, never part of the
 // link, so a link someone sends you approves nothing. The page shows where the
 // request came from, and approving takes your passkey: the session that
-// asked may then read those environments for 15 minutes.
+// asked may then read and change those environments for 15 minutes.
 
 "use client";
 
@@ -33,7 +33,7 @@ export function ApprovePage() {
         <div className="text-center max-w-sm">
           <h1 className="text-2xl font-bold mb-2">Approved</h1>
           <p className="text-muted-foreground">
-            The CLI can read these environments for the next 15 minutes. You can close this page.
+            The CLI can read and change these environments for the next 15 minutes. You can close this page.
           </p>
         </div>
       </div>
@@ -61,7 +61,7 @@ export function ApprovePage() {
     return (
       <div className="flex justify-center items-center min-h-[60vh]">
         <div className="max-w-md w-full flex flex-col gap-4">
-          <h1 className="text-2xl font-bold text-center">Approve this read?</h1>
+          <h1 className="text-2xl font-bold text-center">Approve access?</h1>
           <div className="rounded-lg border border-border p-4 text-sm flex flex-col gap-2">
             <div>
               <span className="text-muted-foreground">Environments: </span>
@@ -109,9 +109,9 @@ export function ApprovePage() {
           else setError("No request with this code. It may have expired: run the command again.");
         })}
       >
-        <h1 className="text-2xl font-bold">Approve a read</h1>
+        <h1 className="text-2xl font-bold">Approve access</h1>
         <p className="text-sm text-muted-foreground">
-          Enter the code your terminal shows to approve reading a protected environment.
+          Enter the code your terminal shows to approve access to a protected environment.
         </p>
         <Input name={codeFields.userCode} placeholder="XXXX-XXXX" autoComplete="off" autoFocus className="text-center mono-sm tracking-[0.25em] uppercase" />
         {error && <p className="text-sm text-destructive">{error}</p>}

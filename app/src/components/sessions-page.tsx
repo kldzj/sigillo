@@ -1,6 +1,8 @@
 // Your sessions — every browser and CLI login of the signed-in user, with the
 // device and IP it signed in from. Ending one signs that device out on its
-// next request; the current session is ended with Log out instead.
+// next request; the current session is ended with Log out instead. Listing
+// them needs a login from the last day: an older one signs in again first,
+// and can still end every other session right away.
 
 "use client"
 
@@ -16,28 +18,51 @@ import { describeUserAgent } from "sigillo-app/src/lib/utils"
 import { endSessionAction, endOtherSessionsAction } from "../actions.ts"
 
 export function SessionsPage() {
-  const { sessions } = useLoaderData('/dash/sessions')
+  const { sessions, signInAgain } = useLoaderData('/dash/sessions')
   const others = sessions.filter((session) => !session.isCurrent).length
+
+  const endOthers = (
+    <Button
+      variant="outline"
+      onClick={async () => {
+        const question = signInAgain
+          ? "Sign out every other browser and CLI login?"
+          : `Sign out ${others === 1 ? "the other session" : `all ${others} other sessions`}?`
+        if (!confirm(question)) return
+        try {
+          await endOtherSessionsAction()
+        } catch (e: any) {
+          alert(e?.message || "Failed to end sessions")
+        }
+      }}
+    >
+      End all other sessions
+    </Button>
+  )
+
+  if (signInAgain) {
+    return (
+      <>
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold tracking-tight">Sessions</h1>
+          {endOthers}
+        </div>
+        <p className="text-sm text-muted-foreground">
+          This login is more than a day old. Sign in again to see your sessions, with their devices and IP
+          addresses. Ending all other sessions works right away.
+        </p>
+        <div>
+          <Button onClick={() => { window.location.href = "/logout?redirect=/dash/sessions" }}>Sign in again</Button>
+        </div>
+      </>
+    )
+  }
 
   return (
     <>
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Sessions</h1>
-        {others > 0 && (
-          <Button
-            variant="outline"
-            onClick={async () => {
-              if (!confirm(`Sign out ${others === 1 ? "the other session" : `all ${others} other sessions`}?`)) return
-              try {
-                await endOtherSessionsAction()
-              } catch (e: any) {
-                alert(e?.message || "Failed to end sessions")
-              }
-            }}
-          >
-            End all other sessions
-          </Button>
-        )}
+        {others > 0 && endOthers}
       </div>
       <p className="text-sm text-muted-foreground">
         Browsers and CLI logins signed in as you. End any you don't recognize.

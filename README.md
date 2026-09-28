@@ -256,8 +256,8 @@ sigillo run -c dev -- pnpm dev
 | **Organizations** | Multi-tenant orgs with admin/member roles and invite links |
 | **Projects & environments** | Organize secrets into projects with dev, preview and prod environments |
 | **Audit log** | Every secret change, and in protected environments every read of a value, is recorded in hash chains your instance signs; `sigillo audit verify` checks them |
-| **Passkeys for production** | Reading a protected environment takes a passkey: in the browser on the spot, for the CLI on an approval page. A stolen session or CLI login alone can't read it |
-| **API tokens** | Scoped to a project and optionally some of its environments, expire after 7 to 365 days, last use and IP shown, SHA-256 hashed, shown once. Machine tokens read protected environments, for CI |
+| **Passkeys for production** | Reading or changing a protected environment takes a passkey: in the browser on the spot, for the CLI on an approval page. So do admin actions in an org that has one. A stolen session or CLI login alone can't read or change it |
+| **API tokens** | Scoped to a project and optionally some of its environments, expire after 7 to 365 days, last use and IP shown, SHA-256 hashed, shown once. Machine tokens read and change protected environments, for CI |
 | **Sign-in allowlist** | Only the email addresses and domains you list can sign up or sign in |
 | **Sessions** | See and end every browser and CLI login signed in as you |
 | **Device flow** | RFC 8628 login for CLI and agents, no copy-pasting tokens |
@@ -403,17 +403,17 @@ sigillo audit verify -c prod
 
 ### Protected environments
 
-Reading a protected environment takes your passkey. Any command that reads values asks for an approval and waits for it:
+Reading or changing a protected environment takes your passkey. Any command that reads or changes values asks for an approval and waits for it:
 
 ```
 $ sigillo run -c prod -- ./deploy.sh
-This environment is protected: approve the read with your passkey.
+This environment is protected: approve with your passkey.
   Open https://secrets.acme.com/approve and enter BCDF-GHJK
 Waiting for your approval...
 ✔ Approved for 15 minutes
 ```
 
-Open the page, check that the code matches, and approve with your passkey. The approval covers this login for 15 minutes. Add passkeys under **user menu → Passkeys** in the web UI. API tokens get `only a machine token can read it`: see [CI / GitHub Actions](#ci--github-actions).
+Open the page, type the code, and approve with your passkey. The approval covers this login for 15 minutes, so running the command again in that time doesn't ask. Add passkeys under **user menu → Passkeys** in the web UI. API tokens get `only a machine token can use it`: see [CI / GitHub Actions](#ci--github-actions).
 
 ### Global flags
 
@@ -540,7 +540,7 @@ sigillo run -- docker compose up
 
 ### CI / GitHub Actions
 
-Use an API token for non-interactive environments. Create it on the project's **Tokens** tab; it expires after the 7 to 365 days you choose, and an expired one gets `401 API token expired`. To read a protected environment, an org admin checks **Machine token** when creating it: that takes their passkey, and the token expires after 90 days at most.
+Use an API token for non-interactive environments. Create it on the project's **Tokens** tab; it expires after the 7 to 365 days you choose, and an expired one gets `401 API token expired`. To read or change a protected environment, an org admin checks **Machine token** when creating it: that takes their passkey, and the token expires after 90 days at most.
 
 ```yaml
 - name: Run with secrets

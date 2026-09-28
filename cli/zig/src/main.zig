@@ -4184,6 +4184,86 @@ test "a protected environment asks for an approval, waits for it, and reads agai
     try std.testing.expectEqualStrings("{\"environmentIds\":[\"env1\"]}", server.step_up_body[0..server.step_up_body_len]);
 }
 
+test "a failed check while waiting for the approval doesn't end the wait" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    client.step_up_poll_ms = 1;
+    defer client.step_up_poll_ms = 2000;
+    var server = try ScriptedServer.init();
+    defer server.inner.server.deinit();
+
+    const created = try std.fmt.allocPrint(allocator, "{{\"id\":\"req1\",\"userCode\":\"BCDF-GHJK\",\"approveUrl\":\"http://127.0.0.1/approve\",\"expiresAt\":{d}}}", .{std.time.milliTimestamp() + 60_000});
+    const responses = [_][]const u8{
+        try httpResponse(allocator, 403, "{\"error\":\"this environment is protected\",\"code\":\"STEP_UP_REQUIRED\",\"environmentIds\":[\"env1\"]}"),
+        try httpResponse(allocator, 200, created),
+        try httpResponse(allocator, 503, "{\"error\":\"service unavailable\"}"),
+        try httpResponse(allocator, 429, "{\"error\":\"too many requests\"}"),
+        try httpResponse(allocator, 200, "{\"status\":\"pending\"}"),
+        try httpResponse(allocator, 200, "{\"status\":\"approved\"}"),
+        try httpResponse(allocator, 200, "{\"value\":\"the-secret\"}"),
+    };
+    const thread = try std.Thread.spawn(.{}, ScriptedServer.serve, .{ &server, &responses });
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.inner.baseUrl(allocator), .path = "/api/v0/projects/p/environments/e/secrets/KEY", .token = "tok123" });
+    std.posix.shutdown(server.inner.server.stream.handle, .both) catch {};
+    thread.join();
+    const res = try result;
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqualStrings("{\"value\":\"the-secret\"}", res.body);
+    try std.testing.expectEqualStrings("GET /api/v0/projects/p/environments/e/secrets/KEY HTTP/1.1", server.line(6));
+}
+
+test "a clock running ahead of the server doesn't end the wait early" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    client.step_up_poll_ms = 1;
+    defer client.step_up_poll_ms = 2000;
+    var server = try ScriptedServer.init();
+    defer server.inner.server.deinit();
+
+    // The server's expiry, already past by this machine's clock
+    const created = try std.fmt.allocPrint(allocator, "{{\"id\":\"req1\",\"userCode\":\"BCDF-GHJK\",\"approveUrl\":\"http://127.0.0.1/approve\",\"expiresAt\":{d}}}", .{std.time.milliTimestamp() - 60_000});
+    const responses = [_][]const u8{
+        try httpResponse(allocator, 403, "{\"error\":\"this environment is protected\",\"code\":\"STEP_UP_REQUIRED\",\"environmentIds\":[\"env1\"]}"),
+        try httpResponse(allocator, 200, created),
+        try httpResponse(allocator, 200, "{\"status\":\"approved\"}"),
+        try httpResponse(allocator, 200, "{\"value\":\"the-secret\"}"),
+    };
+    const thread = try std.Thread.spawn(.{}, ScriptedServer.serve, .{ &server, &responses });
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.inner.baseUrl(allocator), .path = "/api/v0/projects/p/environments/e/secrets/KEY", .token = "tok123" });
+    std.posix.shutdown(server.inner.server.stream.handle, .both) catch {};
+    thread.join();
+    const res = try result;
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+}
+
+test "an approval check the server refuses ends the wait" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    client.step_up_poll_ms = 1;
+    defer client.step_up_poll_ms = 2000;
+    var server = try ScriptedServer.init();
+    defer server.inner.server.deinit();
+
+    const created = try std.fmt.allocPrint(allocator, "{{\"id\":\"req1\",\"userCode\":\"BCDF-GHJK\",\"approveUrl\":\"http://127.0.0.1/approve\",\"expiresAt\":{d}}}", .{std.time.milliTimestamp() + 60_000});
+    const responses = [_][]const u8{
+        try httpResponse(allocator, 403, "{\"error\":\"this environment is protected\",\"code\":\"STEP_UP_REQUIRED\",\"environmentIds\":[\"env1\"]}"),
+        try httpResponse(allocator, 200, created),
+        try httpResponse(allocator, 401, "{\"error\":\"not signed in\"}"),
+    };
+    const thread = try std.Thread.spawn(.{}, ScriptedServer.serve, .{ &server, &responses });
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.inner.baseUrl(allocator), .path = "/api/v0/projects/p/environments/e/secrets/KEY", .token = "tok123" });
+    std.posix.shutdown(server.inner.server.stream.handle, .both) catch {};
+    thread.join();
+    const res = try result;
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+}
+
 test "a refusal that no approval fixes is returned as it is" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4192,7 +4272,7 @@ test "a refusal that no approval fixes is returned as it is" {
     var server = try OneShotServer.init();
     defer server.server.deinit();
 
-    const response = try httpResponse(allocator, 403, "{\"error\":\"only a machine token can read it\",\"code\":\"MACHINE_TOKEN_REQUIRED\",\"environmentIds\":[\"env1\"]}");
+    const response = try httpResponse(allocator, 403, "{\"error\":\"this environment is protected: only a machine token can use it\",\"code\":\"MACHINE_TOKEN_REQUIRED\",\"environmentIds\":[\"env1\"]}");
     const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, response });
     const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.baseUrl(allocator), .path = "/api/v0/me", .token = "sig_abc" });
     thread.join();

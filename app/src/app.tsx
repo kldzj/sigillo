@@ -24,8 +24,10 @@ import {
   getEnvironmentAccessError,
   getProjectMemberAccess,
   listUserSessions,
+  isSessionFresh,
 } from './db.ts'
 import { apiApp } from './api.ts'
+import { isFreshSignIn } from './step-up.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
 import { cn, loginErrorMessage } from 'sigillo-app/src/lib/utils'
 import { CreateOrgForm } from 'sigillo-app/src/components/create-org-form'
@@ -43,7 +45,7 @@ function isTruthy<T>(value: T | null | undefined): value is T {
 // avoids sending logged-in users to API routes or obvious 404s.
 function safeRedirectPath(value: string | null): string {
   if (!value || !value.startsWith('/') || value.startsWith('//')) return '/dash'
-  if (['/', '/device'].includes(value)) return value
+  if (['/', '/device', '/approve'].includes(value)) return value
   if (value === '/dash' || value.startsWith('/dash/') || value.startsWith('/invite/')) return value
   return '/'
 }
@@ -654,8 +656,10 @@ export const app = new Spiceflow({ tracer })
     })
     return {
       passkeys: passkeys.map((p) => ({ ...p, createdAt: p.createdAt ?? 0 })),
-      // The first passkey needs a sign-in from the last 5 minutes
-      freshSignIn: Date.now() - session.sessionCreatedAt < 5 * 60 * 1000,
+      // The first passkey needs a sign-in from the last 5 minutes, and any
+      // further one a login from the last day (better-auth's freshAge)
+      freshSignIn: isFreshSignIn(session),
+      recentLogin: await isSessionFresh(request, session.sessionCreatedAt),
     }
   })
 
@@ -673,14 +677,15 @@ export const app = new Spiceflow({ tracer })
   // of a link, so a link someone sends you approves nothing.
   .page('/approve', async ({ request }) => {
     const session = await getSession(request)
-    if (!session) return Response.redirect(new URL('/login', request.url).toString(), 302)
+    if (!session) return Response.redirect(new URL('/login?redirect=/approve', request.url).toString(), 302)
     const { ApprovePage } = await import('sigillo-app/src/components/approve-page')
     return <ContentFrame><ApprovePage /></ContentFrame>
   })
 
   // ── Your sessions ──────────────────────────────────────────────────
   .loader('/dash/sessions', async ({ request }) => {
-    return { sessions: await listUserSessions(request) }
+    const sessions = await listUserSessions(request)
+    return { sessions: sessions ?? [], signInAgain: sessions === null }
   })
 
   .page('/dash/sessions', async () => {
@@ -794,9 +799,13 @@ export const app = new Spiceflow({ tracer })
   // follows, so the provider can set its own expired Set-Cookie.
   .get('/logout', async ({ request }) => {
     const origin = getRequestOrigin(request)
+    // "Sign in again" comes back to the page it was on
+    const login = new URL('/login', origin)
+    const back = new URL(request.url).searchParams.get('redirect')
+    if (back) login.searchParams.set('redirect', safeRedirectPath(back))
     const providerSignOut = new URL('/sign-out', env.PROVIDER_URL)
     providerSignOut.searchParams.set('client_id', await ensureOAuthClient(request))
-    providerSignOut.searchParams.set('post_logout_redirect_uri', new URL('/login', origin).toString())
+    providerSignOut.searchParams.set('post_logout_redirect_uri', login.toString())
 
     const res = new Response(null, { status: 302, headers: { Location: providerSignOut.toString() } })
 

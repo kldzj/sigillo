@@ -13,10 +13,10 @@ Sigillo encrypts every secret, but the key lives in the Worker that decrypts the
 | Who | What they can do | What limits it |
 |-----|------------------|----------------|
 | Anyone who can edit Workers on the Cloudflare account | Deploy code that reads every secret | [A dedicated account](#1-give-sigillo-its-own-cloudflare-account) |
-| Anyone who can edit the D1 databases | Make any account that can sign in an org admin, change the history | A dedicated account, [protected environments](#4-limit-access-inside-sigillo), [the signed history](#5-check-the-history) |
+| Anyone who can edit the D1 databases | Make any account that can sign in an org admin, change the history | A dedicated account, [protected environments](#4-limit-access-inside-sigillo), [the signed history](#6-check-the-history) |
 | Anyone with `~/.sigillo/selfhost.json` and its passphrase | Decrypt a database export and use the sessions in it, sign history rows, and with a saved login deploy to the account | [The passphrase](#2-protect-the-deploy-file) |
 | Anyone who can sign in | What their org role and project access allow | [The sign-in allowlist](#3-decide-who-can-sign-in) |
-| Anyone with a stolen browser session or CLI login | What that person can read, except protected environments | [Protected environments](#4-limit-access-inside-sigillo) need a passkey |
+| Anyone with a stolen browser session or CLI login | What that person can read and change, except protected environments, and admin actions in an org that has one | [Passkeys](#5-require-a-passkey-for-production) |
 | Org admins | Every project and environment of their org | [Few admins](#4-limit-access-inside-sigillo) |
 
 ## 1. Give Sigillo its own Cloudflare account
@@ -58,28 +58,30 @@ The app and its login provider both check the list, and someone taken off it is 
 
 If your team is a Google Cloud organization, through Google Workspace or Cloud Identity, create the Google OAuth client in a project that belongs to it and set its audience to **Internal** (**Google Auth Platform → Audience**). Google then only signs in members of your organization, before Sigillo's own list is checked.
 
-Everyone can see and end their own sessions under **user menu → Sessions**: every browser and CLI login, with its device, IP address and sign-in time.
+Everyone can see and end their own sessions under **user menu → Sessions**: every browser and CLI login, with its device, IP address and sign-in time. Seeing them takes a login from the last day; **End all other sessions** works from any login.
 
 ## 4. Limit access inside Sigillo
 
 - **Few admins.** An org admin reaches every project and environment of the org, and manages its members.
 - **Project access.** On a project's **Access** tab, limit a member to selected projects. Invitations can be limited to projects too.
 - **Admin-only environments.** On the **Environments** tab, set **Min Role** to **Admin** for production. Members then can't open it, and an API token for it works only while its creator is still an admin.
-- **Protected environments.** On the **Environments** tab, set **Protected** to **On**. Reading its values then takes a passkey, see [step 5](#5-require-a-passkey-for-production). Every read is recorded before the values leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see the reads on the **Read Log** tab. Turning protection off takes a passkey as well, and is recorded too.
-- **API tokens.** Anyone who can open a project's environments can create tokens for them. A token belongs to one project, optionally only some of its environments, and expires after 7, 30, 90 or 365 days. The **Tokens** tab shows when and from which IP each was last used, to the hour. Tokens made before expiry existed never expire and show **Never**: replace them. Prefer one token per machine or pipeline, scoped to the environment it needs. An API token can't read a protected environment; a machine token can.
+- **Protected environments.** On the **Environments** tab, set **Protected** to **On**. Reading or changing its values then takes a passkey, see [step 5](#5-require-a-passkey-for-production). Every read is recorded before the values leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see the reads on the **Read Log** tab. Turning protection off takes a passkey as well, and is recorded too.
+- **API tokens.** Anyone who can open a project's environments can create tokens for them. A token belongs to one project, optionally only some of its environments, and expires after 7, 30, 90 or 365 days. The **Tokens** tab shows when and from which IP each was last used, to the hour. Tokens made before expiry existed never expire and show **Never**: replace them. Prefer one token per machine or pipeline, scoped to the environment it needs. An API token can't read or change a protected environment; a machine token can.
 
 The secrets page never loads values up front: a value reaches the browser when someone reveals, downloads or copies it, and in a protected environment that is what the Read Log shows.
 
 ## 5. Require a passkey for production
 
-A protected environment doesn't trust a session on its own. Reading its values takes a passkey, so someone who copied a browser cookie or a CLI login from a laptop still can't read it.
+A protected environment doesn't trust a session on its own. Reading or changing its values takes a passkey, so someone who copied a browser cookie or a CLI login from a laptop can neither read it nor swap a value, such as a signing key or a webhook URL, for one of their own. Deleting or renaming a protected environment, or the project it belongs to, takes a passkey too, so nobody can move it aside and let an unprotected one take over its slug or name.
 
-- **In the browser**, revealing, copying or downloading a value asks for your passkey on the spot.
-- **In the CLI**, `sigillo run` and the other reads print a link and a code. Open `/approve` on your instance, check that the code matches your terminal, and approve with your passkey. The CLI then continues. The page shows which environments the request is for, and the device, IP address and country it came from. The code is typed, never part of the link, so a link someone sends you approves nothing.
+- **In the browser**, revealing, copying, downloading, saving or deleting a value asks for your passkey on the spot.
+- **In the CLI**, `sigillo run`, `secrets set` and the other commands print a link and a code. Open `/approve` on your instance, type the code your terminal shows, and approve with your passkey. The CLI then continues. The page shows which environments the request is for, and the device, IP address and country it came from. The code is typed, never part of the link, so a link someone sends you approves nothing. A passkey on your phone works through the browser's own **Use a phone or tablet** option, which shows a QR code.
 
-An approval lets that one browser or CLI login read those environments for 15 minutes. Other logins of the same person still have to ask.
+An approval lets that one browser or CLI login read and change those environments for 15 minutes. Other logins of the same person still have to ask.
 
-**Passkeys.** Everyone adds theirs under **user menu → Passkeys**: a laptop's fingerprint reader, a phone, or a security key. Add two, so losing one doesn't lock you out. The first passkey takes a sign-in from the last 5 minutes, and every further one an approval with a passkey you already have. Someone who only has your session can't add their own. On a project's **Access** tab, org admins see how many passkeys each member has and every passkey added or removed. **Reset** removes a member's passkeys, for someone who lost theirs; they add new ones after signing in again.
+**Admin actions.** Once an organization has a protected environment, every admin action in it takes a passkey as well: inviting someone, changing a role or a member's projects, removing a member, auto-join, an environment's **Min Role** or protection, resetting passkeys, making or deleting a machine token, and deleting the organization. Otherwise someone with an admin's session could invite an account of their own, or open production to one. One approval covers admin actions for 5 minutes. Organizations without a protected environment work as before.
+
+**Passkeys.** Everyone adds theirs under **user menu → Passkeys**: a laptop's fingerprint reader, a phone, or a security key. Add two, so losing one doesn't lock you out. The first passkey takes a Google sign-in from the last 5 minutes, in that browser; a CLI login doesn't count, since any session can approve one. Adding or removing one after that takes an approval with a passkey you already have. Someone who only has your session can't swap in their own. On a project's **Access** tab, org admins see how many passkeys each member has and every passkey added or removed. **Reset** removes a member's passkeys, for someone who lost theirs, and signs them out everywhere; they add new ones after signing in again. Passkeys belong to the person, so only an admin of every organization they're in can reset them.
 
 If you are the only admin and lost every passkey, remove them from the machine that deployed Sigillo:
 
@@ -87,7 +89,7 @@ If you are the only admin and lost every passkey, remove them from the machine t
 npx @kldzj/sigillo self-host --reset-passkeys you@acme.com
 ```
 
-**Machine tokens.** CI and servers can't use a passkey. For them, an org admin creates a token on the **Tokens** tab with **Machine token** checked. It takes the admin's passkey for the protected environments it covers, expires after 90 days at most, and then reads without a passkey. The **Tokens** tab marks it **Machine**. Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
+**Machine tokens.** CI and servers can't use a passkey. For them, an org admin creates a token on the **Tokens** tab with **Machine token** checked. Making it is an admin action, so it takes the admin's passkey once the organization has a protected environment. It expires after 90 days at most, reads and changes protected environments without a passkey, and stops working when its creator is no longer an admin. The **Tokens** tab marks it **Machine**. Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
 
 ## 6. Check the history
 

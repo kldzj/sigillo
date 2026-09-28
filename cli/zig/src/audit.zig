@@ -138,9 +138,19 @@ pub fn writeWitness(allocator: std.mem.Allocator, key: []const u8, witness: Witn
         else => return err,
     };
     const bytes = try std.fmt.allocPrint(allocator, "{f}\n", .{std.json.fmt(witnesses, .{ .whitespace = .indent_2 })});
-    const file = try std.fs.createFileAbsolute(try witnessPath(allocator), .{ .truncate = true, .mode = 0o600 });
-    defer file.close();
-    try file.writeAll(bytes);
+    // Written next to it and renamed over it, so a crash or a second run at
+    // the same time never leaves half a file
+    const path = try witnessPath(allocator);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, std.crypto.random.int(u64) });
+    {
+        const file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true, .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(bytes);
+    }
+    std.fs.renameAbsolute(tmp_path, path) catch |err| {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return err;
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

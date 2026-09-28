@@ -1,6 +1,6 @@
-// Your passkeys: they approve reads of protected environments, in the browser
+// Your passkeys: they approve access to protected environments, in the browser
 // and for the CLI. Adding the first one needs a sign-in from the last 5
-// minutes; every further one an approval with an existing passkey. Additions
+// minutes; adding or removing one after that an approval with a passkey. Additions
 // and removals are logged for the admins of your organizations.
 
 "use client";
@@ -9,7 +9,6 @@ import { useState, useTransition } from "react";
 import { z } from "zod";
 import { parseFormData } from "spiceflow";
 import { router, useLoaderData } from "spiceflow/react";
-import { startAuthentication } from "@simplewebauthn/browser";
 import { KeyRoundIcon } from "lucide-react";
 import { Button } from "sigillo-app/src/components/ui/button";
 import { Badge } from "sigillo-app/src/components/ui/badge";
@@ -21,33 +20,29 @@ import {
 } from "sigillo-app/src/components/ui/table";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
 import { authClient } from "../auth-client.ts";
-import { startPasskeysApprovalAction, finishStepUpAction, removePasskeyAction } from "../actions.ts";
+import { removePasskeyAction } from "../actions.ts";
+import { approveInBrowser, withStepUp } from "./step-up.ts";
 
 const addSchema = z.object({ name: z.string().trim().max(60) });
 const addFields = addSchema.keyof().enum;
 
 export function PasskeysPage() {
-  const { passkeys, freshSignIn } = useLoaderData("/dash/passkeys");
+  const { passkeys, freshSignIn, recentLogin } = useLoaderData("/dash/passkeys");
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
-  const needsFreshSignIn = passkeys.length === 0 && !freshSignIn;
+  // The first passkey needs a sign-in from the last 5 minutes, further ones a login from the last day
+  const needsFreshSignIn = passkeys.length === 0 ? !freshSignIn : !recentLogin;
 
   const add = (name: string) => startTransition(async () => {
     setError(null);
     try {
       // Another passkey needs an approval with one you already have
-      if (passkeys.length > 0) {
-        const started = await startPasskeysApprovalAction();
-        const response = await startAuthentication({ optionsJSON: started.options });
-        const { approved } = await finishStepUpAction({ requestId: started.requestId, response });
-        if (!approved) {
-          setError("That passkey couldn't be verified.");
-          return;
-        }
-      }
+      if (passkeys.length > 0 && !await approveInBrowser({ purpose: "admin", environmentIds: [] })) return;
       const { error } = await authClient.passkey.addPasskey({ name: name || undefined });
       if (error) {
-        if (!("code" in error) || error.code !== "ERROR_CEREMONY_ABORTED") setError(error.message || "Adding the passkey failed");
+        // Cancelling the browser's prompt comes back as a passthrough of its NotAllowedError
+        const cancelled = "code" in error && (error.code === "ERROR_CEREMONY_ABORTED" || error.code === "ERROR_PASSTHROUGH_SEE_CAUSE_PROPERTY");
+        if (!cancelled) setError(error.message || "Adding the passkey failed");
         return;
       }
       router.refresh();
@@ -60,7 +55,7 @@ export function PasskeysPage() {
     <>
       <h1 className="text-2xl font-bold tracking-tight">Passkeys</h1>
       <p className="text-sm text-muted-foreground">
-        A passkey approves reading a protected environment, in the browser and for the CLI. Add two, such as
+        A passkey approves reading and changing a protected environment, in the browser and for the CLI, and admin actions in an organization that has one. Add two, such as
         your laptop and your phone, or a security key, so losing one doesn't lock you out.
       </p>
 
@@ -70,7 +65,7 @@ export function PasskeysPage() {
           title="No passkeys yet"
           description={needsFreshSignIn
             ? "For your first passkey, sign in again: the sign-in has to be less than 5 minutes old."
-            : "Add one to read protected environments."}
+            : "Add one to use protected environments."}
         />
       ) : (
         <Frame className="w-full">
@@ -102,9 +97,9 @@ export function PasskeysPage() {
                   <TableCell className="p-0 text-right pr-3">
                     <button
                       onClick={async () => {
-                        if (!confirm(`Remove ${passkey.name || "this passkey"}? It can no longer approve reads.`)) return;
+                        if (!confirm(`Remove ${passkey.name || "this passkey"}? It can no longer approve anything.`)) return;
                         try {
-                          await removePasskeyAction({ passkeyId: passkey.id });
+                          await withStepUp(() => removePasskeyAction({ passkeyId: passkey.id }));
                         } catch (e: any) {
                           alert(e?.message || "Failed to remove the passkey");
                         }
@@ -124,8 +119,11 @@ export function PasskeysPage() {
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       {needsFreshSignIn ? (
-        <div>
-          <Button onClick={() => { window.location.href = "/logout"; }}>Sign in again</Button>
+        <div className="flex flex-col gap-2 items-start">
+          {passkeys.length > 0 && (
+            <p className="text-sm text-muted-foreground">This login is more than a day old: sign in again to add a passkey.</p>
+          )}
+          <Button onClick={() => { window.location.href = "/logout?redirect=/dash/passkeys"; }}>Sign in again</Button>
         </div>
       ) : (
         <form

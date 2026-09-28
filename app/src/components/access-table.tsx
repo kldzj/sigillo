@@ -6,6 +6,7 @@
 import { useState } from "react"
 import { TrashIcon, PencilIcon } from "lucide-react"
 import { removeOrgMemberAction, updateOrgMemberRoleAction, updateMemberAccessAction, removeMemberPasskeysAction } from "sigillo-app/src/actions"
+import { withStepUp } from "./step-up.ts"
 import { InviteButton } from "sigillo-app/src/components/invite-dialog"
 import { Button } from "sigillo-app/src/components/ui/button"
 import { Frame } from "sigillo-app/src/components/ui/frame"
@@ -69,7 +70,8 @@ export function AccessTable() {
     setRoleOverrides((current) => ({ ...current, [member.id]: nextRole }))
     setPendingRoleId(member.id)
     try {
-      await updateOrgMemberRoleAction({ memberId: member.id, role: nextRole })
+      const result = await withStepUp(() => updateOrgMemberRoleAction({ memberId: member.id, role: nextRole }))
+      if (!result) setRoleOverrides((current) => ({ ...current, [member.id]: previousRole }))
     } catch (error) {
       setRoleOverrides((current) => ({ ...current, [member.id]: previousRole }))
       setError(error instanceof Error ? error.message : "Failed to update role")
@@ -87,7 +89,7 @@ export function AccessTable() {
     setError(null)
     setPendingDeleteId(member.id)
     try {
-      await removeOrgMemberAction({ memberId: member.id })
+      await withStepUp(() => removeOrgMemberAction({ memberId: member.id }))
     } catch (error) {
       setError(error instanceof Error ? error.message : "Failed to remove user")
     } finally {
@@ -194,7 +196,7 @@ export function AccessTable() {
                             onClick={async () => {
                               if (!confirm(`Remove every passkey of ${member.user?.name || "this member"}? They add new ones after signing in again.`)) return
                               try {
-                                await removeMemberPasskeysAction({ memberId: member.id })
+                                await withStepUp(() => removeMemberPasskeysAction({ memberId: member.id }))
                               } catch (e) {
                                 setError(e instanceof Error ? e.message : "Failed to remove the passkeys")
                               }
@@ -317,13 +319,8 @@ function ManageAccessDialog({
     setSaving(true)
     setError(null)
     try {
-      if (fullAccess) {
-        await updateMemberAccessAction({ memberId: member.id, projectIds: null })
-      } else {
-        const selectedIds = orgProjects.filter((p) => projectChecked[p.id]).map((p) => p.id)
-        await updateMemberAccessAction({ memberId: member.id, projectIds: selectedIds })
-      }
-      onClose()
+      const projectIds = fullAccess ? null : orgProjects.filter((p) => projectChecked[p.id]).map((p) => p.id)
+      if (await withStepUp(() => updateMemberAccessAction({ memberId: member.id, projectIds }))) onClose()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save')
     } finally {

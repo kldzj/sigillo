@@ -117,7 +117,7 @@ Updates keep the list saved in `~/.sigillo/selfhost.json`. Pass `--allowed-users
 | `--bundle <path>` | Deploy a local bundle file instead of the latest release |
 | `--release-url <url>` | Download the bundle from a custom URL |
 | `--change-passphrase` | Encrypt `~/.sigillo/selfhost.json` with a new passphrase, then stop |
-| `--reset-passkeys <email>` | Remove every passkey of this user, for a sole admin who lost theirs, then stop. See [Hardening](./hardening.mdx#5-require-a-passkey-for-production) |
+| `--reset-passkeys <email>` | Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop. See [Hardening](./hardening.mdx#5-require-a-passkey-for-production) |
 | `--yes` | Accept all defaults, non-interactive |
 
 Non-interactive example for **CI or agents**:

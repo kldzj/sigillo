@@ -19,6 +19,7 @@ import {
   DialogClose,
 } from 'sigillo-app/src/components/ui/dialog'
 import { deleteOrgAction, updateAutoJoinDomainAction } from '../actions.ts'
+import { withStepUp } from './step-up.ts'
 import { COMMON_EMAIL_DOMAINS, getEmailDomain } from '../lib/utils.ts'
 
 function AutoJoinSection() {
@@ -39,8 +40,8 @@ function AutoJoinSection() {
   function handleToggle() {
     const newEnabled = !isEnabled
     startTransition(async () => {
-      const result = await updateAutoJoinDomainAction({ orgId, enabled: newEnabled })
-      setCurrentDomain(result.autoJoinDomain)
+      const result = await withStepUp(() => updateAutoJoinDomainAction({ orgId, enabled: newEnabled }))
+      if (result) setCurrentDomain(result.autoJoinDomain)
     })
   }
 
@@ -94,7 +95,7 @@ export function SettingsPage() {
 
   function handleDelete() {
     startTransition(async () => {
-      await deleteOrgAction({ orgId })
+      await withStepUp(() => deleteOrgAction({ orgId }))
     })
   }
 

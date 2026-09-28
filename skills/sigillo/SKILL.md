@@ -169,19 +169,19 @@ The same pattern works for any secret copy, between environments, or when seedin
 
 ### Protected environments need the user's passkey
 
-In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` needs a passkey approval, and is recorded in its Read Log with your login, the secret names and your IP address. Read only what the task needs.
+In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` needs a passkey approval, and is recorded in its Read Log with your login, the secret names and your IP address. So does every change: `secrets set`, `secrets delete`, and deleting the environment. Read only what the task needs, and change a protected environment only when the user asked for that change.
 
 Without an approval, the command prints a link and a code on stderr, then waits up to 10 minutes:
 
 ```
-This environment is protected: approve the read with your passkey.
+This environment is protected: approve with your passkey.
   Open https://<instance>/approve and enter BCDF-GHJK
 Waiting for your approval...
 ```
 
-Show the user the link and the code right away, and tell them what the command reads. Never open the page or try to approve it yourself: only the user's passkey can. Once they approve, the command continues, and the login can read that environment for 15 minutes. If it prints `the approval expired`, ask before running it again.
+Show the user the link and the code right away, and tell them what the command reads or changes. If your shell only returns output when a command ends, run it in the background and read its output as it comes, or you'll only see the code once it's too late. Never open the page or try to approve it yourself: only the user's passkey can. Once they approve, the command continues. The approval belongs to the login, not to the command: for 15 minutes, other commands on that environment run without asking again. If it prints `the approval expired`, ask before running it again.
 
-An API token gets `only a machine token can read it`. Don't work around it: tell the user an org admin can create a machine token on the **Tokens** tab.
+An API token gets `only a machine token can use it`. Don't work around it: tell the user an org admin can create a machine token on the **Tokens** tab.
 
 ### Never read `.env` files or `~/.sigillo/*`
 

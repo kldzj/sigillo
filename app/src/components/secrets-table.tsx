@@ -150,6 +150,9 @@ export function SecretsTable({
   // twice, the state to show them loading
   const fetching = useRef(new Set<string>());
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
+  // Rows whose passkey approval was declined: "Show all" doesn't ask for them
+  // again on its own, only when turned on again or when a row is revealed
+  const [declined, setDeclined] = useState<ReadonlySet<string>>(new Set());
 
   const loadValues = useCallback(async (targets: { id: string; name: string }[]) => {
     const missing = targets.filter((secret) => values[secret.id] === undefined && !fetching.current.has(secret.id));
@@ -163,6 +166,7 @@ export function SecretsTable({
         setValues((prev) => ({ ...prev, ...Object.fromEntries(missing.map((secret) => [secret.id, result.values[secret.name] ?? ""])) }));
       } else {
         setRowVisible((prev) => ({ ...prev, ...Object.fromEntries(missing.map((secret) => [secret.id, false])) }));
+        setDeclined((prev) => new Set([...prev, ...missing.map((secret) => secret.id)]));
       }
     } catch (e: any) {
       alert(e?.message || "Failed to load values");
@@ -173,8 +177,13 @@ export function SecretsTable({
   }, [environmentId, values]);
 
   useEffect(() => {
-    if (allVisible) void loadValues(secrets);
-  }, [allVisible, secrets, loadValues]);
+    if (allVisible) setDeclined(new Set());
+  }, [allVisible]);
+
+  // Every action refreshes the page data, so this runs again after each one
+  useEffect(() => {
+    if (allVisible) void loadValues(secrets.filter((secret) => !declined.has(secret.id)));
+  }, [allVisible, secrets, loadValues, declined]);
 
   // Track edits per secret id
   const [edits, setEdits] = useState<Record<string, { name?: string; value?: string }>>({});
@@ -257,8 +266,7 @@ export function SecretsTable({
     if (edits.length === 0) return;
     setImporting(true);
     try {
-      await saveSecretsAction({ edits, environmentIds: [environmentId] });
-      setImportOpen(false);
+      if (await withStepUp(() => saveSecretsAction({ edits, environmentIds: [environmentId] })) !== null) setImportOpen(false);
     } catch (e: any) {
       alert(e?.message || "Failed to import secrets");
     } finally {
@@ -297,11 +305,17 @@ export function SecretsTable({
   }, [buildEnvFile, environmentId, environments]);
 
   const handleCopyEnv = useCallback(async () => {
+    // A declined approval rejects the pending item, and the browser then
+    // reports its own error instead of ours
+    let notApproved = false;
     try {
       // A pending ClipboardItem keeps the click's permission to write while
       // the values load; writeText after an await would lose it in Safari
       const text = buildEnvFile().then((t) => {
-        if (t === null) throw new NotApproved();
+        if (t === null) {
+          notApproved = true;
+          throw new NotApproved();
+        }
         return t;
       });
       if (typeof ClipboardItem !== "undefined") {
@@ -310,7 +324,7 @@ export function SecretsTable({
         await navigator.clipboard.writeText(await text);
       }
     } catch (error: any) {
-      if (error instanceof NotApproved) return;
+      if (notApproved || error instanceof NotApproved) return;
       alert(error?.message || "Failed to copy .env contents");
     }
   }, [buildEnvFile]);
@@ -366,7 +380,7 @@ export function SecretsTable({
           <TableBody>
             {secrets.map((secret) => {
               const isDirty = dirtySecrets.includes(secret);
-              const isVisible = allVisible || (rowVisible[secret.id] ?? false);
+              const isVisible = (allVisible && !declined.has(secret.id)) || (rowVisible[secret.id] ?? false);
               return (
                 <TableRow key={secret.id} className={isDirty ? "bg-amber-50/50 dark:bg-amber-950/20" : ""}>
                   <TableCell className="min-w-0 overflow-hidden">
@@ -389,7 +403,10 @@ export function SecretsTable({
                       visible={isVisible}
                       loading={pending.has(secret.id)}
                       onToggle={() => {
-                        if (!isVisible) void loadValues([secret]);
+                        if (!isVisible) {
+                          setDeclined((prev) => new Set([...prev].filter((id) => id !== secret.id)));
+                          void loadValues([secret]);
+                        }
                         setRowVisible((prev) => ({ ...prev, [secret.id]: !isVisible }));
                       }}
                       isDirty={isDirty}
@@ -749,8 +766,7 @@ function DeleteFromEnvsDialog({
             onClick={async () => {
               setDeleting(true);
               try {
-                await deleteSecretAction({ name: secretName, environmentIds: selectedIds });
-                onOpenChange(false);
+                if (await withStepUp(() => deleteSecretAction({ name: secretName, environmentIds: selectedIds }))) onOpenChange(false);
               } catch (e: any) {
                 alert(e?.message || "Failed to delete secret");
               } finally {

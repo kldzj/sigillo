@@ -8,6 +8,7 @@
 import { useState } from "react"
 import { router, useLoaderData } from "spiceflow/react"
 import { createInviteAction } from "../actions.ts"
+import { withStepUp } from "./step-up.ts"
 import { Button } from "sigillo-app/src/components/ui/button"
 import {
   Dialog, DialogPopup, DialogHeader, DialogTitle,
@@ -52,8 +53,8 @@ function InviteDialog({ open, onOpenChange, orgId }: {
       const projectIds = scopeProjects
         ? orgProjects.filter((p) => selectedProjects[p.id]).map((p) => p.id)
         : undefined
-      const result = await createInviteAction({ orgId, projectIds })
-      setInviteUrl(`${window.location.origin}${router.href('/invite/:id', { id: result.id })}`)
+      const result = await withStepUp(() => createInviteAction({ orgId, projectIds }))
+      if (result) setInviteUrl(`${window.location.origin}${router.href('/invite/:id', { id: result.id })}`)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to generate invite link')
     } finally {

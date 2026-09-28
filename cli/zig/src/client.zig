@@ -43,11 +43,16 @@ pub fn request(args: RequestArgs) !ApiResult {
 }
 
 fn send(args: RequestArgs) !ApiResult {
-    const url = try std.fmt.allocPrint(args.allocator, "{s}{s}", .{ args.base_url, args.path });
-    defer args.allocator.free(url);
-
     var http_client: std.http.Client = .{ .allocator = args.allocator };
     defer http_client.deinit();
+    return sendWith(&http_client, args);
+}
+
+// Every new client reads the system's CA certificates again: a loop of
+// requests shares one
+fn sendWith(http_client: *std.http.Client, args: RequestArgs) !ApiResult {
+    const url = try std.fmt.allocPrint(args.allocator, "{s}{s}", .{ args.base_url, args.path });
+    defer args.allocator.free(url);
 
     var response_body: std.io.Writer.Allocating = .init(args.allocator);
     defer response_body.deinit();
@@ -557,8 +562,11 @@ pub fn downloadSecrets(args: DownloadSecretsArgs) !ApiResult {
 
 // ── Step-up ─────────────────────────────────────────────────────────
 
-// How often the CLI asks whether the read was approved
+// How often the CLI asks whether the read was approved, and how long it
+// waits at most: the server's requests last 10 minutes, and it says when one
+// expired, so this clock only ends a wait the server never answers
 pub var step_up_poll_ms: u64 = 2000;
+const step_up_wait_ms: i64 = 11 * 60 * 1000;
 
 fn stepUpEnvironments(allocator: std.mem.Allocator, body: []const u8) ?[]const []const u8 {
     const Denied = struct { code: []const u8 = "", environmentIds: []const []const u8 = &.{} };
@@ -579,7 +587,7 @@ fn approveInBrowser(args: RequestArgs, environment_ids: []const []const u8) !boo
         .token = args.token,
         .json_body = try jsonBody(args.allocator, .{ .environmentIds = environment_ids }),
     });
-    const Opened = struct { id: []const u8, userCode: []const u8, approveUrl: []const u8, expiresAt: i64 };
+    const Opened = struct { id: []const u8, userCode: []const u8, approveUrl: []const u8 };
     const request_info = (if (opened.status == 200) std.json.parseFromSliceLeaky(Opened, args.allocator, opened.body, .{ .ignore_unknown_fields = true }) catch null else null) orelse {
         const message = parseError(args.allocator, opened.body) orelse "unknown error";
         try color.err(stderr, "error");
@@ -587,26 +595,50 @@ fn approveInBrowser(args: RequestArgs, environment_ids: []const []const u8) !boo
         return false;
     };
 
-    try stderr.writeAll("This environment is protected: approve the read with your passkey.\n  Open ");
+    try stderr.writeAll("This environment is protected: approve with your passkey.\n  Open ");
     try color.cyan(stderr, request_info.approveUrl);
     try stderr.writeAll(" and enter ");
     try color.bold(stderr, request_info.userCode);
     try stderr.writeAll("\n");
     try color.dim(stderr, "Waiting for your approval...\n");
 
+    // A check that fails on the way (a dropped connection, 429, 5xx) doesn't
+    // end the wait; the server refusing it (401, 403, 404) does
     const status_path = try std.fmt.allocPrint(args.allocator, "/api/v0/step-up/{s}", .{request_info.id});
-    while (std.time.milliTimestamp() < request_info.expiresAt) {
+    var http_client: std.http.Client = .{ .allocator = args.allocator };
+    defer http_client.deinit();
+    var last_failure: ?[]const u8 = null;
+    const deadline = std.time.milliTimestamp() + step_up_wait_ms;
+    while (std.time.milliTimestamp() < deadline) {
         std.Thread.sleep(step_up_poll_ms * std.time.ns_per_ms);
-        const polled = try send(.{ .allocator = args.allocator, .method = .GET, .base_url = args.base_url, .path = status_path, .token = args.token });
-        const status = if (polled.status == 200) jsonString(args.allocator, polled.body, "status") orelse "" else "";
-        if (std.mem.eql(u8, status, "approved")) {
-            try color.green(stderr, "✔");
-            try stderr.writeAll(" Approved for 15 minutes\n");
-            return true;
+        const polled = sendWith(&http_client, .{ .allocator = args.allocator, .method = .GET, .base_url = args.base_url, .path = status_path, .token = args.token }) catch |err| {
+            last_failure = @errorName(err);
+            continue;
+        };
+        switch (polled.status) {
+            200 => {
+                const status = jsonString(args.allocator, polled.body, "status") orelse "";
+                if (std.mem.eql(u8, status, "approved")) {
+                    try color.green(stderr, "✔");
+                    try stderr.writeAll(" Approved for 15 minutes\n");
+                    return true;
+                }
+                if (!std.mem.eql(u8, status, "pending")) break;
+                last_failure = null;
+            },
+            401, 403, 404 => {
+                try color.err(stderr, "error");
+                try stderr.print(": checking the approval failed ({d}): {s}\n", .{ polled.status, parseError(args.allocator, polled.body) orelse "unknown error" });
+                return false;
+            },
+            else => last_failure = try std.fmt.allocPrint(args.allocator, "{d}: {s}", .{ polled.status, parseError(args.allocator, polled.body) orelse "unknown error" }),
         }
-        if (!std.mem.eql(u8, status, "pending")) break;
     }
     try color.err(stderr, "error");
-    try stderr.writeAll(": the approval expired: run the command again\n");
+    if (last_failure) |failure| {
+        try stderr.print(": couldn't check the approval ({s}): run the command again\n", .{failure});
+    } else {
+        try stderr.writeAll(": the approval expired: run the command again\n");
+    }
     return false;
 }

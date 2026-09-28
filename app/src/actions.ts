@@ -34,7 +34,8 @@ import {
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
 import {
-  StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent, requireMachineTokenApproval,
+  StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
+  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireProtectedAccess, resetMemberPasskeys, type Purpose,
 } from './step-up.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 
@@ -43,6 +44,11 @@ async function requireSession() {
   const session = await getSession(request)
   if (!session) throw new Error('Unauthorized')
   return session
+}
+
+// The signed-in person as the author of a change or a read
+function authorOf(session: { userId: string; sessionId: string }) {
+  return { userId: session.userId, apiTokenId: null, sessionId: session.sessionId }
 }
 
 // Org member + project access + admin role for admin-only envs.
@@ -85,11 +91,6 @@ async function requireTokenScopeAccess({ userId, projectId, environmentIds }: {
   }
 }
 
-async function requireAdminRole(userId: string, orgId: string) {
-  const { role } = await requireOrgMember(userId, orgId)
-  if (role !== 'admin') throw new Error('Only admins can manage access')
-}
-
 async function ensureAnotherAdminExists(orgId: string, userId: string) {
   const db = getDb()
   const admins = await db.query.orgMember.findMany({
@@ -124,27 +125,31 @@ export async function deleteSecretAction({ name, environmentIds }: {
   name: string
   environmentIds: string[]
 }) {
-  const unique = Array.from(new Set(environmentIds))
-  if (!unique.length) throw new Error('No environments selected')
-  const session = await requireSession()
-  const envs = await Promise.all(unique.map((id) => requireEnvironmentAccess(session.userId, id)))
-  if (envs.some((env) => env.projectId !== envs[0]!.projectId)) {
-    throw new Error('All environments must belong to the same project')
-  }
-  await appendSecretEvents(unique.map((environmentId) => ({
-    environmentId, name, operation: 'delete', userId: session.userId, apiTokenId: null,
-  })))
+  return stepUpOr(async () => {
+    const unique = Array.from(new Set(environmentIds))
+    if (!unique.length) throw new Error('No environments selected')
+    const session = await requireSession()
+    const envs = await Promise.all(unique.map((id) => requireEnvironmentAccess(session.userId, id)))
+    if (envs.some((env) => env.projectId !== envs[0]!.projectId)) {
+      throw new Error('All environments must belong to the same project')
+    }
+    await appendSecretEvents({
+      author: authorOf(session),
+      events: unique.map((environmentId) => ({ environmentId, name, operation: 'delete' as const })),
+    })
+    return { ok: true }
+  })
 }
 
-// A read of a protected environment without a passkey approval: the browser
-// asks for one (startStepUpAction) and tries again
-type StepUp = { stepUp: { environmentIds: string[] } }
+// An action that needs a passkey approval first: the browser asks for one
+// (startStepUpAction) and runs the action again
+type StepUp = { stepUp: { purpose: Purpose; environmentIds: string[] } }
 
-async function stepUpOr<T>(read: () => Promise<T>): Promise<T | StepUp> {
+async function stepUpOr<T>(action: () => Promise<T>): Promise<T | StepUp> {
   try {
-    return await read()
+    return await action()
   } catch (error) {
-    if (error instanceof StepUpRequiredError) return { stepUp: { environmentIds: error.environmentIds } }
+    if (error instanceof StepUpRequiredError) return { stepUp: { purpose: error.purpose, environmentIds: error.environmentIds } }
     throw error
   }
 }
@@ -174,10 +179,10 @@ export async function revealEventValueAction({ eventId }: { eventId: string }) {
 // ── Step-up in the browser ──────────────────────────────────────────
 
 // Asks this browser session's own approval: the passkey challenge to sign
-export async function startStepUpAction({ environmentIds }: { environmentIds: string[] }) {
+export async function startStepUpAction({ purpose, environmentIds }: { purpose: Purpose; environmentIds: string[] }) {
   const session = await requireSession()
   const request = getActionRequest()
-  const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds, withCode: false })
+  const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds, withCode: false, purpose })
   try {
     return { requestId: row.id, options: await approvalOptions({ request, requestId: row.id, userId: session.userId }) }
   } catch (error) {
@@ -193,37 +198,30 @@ export async function finishStepUpAction({ requestId, response }: { requestId: s
 
 // ── Passkeys ────────────────────────────────────────────────────────
 
-// Adding another passkey needs an approval with an existing one first
-export async function startPasskeysApprovalAction() {
-  const session = await requireSession()
-  const request = getActionRequest()
-  const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds: [], withCode: false, purpose: 'passkeys' })
-  return { requestId: row.id, options: await approvalOptions({ request, requestId: row.id, userId: session.userId }) }
-}
-
 export async function removePasskeyAction({ passkeyId }: { passkeyId: string }) {
-  const session = await requireSession()
-  const db = getDb()
-  const passkey = await db.query.passkey.findFirst({ where: { id: passkeyId, userId: session.userId }, columns: { id: true, name: true } })
-  if (!passkey) throw new Error('Passkey not found')
-  await db.delete(schema.passkey).where(orm.eq(schema.passkey.id, passkey.id))
-  await logPasskeyEvent({ request: getActionRequest(), userId: session.userId, actor: `user:${session.userId}`, action: 'removed', passkeyName: passkey.name })
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const db = getDb()
+    const passkey = await db.query.passkey.findFirst({ where: { id: passkeyId, userId: session.userId }, columns: { id: true, name: true } })
+    if (!passkey) throw new Error('Passkey not found')
+    await requireAdminApproval({ userId: session.userId, sessionId: session.sessionId })
+    await db.delete(schema.passkey).where(orm.eq(schema.passkey.id, passkey.id))
+    await logPasskeyEvent({ request: getActionRequest(), userId: session.userId, actor: `user:${session.userId}`, action: 'removed', passkeyName: passkey.name })
+    return { ok: true }
+  })
 }
 
 // An org admin removes a member's passkeys, for a member who lost them: the
 // member then adds new ones after a fresh sign-in
 export async function removeMemberPasskeysAction({ memberId }: { memberId: string }) {
-  const session = await requireSession()
-  const db = getDb()
-  const member = await db.query.orgMember.findFirst({ where: { id: memberId }, columns: { orgId: true, userId: true } })
-  if (!member) throw new Error('Member not found')
-  await requireAdminRole(session.userId, member.orgId)
-  const passkeys = await db.query.passkey.findMany({ where: { userId: member.userId }, columns: { id: true, name: true } })
-  if (passkeys.length === 0) return
-  await db.delete(schema.passkey).where(orm.eq(schema.passkey.userId, member.userId))
-  for (const passkey of passkeys) {
-    await logPasskeyEvent({ request: getActionRequest(), userId: member.userId, actor: `user:${session.userId}`, action: 'removed', passkeyName: passkey.name })
-  }
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const db = getDb()
+    const member = await db.query.orgMember.findFirst({ where: { id: memberId }, columns: { orgId: true, userId: true } })
+    if (!member) throw new Error('Member not found')
+    await resetMemberPasskeys({ request: getActionRequest(), actor: session, userId: member.userId })
+    return { ok: true }
+  })
 }
 
 // /approve: a CLI request of the signed-in user, found by the code typed there
@@ -280,6 +278,10 @@ async function saveSecrets({ edits: requested, environmentIds }: {
     }
   }
 
+  // Every environment written, protected ones asked for at once
+  const author = authorOf(session)
+  await requireProtectedAccess({ environmentIds, reader: author })
+
   const kept = requested.filter((edit) => edit.value === undefined)
   const current = kept.length ? await deriveSecrets(currentEnvId) : []
   const edits = await Promise.all(requested.map(async (edit) => {
@@ -291,36 +293,40 @@ async function saveSecrets({ edits: requested, environmentIds }: {
   if (kept.length && environmentIds.some((id) => id !== currentEnvId)) {
     await recordSecretRead({
       request: getActionRequest(), environment: envs.find((env) => env.id === currentEnvId)!,
-      author: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId }, kind: 'copy', names: kept.map((edit) => edit.originalName ?? edit.name),
+      author, kind: 'copy', names: kept.map((edit) => edit.originalName ?? edit.name),
     })
   }
 
-  const author = { userId: session.userId, apiTokenId: null }
   const events: NewSecretEvent[] = []
   for (const edit of edits) {
     const originalName = edit.originalName
     if (originalName && edit.name !== originalName) {
-      events.push({ environmentId: currentEnvId, name: originalName, operation: 'delete', ...author })
+      events.push({ environmentId: currentEnvId, name: originalName, operation: 'delete' })
     }
-    events.push({ environmentId: currentEnvId, name: edit.name, operation: 'set', value: edit.value, ...author })
+    events.push({ environmentId: currentEnvId, name: edit.name, operation: 'set', value: edit.value })
   }
 
   // Apply value changes to other environments
   const otherEnvIds = Array.from(new Set(environmentIds.slice(1))).filter((id) => id !== currentEnvId)
   for (const environmentId of otherEnvIds) {
     for (const edit of edits) {
-      events.push({ environmentId, name: edit.name, operation: 'set', value: edit.value, ...author })
+      events.push({ environmentId, name: edit.name, operation: 'set', value: edit.value })
     }
   }
 
-  await appendSecretEvents(events)
+  await appendSecretEvents({ author, events })
 }
 
 export async function deleteEnvAction({ id }: { id: string }) {
-  const session = await requireSession()
-  await requireEnvironmentAccess(session.userId, id)
-  const db = getDb()
-  await db.delete(schema.environment).where(orm.eq(schema.environment.id, id))
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    await requireEnvironmentAccess(session.userId, id)
+    // Deleting a protected environment deletes its secrets: the same approval as changing them
+    await requireProtectedAccess({ environmentIds: [id], reader: authorOf(session) })
+    const db = getDb()
+    await db.delete(schema.environment).where(orm.eq(schema.environment.id, id))
+    return { ok: true }
+  })
 }
 
 export async function createEnvAction({ name, slug, projectId }: {
@@ -341,46 +347,52 @@ export async function renameEnvAction({ id, name, slug }: {
   name?: string
   slug?: string
 }) {
-  if (!name && !slug) throw new Error('At least one of name or slug is required')
-  const session = await requireSession()
-  await requireEnvironmentAccess(session.userId, id)
-  const db = getDb()
-  const updates: Partial<{ name: string; slug: string; updatedAt: number }> = { updatedAt: Date.now() }
-  if (name) updates.name = name
-  if (slug) updates.slug = slug
-  await db.update(schema.environment).set(updates).where(orm.eq(schema.environment.id, id))
-  return { id }
+  return stepUpOr(async () => {
+    if (!name && !slug) throw new Error('At least one of name or slug is required')
+    const session = await requireSession()
+    await requireEnvironmentAccess(session.userId, id)
+    // A protected environment's slug is what the CLI and CI ask for: moving it
+    // aside would let an unprotected one take its place
+    await requireProtectedAccess({ environmentIds: [id], reader: authorOf(session) })
+    const db = getDb()
+    const updates: Partial<{ name: string; slug: string; updatedAt: number }> = { updatedAt: Date.now() }
+    if (name) updates.name = name
+    if (slug) updates.slug = slug
+    await db.update(schema.environment).set(updates).where(orm.eq(schema.environment.id, id))
+    return { id }
+  })
 }
 
 const INVITE_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
 
 export async function createInviteAction({ orgId, projectIds }: { orgId: string; projectIds?: string[] }) {
-  if (!orgId) throw new Error('No org selected')
-  const session = await requireSession()
-  const { role } = await requireOrgMember(session.userId, orgId)
-  if (role !== 'admin') throw new Error('Only admins can create invites')
+  return stepUpOr(async () => {
+    if (!orgId) throw new Error('No org selected')
+    const session = await requireSession()
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId })
 
-  // Validate project IDs belong to this org if provided
-  if (projectIds && projectIds.length > 0) {
-    const db = getDb()
-    const orgProjects = await db.query.project.findMany({
-      where: { orgId },
-      columns: { id: true },
-    })
-    const validIds = new Set(orgProjects.map((p) => p.id))
-    for (const pid of projectIds) {
-      if (!validIds.has(pid)) throw new Error(`Project ${pid} does not belong to this organization`)
+    // Validate project IDs belong to this org if provided
+    if (projectIds && projectIds.length > 0) {
+      const db = getDb()
+      const orgProjects = await db.query.project.findMany({
+        where: { orgId },
+        columns: { id: true },
+      })
+      const validIds = new Set(orgProjects.map((p) => p.id))
+      for (const pid of projectIds) {
+        if (!validIds.has(pid)) throw new Error(`Project ${pid} does not belong to this organization`)
+      }
     }
-  }
 
-  const db = getDb()
-  const [invite] = await db.insert(schema.orgInvitation).values({
-    orgId,
-    createdBy: session.userId,
-    projectIds: projectIds && projectIds.length > 0 ? JSON.stringify(projectIds) : null,
-    expiresAt: Date.now() + INVITE_EXPIRY_MS,
-  }).returning({ id: schema.orgInvitation.id })
-  return { id: invite!.id }
+    const db = getDb()
+    const [invite] = await db.insert(schema.orgInvitation).values({
+      orgId,
+      createdBy: session.userId,
+      projectIds: projectIds && projectIds.length > 0 ? JSON.stringify(projectIds) : null,
+      expiresAt: Date.now() + INVITE_EXPIRY_MS,
+    }).returning({ id: schema.orgInvitation.id })
+    return { id: invite!.id }
+  })
 }
 
 export async function acceptInviteAction({ invitationId }: { invitationId: string }) {
@@ -430,49 +442,53 @@ export async function updateOrgMemberRoleAction({ memberId, role }: {
   memberId: string
   role: 'admin' | 'member'
 }) {
-  const session = await requireSession()
-  const db = getDb()
-  const member = await db.query.orgMember.findFirst({
-    where: { id: memberId },
-    columns: { id: true, orgId: true, userId: true, role: true },
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const db = getDb()
+    const member = await db.query.orgMember.findFirst({
+      where: { id: memberId },
+      columns: { id: true, orgId: true, userId: true, role: true },
+    })
+    if (!member) throw new Error('Member not found')
+
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: member.orgId })
+
+    if (member.role === role) {
+      return { id: member.id, role: member.role }
+    }
+
+    if (member.role === 'admin' && role !== 'admin') {
+      await ensureAnotherAdminExists(member.orgId, member.userId)
+    }
+
+    await db.update(schema.orgMember)
+      .set({ role })
+      .where(orm.eq(schema.orgMember.id, member.id))
+      .limit(1)
+
+    return { id: member.id, role }
   })
-  if (!member) throw new Error('Member not found')
-
-  await requireAdminRole(session.userId, member.orgId)
-
-  if (member.role === role) {
-    return { id: member.id, role: member.role }
-  }
-
-  if (member.role === 'admin' && role !== 'admin') {
-    await ensureAnotherAdminExists(member.orgId, member.userId)
-  }
-
-  await db.update(schema.orgMember)
-    .set({ role })
-    .where(orm.eq(schema.orgMember.id, member.id))
-    .limit(1)
-
-  return { id: member.id, role }
 }
 
 export async function removeOrgMemberAction({ memberId }: { memberId: string }) {
-  const session = await requireSession()
-  const db = getDb()
-  const member = await db.query.orgMember.findFirst({
-    where: { id: memberId },
-    columns: { id: true, orgId: true, userId: true, role: true },
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const db = getDb()
+    const member = await db.query.orgMember.findFirst({
+      where: { id: memberId },
+      columns: { id: true, orgId: true, userId: true, role: true },
+    })
+    if (!member) throw new Error('Member not found')
+
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: member.orgId })
+
+    if (member.role === 'admin') {
+      await ensureAnotherAdminExists(member.orgId, member.userId)
+    }
+
+    await deleteOrgMember(member)
+    return { id: member.id }
   })
-  if (!member) throw new Error('Member not found')
-
-  await requireAdminRole(session.userId, member.orgId)
-
-  if (member.role === 'admin') {
-    await ensureAnotherAdminExists(member.orgId, member.userId)
-  }
-
-  await deleteOrgMember(member)
-  return { id: member.id }
 }
 
 // ── Session actions ─────────────────────────────────────────────────
@@ -519,7 +535,7 @@ async function createToken({ name, projectId, environmentIds, expiresInDays, pro
   const db = getDb()
 
   if (protectedAccess) {
-    await requireMachineTokenApproval({ userId: session.userId, sessionId: session.sessionId, projectId, environmentIds: uniqueEnvIds, expiresInDays })
+    await requireMachineTokenApproval({ userId: session.userId, sessionId: session.sessionId, projectId, expiresInDays })
   }
 
   const { key, hashedKey, prefix } = await generateApiToken()
@@ -545,21 +561,26 @@ async function createToken({ name, projectId, environmentIds, expiresInDays, pro
 }
 
 export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
-  if (!tokenId) throw new Error('Token ID is required')
-  const session = await requireSession()
-  const db = getDb()
-  const token = await db.query.apiToken.findFirst({
-    where: { id: tokenId },
-    columns: { projectId: true },
-    with: { environments: { columns: { environmentId: true } } },
+  return stepUpOr(async () => {
+    if (!tokenId) throw new Error('Token ID is required')
+    const session = await requireSession()
+    const db = getDb()
+    const token = await db.query.apiToken.findFirst({
+      where: { id: tokenId },
+      columns: { projectId: true, protectedAccess: true },
+      with: { environments: { columns: { environmentId: true } } },
+    })
+    if (!token) throw new Error('Token not found')
+    await requireTokenScopeAccess({
+      userId: session.userId,
+      projectId: token.projectId,
+      environmentIds: token.environments.map((row) => row.environmentId),
+    })
+    // Deleting a machine token stops CI: an admin action, like making one
+    if (token.protectedAccess) await requireMachineTokenApproval({ userId: session.userId, sessionId: session.sessionId, projectId: token.projectId, expiresInDays: 0 })
+    await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
+    return { ok: true }
   })
-  if (!token) throw new Error('Token not found')
-  await requireTokenScopeAccess({
-    userId: session.userId,
-    projectId: token.projectId,
-    environmentIds: token.environments.map((row) => row.environmentId),
-  })
-  await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
 }
 
 export async function syncMissingSecretsAction(args: {
@@ -603,13 +624,16 @@ async function syncMissingSecrets({
 
   if (toSync.length === 0) return { count: 0 }
 
-  const author = { userId: session.userId, apiTokenId: null }
-  // Copying values out of a protected environment is a read of them
-  await recordSecretRead({ request: getActionRequest(), environment: source, author: { ...author, sessionId: session.sessionId }, kind: 'copy', names: toSync.map((s) => s.name) })
+  // Copying values out of a protected environment is a read of them, and
+  // into one a change: both asked for at once
+  const author = authorOf(session)
+  await requireProtectedAccess({ environmentIds: [sourceEnvironmentId, targetEnvironmentId], reader: author })
+  await recordSecretRead({ request: getActionRequest(), environment: source, author, kind: 'copy', names: toSync.map((s) => s.name) })
   const values = await Promise.all(toSync.map((s) => decrypt(s.valueEncrypted, s.iv)))
-  await appendSecretEvents(toSync.map((s, i) => ({
-    environmentId: targetEnvironmentId, name: s.name, operation: 'set', value: values[i]!, ...author,
-  })))
+  await appendSecretEvents({
+    author,
+    events: toSync.map((s, i) => ({ environmentId: targetEnvironmentId, name: s.name, operation: 'set' as const, value: values[i]! })),
+  })
   return { count: toSync.length }
 }
 
@@ -634,24 +658,26 @@ export async function createOrgAction({ name, enableAutoJoin }: { name: string; 
 }
 
 export async function updateAutoJoinDomainAction({ orgId, enabled }: { orgId: string; enabled: boolean }) {
-  if (!orgId) throw new Error('Org ID is required')
-  const session = await requireSession()
-  await requireAdminRole(session.userId, orgId)
+  return stepUpOr(async () => {
+    if (!orgId) throw new Error('Org ID is required')
+    const session = await requireSession()
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: orgId })
 
-  let autoJoinDomain: string | null = null
-  if (enabled) {
-    const domain = await getClaimableAutoJoinDomain({ session, orgId })
-    if (domain instanceof Error) throw domain
-    autoJoinDomain = domain
-  }
+    let autoJoinDomain: string | null = null
+    if (enabled) {
+      const domain = await getClaimableAutoJoinDomain({ session, orgId })
+      if (domain instanceof Error) throw domain
+      autoJoinDomain = domain
+    }
 
-  const db = getDb()
-  await db.update(schema.org)
-    .set({ autoJoinDomain, updatedAt: Date.now() })
-    .where(orm.eq(schema.org.id, orgId))
-    .limit(1)
+    const db = getDb()
+    await db.update(schema.org)
+      .set({ autoJoinDomain, updatedAt: Date.now() })
+      .where(orm.eq(schema.org.id, orgId))
+      .limit(1)
 
-  return { autoJoinDomain }
+    return { autoJoinDomain }
+  })
 }
 
 // ── Member access (granular project permissions) ────────────────────
@@ -663,40 +689,42 @@ export async function updateMemberAccessAction({ memberId, projectIds }: {
   memberId: string
   projectIds: string[] | null
 }) {
-  const session = await requireSession()
-  const db = getDb()
-  const member = await db.query.orgMember.findFirst({
-    where: { id: memberId },
-    columns: { id: true, orgId: true, role: true },
-  })
-  if (!member) throw new Error('Member not found')
-  await requireAdminRole(session.userId, member.orgId)
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const db = getDb()
+    const member = await db.query.orgMember.findFirst({
+      where: { id: memberId },
+      columns: { id: true, orgId: true, role: true },
+    })
+    if (!member) throw new Error('Member not found')
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: member.orgId })
 
-  // Cannot restrict admins
-  if (member.role === 'admin') throw new Error('Admins always have full access')
+    // Cannot restrict admins
+    if (member.role === 'admin') throw new Error('Admins always have full access')
 
-  const selected = projectIds ?? []
-  const orgProjects = await db.query.project.findMany({
-    where: { orgId: member.orgId },
-    columns: { id: true },
-  })
-  const orgProjectIdsSet = new Set(orgProjects.map((p) => p.id))
-  for (const pid of selected) {
-    if (!orgProjectIdsSet.has(pid)) {
-      throw new Error(`Project ${pid} does not belong to this organization`)
+    const selected = projectIds ?? []
+    const orgProjects = await db.query.project.findMany({
+      where: { orgId: member.orgId },
+      columns: { id: true },
+    })
+    const orgProjectIdsSet = new Set(orgProjects.map((p) => p.id))
+    for (const pid of selected) {
+      if (!orgProjectIdsSet.has(pid)) {
+        throw new Error(`Project ${pid} does not belong to this organization`)
+      }
     }
-  }
 
-  // Mode and rules in one batch, so a failure keeps the old access.
-  await db.batch([
-    db.update(schema.orgMember)
-      .set({ projectAccess: projectIds === null ? 'all' : 'selected' })
-      .where(orm.eq(schema.orgMember.id, member.id)),
-    db.delete(schema.memberAccess).where(orm.eq(schema.memberAccess.orgMemberId, member.id)),
-    ...selected.map((projectId) => db.insert(schema.memberAccess).values({ orgMemberId: member.id, projectId })),
-  ])
+    // Mode and rules in one batch, so a failure keeps the old access.
+    await db.batch([
+      db.update(schema.orgMember)
+        .set({ projectAccess: projectIds === null ? 'all' : 'selected' })
+        .where(orm.eq(schema.orgMember.id, member.id)),
+      db.delete(schema.memberAccess).where(orm.eq(schema.memberAccess.orgMemberId, member.id)),
+      ...selected.map((projectId) => db.insert(schema.memberAccess).values({ orgMemberId: member.id, projectId })),
+    ])
 
-  return { ok: true }
+    return { ok: true }
+  })
 }
 
 // ── Environment access role ─────────────────────────────────────────
@@ -707,16 +735,18 @@ export async function updateEnvironmentAccessRoleAction({ environmentId, accessR
   environmentId: string
   accessRole: 'admin' | 'member'
 }) {
-  const session = await requireSession()
-  const orgId = await getOrgIdForEnvironment(environmentId)
-  if (!orgId) throw new Error('Environment not found')
-  await requireAdminRole(session.userId, orgId)
-  const db = getDb()
-  await db.update(schema.environment)
-    .set({ accessRole, updatedAt: Date.now() })
-    .where(orm.eq(schema.environment.id, environmentId))
-    .limit(1)
-  return { ok: true, environmentId, accessRole }
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const orgId = await getOrgIdForEnvironment(environmentId)
+    if (!orgId) throw new Error('Environment not found')
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: orgId })
+    const db = getDb()
+    await db.update(schema.environment)
+      .set({ accessRole, updatedAt: Date.now() })
+      .where(orm.eq(schema.environment.id, environmentId))
+      .limit(1)
+    return { ok: true, environmentId, accessRole }
+  })
 }
 
 export async function updateEnvironmentProtectionAction({ environmentId, protect }: {
@@ -727,7 +757,7 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
     const session = await requireSession()
     const orgId = await getOrgIdForEnvironment(environmentId)
     if (!orgId) throw new Error('Environment not found')
-    await requireAdminRole(session.userId, orgId)
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: orgId })
     await setEnvironmentProtection({
       request: getActionRequest(), environmentId, protect, author: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId },
     })
@@ -736,13 +766,15 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
 }
 
 export async function deleteOrgAction({ orgId }: { orgId: string }) {
-  if (!orgId) throw new Error('Org ID is required')
-  const session = await requireSession()
-  await requireAdminRole(session.userId, orgId)
-  const db = getDb()
-  // Cascade deletes handle orgMembers, invitations, projects, environments,
-  // secretEvents, and apiTokens automatically via foreign key constraints.
-  await db.delete(schema.org).where(orm.eq(schema.org.id, orgId))
-  // /dash re-resolves the user's remaining orgs (or shows the create-org flow)
-  throw redirect(router.href('/dash'))
+  return stepUpOr(async () => {
+    if (!orgId) throw new Error('Org ID is required')
+    const session = await requireSession()
+    await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: orgId })
+    const db = getDb()
+    // Cascade deletes handle orgMembers, invitations, projects, environments,
+    // secretEvents, and apiTokens automatically via foreign key constraints.
+    await db.delete(schema.org).where(orm.eq(schema.org.id, orgId))
+    // /dash re-resolves the user's remaining orgs (or shows the create-org flow)
+    throw redirect(router.href('/dash'))
+  })
 }

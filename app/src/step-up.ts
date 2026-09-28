@@ -1,4 +1,7 @@
-// Step-up: a person approves reads of protected environments with a passkey.
+// Step-up: a person approves with a passkey. An access approval lets one
+// session read and change protected environments; an admin approval lets it
+// run admin actions in an organization with protected environments, and
+// manage its own passkeys.
 // better-auth's passkey plugin adds and manages passkeys; its own passkey
 // sign-in would create a new session and accepts a passkey without user
 // verification, so approvals are verified here, on the same passkey table,
@@ -12,17 +15,16 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
 } from '@simplewebauthn/server'
 import { getDb, schema } from 'db'
-import { getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess } from './db.ts'
+import { getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
 import { MACHINE_TOKEN_MAX_DAYS } from './lib/utils.ts'
 
-// How long an approval lets a session read, or add passkeys, and how long a
-// request waits
-const GRANT_MS = { read: 15 * 60 * 1000, passkeys: 5 * 60 * 1000 }
+// How long an approval lasts for the session, and how long a request waits
+const GRANT_MS = { access: 15 * 60 * 1000, admin: 5 * 60 * 1000 }
 const REQUEST_MS = 10 * 60 * 1000
 // The first passkey needs a sign-in this recent instead of an approval
 const FRESH_SIGN_IN_MS = 5 * 60 * 1000
 
-type Purpose = 'read' | 'passkeys'
+export type Purpose = 'access' | 'admin'
 
 // Where passkeys belong: the hostname and origin of this request
 export function relyingParty(request: Request) {
@@ -91,10 +93,12 @@ export async function verifyPasskey({ userId, response, expectedChallenge, origi
 // ── The gate ────────────────────────────────────────────────────────
 
 export class StepUpRequiredError extends Error {
-  constructor(readonly environmentIds: string[], readonly machineTokenRequired = false) {
+  constructor(readonly purpose: Purpose, readonly environmentIds: string[] = [], readonly machineTokenRequired = false) {
     super(machineTokenRequired
-      ? 'this environment is protected: only a machine token can read it'
-      : 'this environment is protected: approve the read with your passkey')
+      ? 'this environment is protected: only a machine token can use it'
+      : purpose === 'access'
+        ? 'this environment is protected: approve with your passkey'
+        : 'this needs an approval with your passkey')
     this.name = 'StepUpRequiredError'
   }
 
@@ -105,49 +109,82 @@ export class StepUpRequiredError extends Error {
 
 export type Reader = { userId: string | null; apiTokenId: string | null; sessionId?: string | null }
 
-// Reads of a protected environment need a grant for the reading session, or
-// a machine token. recordSecretRead calls this, and every read of values goes
-// through recordSecretRead. It only ever denies on top of the usual access rules.
+// Reading or changing a protected environment needs an access grant for the
+// session, or a machine token. recordSecretRead and appendSecretEvents call
+// this, and every read and write of values goes through them. It only ever
+// denies on top of the usual access rules.
 export async function requireStepUp({ environmentId, reader }: { environmentId: string; reader: Reader }) {
-  const db = getDb()
-  if (reader.apiTokenId) {
-    const token = await db.query.apiToken.findFirst({ where: { id: reader.apiTokenId }, columns: { protectedAccess: true } })
-    if (!token?.protectedAccess) throw new StepUpRequiredError([environmentId], true)
-    return
-  }
-  if (!reader.userId || !reader.sessionId) throw new StepUpRequiredError([environmentId])
-  const grants = await db.query.stepUpGrant.findMany({
-    where: { sessionId: reader.sessionId, userId: reader.userId, purpose: 'read', expiresAt: { gt: Date.now() } },
-    columns: { environmentIds: true },
-  })
-  if (!grants.some((grant) => grant.environmentIds.includes(environmentId))) throw new StepUpRequiredError([environmentId])
+  await requireProtectedAccess({ environmentIds: [environmentId], reader, known: true })
 }
 
-// A machine token reads protected environments without a passkey, so only
-// an admin makes one, with an approval of their own for every protected
-// environment it covers right now, and it expires after 90 days at most
-export async function requireMachineTokenApproval({ userId, sessionId, projectId, environmentIds, expiresInDays }: {
+// The same for several environments at once; only the protected ones need
+// it. One error lists every environment still missing an approval, so the
+// browser asks for the passkey once.
+export async function requireProtectedAccess({ environmentIds, reader, known = false }: {
+  environmentIds: string[]
+  reader: Reader
+  // The environments are known to be protected
+  known?: boolean
+}) {
+  const db = getDb()
+  const ids = [...new Set(environmentIds)]
+  const protectedIds = known || ids.length === 0
+    ? ids
+    : (await db.query.environment.findMany({ where: { id: { in: ids }, protected: true }, columns: { id: true } })).map((env) => env.id)
+  if (protectedIds.length === 0) return
+  if (reader.apiTokenId) {
+    // A machine token acts for its creator, who must still be an org admin
+    const token = await db.query.apiToken.findFirst({ where: { id: reader.apiTokenId }, columns: { protectedAccess: true, projectId: true, createdBy: true } })
+    const creator = token?.protectedAccess && token.createdBy ? await getProjectMemberAccess(token.createdBy, token.projectId) : null
+    if (creator?.role !== 'admin') throw new StepUpRequiredError('access', protectedIds, true)
+    return
+  }
+  if (!reader.userId || !reader.sessionId) throw new StepUpRequiredError('access', protectedIds)
+  const grants = await db.query.stepUpGrant.findMany({
+    where: { sessionId: reader.sessionId, userId: reader.userId, purpose: 'access', expiresAt: { gt: Date.now() } },
+    columns: { environmentIds: true },
+  })
+  const missing = protectedIds.filter((id) => !grants.some((grant) => grant.environmentIds.includes(id)))
+  if (missing.length) throw new StepUpRequiredError('access', missing)
+}
+
+async function hasAdminGrant({ userId, sessionId }: { userId: string; sessionId: string }) {
+  const grant = await getDb().query.stepUpGrant.findFirst({
+    where: { sessionId, userId, purpose: 'admin', expiresAt: { gt: Date.now() } },
+    columns: { id: true },
+  })
+  return !!grant
+}
+
+// An org admin, with an admin approval for the session when the org has a
+// protected environment, so a stolen admin session can't invite someone,
+// change roles or access, or delete. Orgs without protection keep today's rules.
+export async function requireOrgAdmin({ userId, sessionId, orgId }: { userId: string; sessionId: string; orgId: string }) {
+  const { role } = await requireOrgMember(userId, orgId)
+  if (role !== 'admin') throw new Error('Only admins can do this')
+  const [protectedEnv] = await getDb()
+    .select({ id: schema.environment.id })
+    .from(schema.environment)
+    .innerJoin(schema.project, orm.eq(schema.project.id, schema.environment.projectId))
+    .where(orm.and(orm.eq(schema.project.orgId, orgId), orm.eq(schema.environment.protected, true)))
+    .limit(1)
+  if (protectedEnv && !await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+}
+
+// A machine token reads and changes protected environments without a
+// passkey, so making or deleting one is an admin action (with an admin
+// approval once the org has a protected environment), and it expires after
+// 90 days at most. It stops working when its creator is no longer an admin.
+export async function requireMachineTokenApproval({ userId, sessionId, projectId, expiresInDays }: {
   userId: string
   sessionId: string
   projectId: string
-  // [] covers every environment of the project
-  environmentIds: string[]
   expiresInDays: number
 }) {
   if (expiresInDays > MACHINE_TOKEN_MAX_DAYS) throw new Error(`A machine token expires after ${MACHINE_TOKEN_MAX_DAYS} days at most`)
-  if ((await getProjectMemberAccess(userId, projectId))?.role !== 'admin') throw new Error('Only admins can make a machine token')
-  const environments = await getDb().query.environment.findMany({ where: { projectId, protected: true }, columns: { id: true } })
-  const missing: string[] = []
-  for (const env of environments) {
-    if (environmentIds.length && !environmentIds.includes(env.id)) continue
-    try {
-      await requireStepUp({ environmentId: env.id, reader: { userId, apiTokenId: null, sessionId } })
-    } catch (error) {
-      if (!(error instanceof StepUpRequiredError)) throw error
-      missing.push(env.id)
-    }
-  }
-  if (missing.length) throw new StepUpRequiredError(missing)
+  const project = await getDb().query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } })
+  if (!project) throw new Error('Project not found')
+  await requireOrgAdmin({ userId, sessionId, orgId: project.orgId })
 }
 
 // ── Requests and approvals ──────────────────────────────────────────
@@ -167,10 +204,10 @@ export class NoPasskeyError extends Error {
   }
 }
 
-// Opens a request for the session to read the environments, or to add
-// passkeys. The CLI gets a code that its user types on /approve; the browser
+// Opens a request for the session: access to the environments, or admin
+// actions. The CLI gets a code that its user types on /approve; the browser
 // approves its own.
-export async function createStepUpRequest({ request, userId, sessionId, environmentIds, withCode, purpose = 'read' }: {
+export async function createStepUpRequest({ request, userId, sessionId, environmentIds, withCode, purpose = 'access' }: {
   request: Request
   userId: string
   sessionId: string
@@ -179,7 +216,7 @@ export async function createStepUpRequest({ request, userId, sessionId, environm
   purpose?: Purpose
 }) {
   const ids = [...new Set(environmentIds)]
-  if (purpose === 'read' && ids.length === 0) throw new Error('No environments to approve')
+  if (purpose === 'access' && ids.length === 0) throw new Error('No environments to approve')
   // Only environments the user may read at all
   for (const id of ids) {
     if (!await getUserEnvironmentAccess({ userId, environmentRef: id })) throw new Error('Environment not found')
@@ -203,11 +240,11 @@ async function pendingRequest(where: { id?: string; userCode?: string; userId: s
   return row ?? null
 }
 
-// A pending read request of this user by the code typed on /approve, with
+// A pending access request of this user by the code typed on /approve, with
 // what the page shows before anyone approves it
 export async function findStepUpRequest({ userId, userCode }: { userId: string; userCode: string }) {
   const row = await pendingRequest({ userId, userCode: userCode.trim().toUpperCase() })
-  if (!row || row.purpose !== 'read') return null
+  if (!row || row.purpose !== 'access') return null
   const environments = await getDb().query.environment.findMany({
     where: { id: { in: row.environmentIds } },
     columns: { id: true, name: true },
@@ -234,7 +271,7 @@ export async function approvalOptions({ request, requestId, userId }: { request:
 }
 
 // Approves the request with the passkey's answer to its challenge: the
-// session that asked may read its environments for 15 minutes
+// session that asked gets its grant
 export async function approveStepUpRequest({ request, requestId, userId, response }: {
   request: Request
   requestId: string
@@ -265,18 +302,55 @@ export async function stepUpRequestStatus({ requestId, sessionId }: { requestId:
 
 // ── Adding passkeys ─────────────────────────────────────────────────
 
-// The first passkey needs a Google sign-in from the last 5 minutes, so an old
-// stolen session can't add one; every further one an approval with an
-// existing passkey from the last 5 minutes.
-export async function canAddPasskey({ userId, sessionId, sessionCreatedAt }: { userId: string; sessionId: string; sessionCreatedAt: number }) {
+// The first passkey needs a session made by a Google sign-in in the last 5
+// minutes, so an old stolen session can't add one, not even through a CLI
+// login it approves; every further one an admin approval with an existing
+// passkey.
+export function isFreshSignIn({ signedIn, sessionCreatedAt }: { signedIn: boolean; sessionCreatedAt: number }) {
+  return signedIn && Date.now() - sessionCreatedAt < FRESH_SIGN_IN_MS
+}
+
+export async function canAddPasskey({ userId, sessionId, signedIn, sessionCreatedAt }: { userId: string; sessionId: string; signedIn: boolean; sessionCreatedAt: number }) {
+  const existing = await getDb().query.passkey.findFirst({ where: { userId }, columns: { id: true } })
+  if (!existing) return isFreshSignIn({ signedIn, sessionCreatedAt })
+  return hasAdminGrant({ userId, sessionId })
+}
+
+// An admin approval for the session, whatever the organization: removing one
+// of your passkeys (so a stolen session can't clear them and add its own after
+// a fresh sign-in), and turning protection off
+export async function requireAdminApproval({ userId, sessionId }: { userId: string; sessionId: string }) {
+  if (!await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+}
+
+// An admin removes a member's passkeys, for a member who lost them. Passkeys
+// belong to the person, not to one organization, so the admin must be an admin
+// of every organization the member belongs to, with an admin approval where
+// one has protected environments. The member is signed out everywhere, and
+// adds new passkeys after a fresh Google sign-in.
+export async function resetMemberPasskeys({ request, actor, userId }: {
+  request: Request | null
+  actor: { userId: string; sessionId: string }
+  userId: string
+}) {
+  if (userId === actor.userId) throw new Error('Remove your own passkeys on the Passkeys page')
   const db = getDb()
-  const existing = await db.query.passkey.findFirst({ where: { userId }, columns: { id: true } })
-  if (!existing) return Date.now() - sessionCreatedAt < FRESH_SIGN_IN_MS
-  const grant = await db.query.stepUpGrant.findFirst({
-    where: { sessionId, userId, purpose: 'passkeys', expiresAt: { gt: Date.now() } },
-    columns: { id: true },
-  })
-  return !!grant
+  const memberships = await db.query.orgMember.findMany({ where: { userId }, columns: { orgId: true } })
+  for (const { orgId } of memberships) {
+    const admin = await db.query.orgMember.findFirst({ where: { orgId, userId: actor.userId }, columns: { role: true } })
+    if (admin?.role !== 'admin') {
+      throw new Error("They also belong to an organization you're not an admin of: an admin of each of their organizations can reset them")
+    }
+  }
+  for (const { orgId } of memberships) await requireOrgAdmin({ ...actor, orgId })
+  const passkeys = await db.query.passkey.findMany({ where: { userId }, columns: { name: true } })
+  await db.batch([
+    db.delete(schema.passkey).where(orm.eq(schema.passkey.userId, userId)),
+    db.delete(schema.session).where(orm.eq(schema.session.userId, userId)),
+  ])
+  for (const passkey of passkeys) {
+    await logPasskeyEvent({ request, userId, actor: `user:${actor.userId}`, action: 'removed', passkeyName: passkey.name })
+  }
 }
 
 export async function logPasskeyEvent({ request, userId, actor, action, passkeyName }: {

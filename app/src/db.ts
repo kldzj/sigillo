@@ -291,6 +291,9 @@ export async function getAuth(request: Request) {
         return ctx.json({ ...issued, access_token: `${issued.access_token}.${signature}` })
       }),
     },
+    session: {
+      additionalFields: { signedIn: { type: 'boolean', defaultValue: false, input: false } },
+    },
     // Nobody off the allowlist gets a user or a session, whichever way they sign in
     databaseHooks: {
       user: {
@@ -302,9 +305,14 @@ export async function getAuth(request: Request) {
       },
       session: {
         create: {
-          before: async (session) => {
+          before: async (session, ctx) => {
             const user = await db.query.user.findFirst({ where: { id: session.userId }, columns: { email: true, emailVerified: true } })
             if (!user || !isAllowed(user)) throw notAllowedError()
+            // A sign-in through Google (the OAuth callback), or by email in
+            // tests. Approving a CLI login on /device also makes a session, and
+            // any session can approve one, so that one is never signed in.
+            const path = ctx?.path ?? ''
+            return { data: { ...session, signedIn: path.startsWith('/callback/') || path === '/sign-in/email' || path === '/sign-up/email' } }
           },
         },
       },
@@ -348,7 +356,8 @@ export async function getAuth(request: Request) {
           afterVerification: async ({ ctx }) => {
             const current = ctx.context.session
             if (!current || !await canAddPasskey({
-              userId: current.user.id, sessionId: current.session.id, sessionCreatedAt: new Date(current.session.createdAt).getTime(),
+              userId: current.user.id, sessionId: current.session.id, signedIn: !!current.session.signedIn,
+              sessionCreatedAt: new Date(current.session.createdAt).getTime(),
             })) {
               throw new APIError('FORBIDDEN', { message: 'approve with an existing passkey, or sign in again for your first one', code: 'PASSKEY_APPROVAL_REQUIRED' })
             }
@@ -374,7 +383,7 @@ export function getDataCenter(request: Request & { cf?: { colo?: string } }): st
 
 // ── Session helpers ─────────────────────────────────────────────────
 
-type Session = { userId: string; sessionId: string; sessionCreatedAt: number; user: { id: string; name: string; email: string; emailVerified: boolean } }
+type Session = { userId: string; sessionId: string; sessionCreatedAt: number; signedIn: boolean; user: { id: string; name: string; email: string; emailVerified: boolean } }
 
 // Spiceflow passes the SAME request instance to every matched loader/layout in
 // a single navigation (verified against the framework source). Several loaders
@@ -408,6 +417,7 @@ async function resolveSession(request: Request): Promise<Session | null> {
     userId: session.user.id,
     sessionId: session.session.id,
     sessionCreatedAt: new Date(session.session.createdAt).getTime(),
+    signedIn: !!session.session.signedIn,
     user: { id: session.user.id, name: session.user.name, email: session.user.email, emailVerified: session.user.emailVerified },
   }
 }
@@ -417,10 +427,18 @@ async function resolveSession(request: Request): Promise<Session | null> {
 // sessions. Its session list carries each session's token, so tokens stay
 // on the server: the page gets ids, and ending one looks its token up again.
 
+// null when this login is too old to list sessions: better-auth wants one
+// from the last day (freshAge), and the page then asks to sign in again
 export async function listUserSessions(request: Request) {
   const auth = await getAuth(request)
   const current = await auth.api.getSession({ headers: request.headers })
-  const sessions = await auth.api.listSessions({ headers: request.headers })
+  let sessions
+  try {
+    sessions = await auth.api.listSessions({ headers: request.headers })
+  } catch (error) {
+    if (isNotFresh(error)) return null
+    throw error
+  }
   return sessions.map((session) => ({
     id: session.id,
     createdAt: new Date(session.createdAt).getTime(),
@@ -429,6 +447,18 @@ export async function listUserSessions(request: Request) {
     userAgent: session.userAgent || null,
     isCurrent: session.id === current?.session.id,
   }))
+}
+
+// better-auth's APIError when a login is too old for the endpoint
+function isNotFresh(error: unknown) {
+  return (error as { body?: { code?: string } } | null)?.body?.code === 'SESSION_NOT_FRESH'
+}
+
+// Whether better-auth still counts this login as recent enough for its
+// sensitive endpoints, such as adding a passkey (freshAge, a day by default)
+export async function isSessionFresh(request: Request, sessionCreatedAt: number) {
+  const { sessionConfig } = await (await getAuth(request)).$context
+  return sessionConfig.freshAge === 0 || Date.now() - sessionCreatedAt < sessionConfig.freshAge * 1000
 }
 
 export async function endUserSession(request: Request, sessionId: string) {

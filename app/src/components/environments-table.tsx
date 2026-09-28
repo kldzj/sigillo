@@ -91,7 +91,8 @@ function EditableEnvCell({ env, field }: { env: Environment; field: "name" | "sl
       return;
     }
     try {
-      await renameEnvAction({ id: env.id, [field]: trimmed });
+      // Renaming a protected environment asks for the passkey
+      if (!await withStepUp(() => renameEnvAction({ id: env.id, [field]: trimmed }))) setValue(env[field]);
       setEditing(false);
     } catch (e: any) {
       alert(e?.message || `Failed to rename ${field}`);
@@ -184,10 +185,12 @@ export function EnvironmentsTable() {
         <NativeSelect
           value={row.original.accessRole}
           onChange={async (e) => {
-            const nextRole: 'admin' | 'member' = e.currentTarget.value === 'admin' ? 'admin' : 'member'
+            const select = e.currentTarget
+            const nextRole: 'admin' | 'member' = select.value === 'admin' ? 'admin' : 'member'
             if (nextRole === row.original.accessRole) return
             try {
-              await updateEnvironmentAccessRoleAction({ environmentId: row.original.id, accessRole: nextRole })
+              const result = await withStepUp(() => updateEnvironmentAccessRoleAction({ environmentId: row.original.id, accessRole: nextRole }))
+              if (!result) select.value = row.original.accessRole
             } catch (err: any) {
               alert(err?.message || 'Failed to update access role')
             }
@@ -212,8 +215,8 @@ export function EnvironmentsTable() {
             const protect = select.value === 'on'
             if (protect === row.original.protected) return
             const question = protect
-              ? `Protect ${row.original.name}? Reading it will need a passkey, and API tokens other than machine tokens stop working for it.`
-              : `Unprotect ${row.original.name}? Reading it will no longer need a passkey, and reads will no longer be recorded.`
+              ? `Protect ${row.original.name}? Reading or changing it will need a passkey, and API tokens other than machine tokens stop working for it.`
+              : `Unprotect ${row.original.name}? Reading or changing it will no longer need a passkey, and reads will no longer be recorded.`
             if (!confirm(question)) {
               select.value = row.original.protected ? 'on' : 'off'
               return
@@ -263,7 +266,7 @@ export function EnvironmentsTable() {
             e.stopPropagation();
             if (confirm(`Delete environment "${row.original.name}"? All secrets in this environment will be lost.`)) {
               try {
-                await deleteEnvAction({ id: row.original.id });
+                await withStepUp(() => deleteEnvAction({ id: row.original.id }));
               } catch (e: any) {
                 alert(e?.message || "Failed to delete environment");
               }

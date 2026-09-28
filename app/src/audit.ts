@@ -18,7 +18,7 @@ import type { BatchItem } from 'drizzle-orm/batch'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import { encrypt, decrypt, deriveSecrets, getUserEnvironmentAccess } from './db.ts'
-import { requireStepUp, type Reader } from './step-up.ts'
+import { requireStepUp, requireProtectedAccess, requireAdminApproval, StepUpRequiredError, type Reader } from './step-up.ts'
 
 const ZERO_HASH = '0'.repeat(64)
 const encoder = new TextEncoder()
@@ -192,12 +192,12 @@ export type NewSecretEvent = {
   operation: 'set' | 'delete'
   // Plaintext of a set event
   value?: string
-  userId: string | null
-  apiTokenId: string | null
 }
 
-// The only way secret_event rows are written
-export async function appendSecretEvents(events: NewSecretEvent[]): Promise<{ id: string; name: string }[]> {
+// The only way secret_event rows are written. Changing a protected
+// environment takes the same passkey approval or machine token as reading it.
+export async function appendSecretEvents({ author, events }: { author: Reader; events: NewSecretEvent[] }): Promise<{ id: string; name: string }[]> {
+  await requireProtectedAccess({ environmentIds: events.map((event) => event.environmentId), reader: author })
   // Encrypt and digest once, outside the retry loop
   const prepared = await Promise.all(events.map(async (event) => {
     const value = event.operation === 'set' ? event.value ?? '' : null
@@ -207,9 +207,9 @@ export async function appendSecretEvents(events: NewSecretEvent[]): Promise<{ id
       environmentId: event.environmentId,
       name: event.name,
       operation: event.operation,
-      actor: actorOf(event),
-      userId: event.userId,
-      apiTokenId: event.apiTokenId,
+      actor: actorOf(author),
+      userId: author.userId,
+      apiTokenId: author.apiTokenId,
       encrypted: value === null ? null : await encrypt(value),
       digest: value === null ? null : await valueDigest(event.environmentId, event.name, value),
     }
@@ -299,8 +299,9 @@ export async function recordSecretRead({ request, environment, author, kind, nam
 
 // Turns protection on or off together with a row in the read log, so a
 // stretch of unlogged reads shows up there
-// Turning protection off takes the same passkey approval as a read, or a
-// stolen admin session could switch it off and read
+// Turning protection off takes an admin approval, or a stolen admin session
+// could switch it off and read. It is the same approval the admin action asks
+// for, so the browser asks once.
 export async function setEnvironmentProtection({ request, environmentId, protect, author }: {
   request: Request
   environmentId: string
@@ -310,7 +311,10 @@ export async function setEnvironmentProtection({ request, environmentId, protect
   const db = getDb()
   const env = await db.query.environment.findFirst({ where: { id: environmentId }, columns: { protected: true } })
   if (!env) throw new Error('Environment not found')
-  if (env.protected && !protect) await requireStepUp({ environmentId, reader: author })
+  if (env.protected && !protect) {
+    if (!author.userId || !author.sessionId) throw new StepUpRequiredError('admin')
+    await requireAdminApproval({ userId: author.userId, sessionId: author.sessionId })
+  }
   await appendRead(
     readRow({ request, environmentId, author, kind: protect ? 'protected' : 'unprotected', names: [] }),
     [db.update(schema.environment).set({ protected: protect, updatedAt: Date.now() }).where(orm.eq(schema.environment.id, environmentId))],

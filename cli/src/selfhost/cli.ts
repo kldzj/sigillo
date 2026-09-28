@@ -60,7 +60,8 @@ cli
   .option('--google-client-secret [secret]', z.string().optional().describe('Google OAuth client secret for the login provider'))
   .option('--allowed-users [list]', z.string().optional().describe('Email addresses and domains that may sign in, comma-separated (empty: anyone)'))
   .option('--change-passphrase', 'Encrypt ~/.sigillo/selfhost.json with a new passphrase, then stop')
-  .option('--reset-passkeys [email]', z.string().optional().describe('Remove every passkey of this user, for a sole admin who lost theirs, then stop'))
+  // No schema: goke then gives "" for a bare flag instead of undefined, which would deploy
+  .option('--reset-passkeys [email]', 'Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop')
   .option('--yes', 'Accept all defaults (non-interactive)')
   .example('npx @kldzj/sigillo self-host')
   .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
@@ -85,7 +86,7 @@ cli
         },
       })
       if (warning) clack.log.warn(warning)
-      if (options.resetPasskeys) {
+      if (options.resetPasskeys !== undefined) {
         await resetPasskeys(options)
         return
       }
@@ -109,6 +110,7 @@ cli
 // removed in D1 directly, and the removal is logged like any other
 async function resetPasskeys(options: SelfHostOptions) {
   const email = options.resetPasskeys!.trim()
+  if (!email) throw new Error('Pass the email of the user: --reset-passkeys you@acme.com')
   const deployments = Object.values(readState().deployments ?? {})
     .filter((d) => (!options.account || d.accountId === options.account) && (!options.name || d.workerName === options.name))
   if (deployments.length === 0) throw new Error('No saved deployment matches: pass --name, or run self-host from the machine that deployed it')
@@ -140,7 +142,13 @@ async function resetPasskeys(options: SelfHostOptions) {
     sql: 'DELETE FROM passkey WHERE user_id IN (SELECT id FROM user WHERE lower(email) = lower(?))',
     params: [email],
   })
-  clack.outro(`Removed ${count} passkey${count === 1 ? '' : 's'} of ${email}. They add new ones after signing in again.`)
+  // Signed out everywhere, like a reset by an admin: a new passkey then takes a fresh Google sign-in
+  await client.d1Query({
+    ...database,
+    sql: 'DELETE FROM session WHERE user_id IN (SELECT id FROM user WHERE lower(email) = lower(?))',
+    params: [email],
+  })
+  clack.outro(`Removed ${count} passkey${count === 1 ? '' : 's'} of ${email} and signed them out. They add new ones after signing in again.`)
 }
 
 async function askPassphrase(): Promise<string> {
