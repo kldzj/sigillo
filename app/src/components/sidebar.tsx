@@ -47,6 +47,7 @@ import {
   DropdownMenuLinkItem,
   DropdownMenuSeparator,
   DropdownMenuLabel,
+  DropdownMenuContainer,
 } from "sigillo-app/src/components/ui/dropdown-menu";
 import { createProjectAction } from "../actions.ts";
 
@@ -272,6 +273,7 @@ export function Sidebar() {
 
 export function MobileDrawer() {
   const [open, setOpen] = useState(false);
+  const [content, setContent] = useState<HTMLDivElement | null>(null);
 
   // Listen for toggle events from MobileMenuButton
   useEffect(() => {
@@ -285,11 +287,17 @@ export function MobileDrawer() {
       <Drawer.Portal>
         <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 md:hidden" />
         <Drawer.Content
+          ref={setContent}
           className="fixed inset-y-0 left-0 z-50 w-72 flex flex-col bg-background border-r border-sidebar-border p-6 md:hidden outline-none"
           aria-describedby={undefined}
         >
           <Drawer.Title className="sr-only">Navigation</Drawer.Title>
-          <SidebarContent onNavigate={() => setOpen(false)} />
+          {/* Menus open inside the drawer, so taps on them reach them */}
+          {/* Closed after the click, not during it: a link removed from the
+              page while its click runs doesn't navigate */}
+          <DropdownMenuContainer.Provider value={content}>
+            <SidebarContent onNavigate={() => setTimeout(() => setOpen(false))} />
+          </DropdownMenuContainer.Provider>
         </Drawer.Content>
       </Drawer.Portal>
     </Drawer.Root>

@@ -5,10 +5,16 @@
 "use client";
 
 import { Menu as MenuPrimitive } from "@base-ui/react/menu";
+import { createContext, useContext } from "react";
 import type React from "react";
 import { cn } from "sigillo-app/src/lib/utils";
 
 export const DropdownMenu: typeof MenuPrimitive.Root = MenuPrimitive.Root;
+
+// Where menus render. A modal drawer sets it to its own element: a menu
+// portaled to the body sat under the drawer, and the drawer's dialog treated
+// taps on it as taps outside, so on a phone no menu item could be chosen.
+export const DropdownMenuContainer = createContext<HTMLElement | null>(null);
 
 export function DropdownMenuTrigger({
   className,
@@ -40,8 +46,9 @@ export function DropdownMenuPopup({
   alignOffset?: MenuPrimitive.Positioner.Props["alignOffset"];
   anchor?: MenuPrimitive.Positioner.Props["anchor"];
 }): React.ReactElement {
+  const container = useContext(DropdownMenuContainer);
   return (
-    <MenuPrimitive.Portal>
+    <MenuPrimitive.Portal container={container ?? undefined}>
       <MenuPrimitive.Positioner
         align={align}
         alignOffset={alignOffset}
