@@ -1873,6 +1873,28 @@ describe('your sessions', () => {
     }).toEqual({ bob: 200, aliceEnded: 401, aliceCurrent: 200 })
   })
 
+  test('a login older than a day can still end all others, and signs in again where better-auth wants a recent one to list them', async () => {
+    const alice = await createTestUser({ email: `alice-old-${Date.now()}@example.com` })
+    await signInAgain(alice.user.email)
+    // Logins last 7 days; this one is 2 days old
+    const current = (await getDb().query.session.findFirst({ where: { token: alice.token.split('.')[0]! }, columns: { id: true } }))!.id
+    await getDb().update(schema.session).set({ createdAt: Date.now() - 2 * 86_400_000 }).where(orm.eq(schema.session.id, current))
+    const listed = await listUserSessions(as(alice.token))
+    await endOtherUserSessions(as(alice.token))
+    const left = (await sessionIds(alice.user.id)).length
+    const fresh = await signInAgain(alice.user.email)
+    // better-auth 1.7.6 lists sessions only for a login from the last day
+    // (null: sign in again); 1.7.0-beta.4 lists them for any login
+    expect({ listed: listed === null ? 'sign in again' : listed.length, left, afterSignIn: (await listUserSessions(as(fresh)))?.length })
+      .toEqual({ listed: expect.toBeOneOf(['sign in again', 2]), left: 1, afterSignIn: 2 })
+  })
+
+  test('signing in again comes back to the page it was on', async () => {
+    const location = async (path: string) => new URL((await app.handle(new Request(`http://e.ly${path}`))).headers.get('location')!).searchParams.get('post_logout_redirect_uri')
+    expect({ sessions: await location('/logout?redirect=/dash/sessions'), elsewhere: await location('/logout?redirect=https://evil.example'), none: await location('/logout') })
+      .toEqual({ sessions: 'http://e.ly/login?redirect=%2Fdash%2Fsessions', elsewhere: 'http://e.ly/login?redirect=%2Fdash', none: 'http://e.ly/login' })
+  })
+
   test('ends all your other sessions, but not this one', async () => {
     const alice = await createTestUser({ email: `alice3-${Date.now()}@example.com` })
     await signInAgain(alice.user.email)

@@ -299,10 +299,19 @@ async function resolveSession(request: Request): Promise<Session | null> {
 // sessions. Its session list carries each session's token, so tokens stay
 // on the server: the page gets ids, and ending one looks its token up again.
 
+// null when this login is too old to list sessions: from better-auth 1.7.6
+// on, that needs one from the last day (freshAge), and the page then asks to
+// sign in again
 export async function listUserSessions(request: Request) {
   const auth = await getAuth(request)
   const current = await auth.api.getSession({ headers: request.headers })
-  const sessions = await auth.api.listSessions({ headers: request.headers })
+  let sessions
+  try {
+    sessions = await auth.api.listSessions({ headers: request.headers })
+  } catch (error) {
+    if (isNotFresh(error)) return null
+    throw error
+  }
   return sessions.map((session) => ({
     id: session.id,
     createdAt: new Date(session.createdAt).getTime(),
@@ -311,6 +320,11 @@ export async function listUserSessions(request: Request) {
     userAgent: session.userAgent || null,
     isCurrent: session.id === current?.session.id,
   }))
+}
+
+// better-auth's APIError when a login is too old for the endpoint
+function isNotFresh(error: unknown) {
+  return (error as { body?: { code?: string } } | null)?.body?.code === 'SESSION_NOT_FRESH'
 }
 
 export async function endUserSession(request: Request, sessionId: string) {
