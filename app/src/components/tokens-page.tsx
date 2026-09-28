@@ -27,7 +27,7 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
-import { cn, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS } from "sigillo-app/src/lib/utils"
+import { cn, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatIp } from "sigillo-app/src/lib/utils"
 import { createTokenAction, deleteTokenAction } from "../actions.ts"
 import { withStepUp } from "./step-up.ts"
 
@@ -143,7 +143,7 @@ function TokensTable() {
                     />
                     {token.lastUsedIp && (
                       <span className="text-muted-foreground text-xs mono-sm truncate" title={token.lastUsedIp}>
-                        {token.lastUsedIp}
+                        {formatIp(token.lastUsedIp)}
                       </span>
                     )}
                   </span>

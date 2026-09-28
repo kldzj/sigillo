@@ -25,6 +25,7 @@ import {
   TableRow,
 } from "sigillo-app/src/components/ui/table";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
+import { formatIp } from "sigillo-app/src/lib/utils";
 
 const KIND_LABELS: Record<string, string> = {
   list: "Listed",
@@ -137,7 +138,7 @@ export function ReadLogTable() {
                       </span>
                     </TableCell>
                     <TableCell>
-                      <code className="text-xs text-muted-foreground mono-sm">{read.ipAddress ?? "—"}</code>
+                      <code className="block truncate text-xs text-muted-foreground mono-sm" title={read.ipAddress ?? undefined}>{formatIp(read.ipAddress) ?? "—"}</code>
                     </TableCell>
                   </TableRow>
                 ))}

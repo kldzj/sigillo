@@ -64,6 +64,8 @@
 }
 
 :root {
+  /* Native controls (select lists, scrollbars) follow the theme */
+  color-scheme: light;
   --content-max-width: 1200px;
   --radius: 0.625rem;
   /* Warm off-white background inspired by ElevenLabs' "eggshell" (#FDFCFC) */
@@ -106,6 +108,7 @@
   --sidebar-ring: var(--color-neutral-400);
 
   @variant dark {
+    color-scheme: dark;
     --background: var(--color-neutral-950);
     --foreground: var(--color-neutral-100);
     --card: var(--color-neutral-900);
@@ -149,6 +152,13 @@
   }
   body {
     @apply bg-background text-foreground overflow-x-hidden;
+  }
+
+  /* Chrome draws a select's list with its options' own colors: without
+     these, dark mode showed the select's light text on a white list */
+  option {
+    background-color: var(--popover);
+    color: var(--popover-foreground);
   }
 
   /* Thin, subtle scrollbars that match the UI */

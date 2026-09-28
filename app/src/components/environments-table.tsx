@@ -183,6 +183,7 @@ export function EnvironmentsTable() {
       size: 120,
       cell: ({ row }) => (
         <NativeSelect
+          className="min-w-0"
           value={row.original.accessRole}
           onChange={async (e) => {
             const select = e.currentTarget
@@ -209,6 +210,7 @@ export function EnvironmentsTable() {
       size: 120,
       cell: ({ row }) => (
         <NativeSelect
+          className="min-w-0"
           value={row.original.protected ? 'on' : 'off'}
           onChange={async (e) => {
             const select = e.currentTarget

@@ -13,7 +13,7 @@ import { startAuthentication } from "@simplewebauthn/browser";
 import { Button } from "sigillo-app/src/components/ui/button";
 import { Input } from "sigillo-app/src/components/ui/input";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
-import { describeUserAgent } from "sigillo-app/src/lib/utils";
+import { describeUserAgent, formatIp } from "sigillo-app/src/lib/utils";
 import { findApprovalAction, approvalOptionsAction, finishStepUpAction } from "../actions.ts";
 
 const codeSchema = z.object({ userCode: z.string().trim().min(1, "Enter the code shown in your terminal") });
@@ -72,7 +72,7 @@ export function ApprovePage() {
             <div>
               <span className="text-muted-foreground">From: </span>
               {describeUserAgent(request.userAgent)}
-              {request.ipAddress ? `, ${request.ipAddress}` : ""}
+              {request.ipAddress ? `, ${formatIp(request.ipAddress)}` : ""}
               {request.country ? ` (${request.country})` : ""}
             </div>
             <div>

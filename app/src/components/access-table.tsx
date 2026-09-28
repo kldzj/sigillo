@@ -14,6 +14,7 @@ import { NativeSelect } from "sigillo-app/src/components/ui/native-select"
 import { Spinner } from "sigillo-app/src/components/ui/spinner"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "sigillo-app/src/components/ui/dialog"
 import { useLoaderData } from "spiceflow/react"
+import { formatIp } from "sigillo-app/src/lib/utils"
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
@@ -275,7 +276,7 @@ function PasskeyChanges() {
                 <TableCell className="text-sm">{event.action === "added" ? "Added" : "Removed"}</TableCell>
                 <TableCell className="text-sm">{event.passkeyName || "—"}</TableCell>
                 <TableCell className="text-sm">{event.by}</TableCell>
-                <TableCell><code className="text-xs text-muted-foreground mono-sm">{event.ipAddress ?? "—"}</code></TableCell>
+                <TableCell><code className="block truncate text-xs text-muted-foreground mono-sm" title={event.ipAddress ?? undefined}>{formatIp(event.ipAddress) ?? "—"}</code></TableCell>
               </TableRow>
             ))}
           </TableBody>
