@@ -4,27 +4,40 @@
 
 import { ChevronsUpDownIcon } from "lucide-react";
 import type * as React from "react";
-import { cva } from "class-variance-authority";
 import { cn } from "sigillo-app/src/lib/utils";
-
-const nativeSelectVariants = cva(
-  "relative inline-flex min-h-9 w-full min-w-36 items-center rounded-lg border border-input bg-background px-[calc(--spacing(3)-1px)] pr-8 text-left text-base text-foreground shadow-xs/5 outline-none ring-ring/24 transition-shadow focus-visible:border-ring focus-visible:ring-[3px] disabled:pointer-events-none disabled:opacity-64 sm:min-h-8 sm:text-sm dark:bg-input/32",
-)
 
 export function NativeSelect({
   children,
   className,
+  size = "default",
   ...props
-}: React.SelectHTMLAttributes<HTMLSelectElement>): React.ReactElement {
+}: Omit<React.ComponentProps<"select">, "size"> & {
+  size?: "sm" | "default";
+}): React.ReactElement {
   return (
-    <div className="relative w-full">
+    <div
+      className={cn(
+        "group/native-select relative w-fit max-w-full has-[select:disabled]:opacity-50",
+        className,
+      )}
+      data-slot="native-select-wrapper"
+      data-size={size}
+    >
       <select
-        className={cn(nativeSelectVariants(), "appearance-none rounded-md", className)}
+        data-slot="native-select"
+        data-size={size}
+        className={cn(
+          "h-8 w-full min-w-0 appearance-none rounded-lg border border-input bg-background py-0 pr-8 pl-2.5 text-sm text-foreground outline-none transition-colors",
+          "focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50",
+          "disabled:pointer-events-none disabled:cursor-not-allowed",
+          "dark:bg-input/32",
+          size === "sm" && "h-7 text-xs",
+        )}
         {...props}
       >
         {children}
       </select>
-      <ChevronsUpDownIcon className="pointer-events-none absolute right-2 top-1/2 size-4 -translate-y-1/2 opacity-80 sm:size-4" />
+      <ChevronsUpDownIcon className="pointer-events-none absolute top-1/2 right-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
     </div>
   );
 }

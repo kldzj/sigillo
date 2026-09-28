@@ -888,7 +888,7 @@ function SyncMissingDialog({
             <label htmlFor="sync-source-env" className="text-sm font-medium mb-1 block">
               Source environment
             </label>
-            <NativeSelect id="sync-source-env" name={syncFields.sourceEnvironmentId} required autoFocus>
+            <NativeSelect id="sync-source-env" name={syncFields.sourceEnvironmentId} required autoFocus className="w-full">
               <option value="">Select an environment…</option>
               {otherEnvironments.map((env) => (
                 <option key={env.id} value={env.id}>{env.name}</option>

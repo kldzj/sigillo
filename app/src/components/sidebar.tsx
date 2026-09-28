@@ -479,7 +479,8 @@ export function ThemeSelect() {
       <span>Theme</span>
       <NativeSelect
         aria-label="Theme"
-        className="min-h-7 min-w-28 text-xs sm:min-h-7 sm:text-xs"
+        size="sm"
+        className="min-w-28"
         value={theme}
         onChange={(event) => {
           const nextTheme = parseThemeChoice(event.currentTarget.value)

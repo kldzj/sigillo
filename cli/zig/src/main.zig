@@ -102,11 +102,18 @@ fn exitNoApiUrl(stderr: Writer) noreturn {
     std.process.exit(1);
 }
 
-fn printChildScopes(
+fn printSetupHints(
     allocator: std.mem.Allocator,
     stderr: Writer,
     cwd: []const u8,
 ) !void {
+    if (config.findGitWorktree(allocator, cwd)) |wt| {
+        try stderr.print("\nthis is a git worktree of {s}. To configure it and all its worktrees:\n  sigillo setup --scope {s}\n", .{
+            wt.main_root,
+            try wt.toMain(allocator, cwd),
+        });
+    }
+
     const children = config.findChildScopes(allocator, cwd) catch return;
     if (children.len == 0) return;
 
@@ -314,7 +321,9 @@ const Setup = zeke.cmd("setup", "Save default project and env for the current di
     .option("-p, --project [id]", "Project ID or name")
     .option("--env [slug]", "Env slug, usually dev since you run locally with the development environment")
     .option("-c, --config [slug]", "Env slug alias")
-    .example("sigillo setup --project website --env dev");
+    .option("--scope [dir]", "Directory to save the setup for (default: current directory)")
+    .example("sigillo setup --project website --env dev")
+    .example("sigillo setup --scope /path/to/main/checkout  # from a git worktree: apply to all worktrees");
 
 const Run = zeke.cmd("run <...cmd>", "Run a command with secrets injected")
     .option("--command [cmd]", "Run a shell command string")
@@ -700,6 +709,11 @@ fn meAction(_: Me.Args, opts: Me.Options, global: Global.Options) !void {
         try color.blue(stdout, "Setup:   ");
         try color.dim(stdout, cwd);
         try stdout.writeAll("\n");
+        if (config.findGitWorktree(allocator, cwd)) |wt| {
+            try color.blue(stdout, "Worktree of: ");
+            try color.dim(stdout, wt.main_root);
+            try stdout.writeAll("\n");
+        }
         if (resolved.project) |project| {
             try color.blue(stdout, "Project: ");
             if (resolved.project_name) |project_name| {
@@ -900,7 +914,25 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
         std.process.exit(1);
     };
 
-    try config.setScope(allocator, cwd, .{
+    // Main-checkout scopes also apply to its git worktrees at the same relative
+    // path, so from a worktree the user picks between all worktrees or this one.
+    const worktree = config.findGitWorktree(allocator, cwd);
+    const scope: []const u8 = if (opts.scope) |s| s else if (worktree) |wt| scope_sel: {
+        const main_path = try wt.toMain(allocator, cwd);
+        if (!is_tty) break :scope_sel cwd;
+        const scope_options = [_][]const u8{
+            try std.fmt.allocPrint(allocator, "Main checkout and all worktrees ({s})", .{main_path}),
+            try std.fmt.allocPrint(allocator, "This worktree only ({s})", .{cwd}),
+        };
+        const scope_choice = try prompt.select("Save setup for", &scope_options, 0) orelse {
+            try color.err(stderr, "error");
+            try stderr.print(": setup cancelled\n", .{});
+            std.process.exit(1);
+        };
+        break :scope_sel if (scope_choice == 0) main_path else cwd;
+    } else cwd;
+
+    try config.setScope(allocator, scope, .{
         .project = project,
         .project_name = project_name,
         .environment = environment,
@@ -908,7 +940,7 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
 
     try color.green(stdout, "✔");
     try stdout.writeAll(" Saved setup for ");
-    try color.bold(stdout, cwd);
+    try color.bold(stdout, scope);
     try stdout.writeAll("\n");
     try color.blue(stdout, "  project:     ");
     if (project_name) |name| {
@@ -918,6 +950,16 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
     }
     try color.blue(stdout, "  env:         ");
     try stdout.print("{s}\n", .{environment});
+
+    if (worktree) |wt| {
+        if (opts.scope == null and std.mem.eql(u8, scope, cwd)) {
+            try color.dim(stdout, try std.fmt.allocPrint(
+                allocator,
+                "\nOnly applies to this git worktree. To apply to all worktrees:\n  sigillo setup --scope {s}\n",
+                .{try wt.toMain(allocator, cwd)},
+            ));
+        }
+    }
 }
 
 fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
@@ -962,14 +1004,14 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
         try color.err(stderr, "error");
         try stderr.print(": project not configured for {s}\n", .{cwd});
         try stderr.writeAll("  sigillo setup --project <PROJECT_ID> --env <SLUG>\n");
-        try printChildScopes(allocator, stderr, cwd);
+        try printSetupHints(allocator, stderr, cwd);
         std.process.exit(1);
     });
     const environment = resolved.environment orelse {
         try color.err(stderr, "error");
         try stderr.print(": env not configured for {s}\n", .{cwd});
         try stderr.writeAll("  sigillo setup\n");
-        try printChildScopes(allocator, stderr, cwd);
+        try printSetupHints(allocator, stderr, cwd);
         std.process.exit(1);
     };
 
@@ -1706,7 +1748,7 @@ fn requireProjectContext(allocator: std.mem.Allocator, stderr: Writer, cwd: []co
             try color.err(stderr, "error");
             try stderr.print(": project not configured for {s}\n", .{cwd});
             try stderr.writeAll("  sigillo setup --project <PROJECT_ID> --env <SLUG>\n");
-            try printChildScopes(allocator, stderr, cwd);
+            try printSetupHints(allocator, stderr, cwd);
             std.process.exit(1);
         },
         else => return err,
@@ -1728,14 +1770,14 @@ fn requireEnvironmentContext(allocator: std.mem.Allocator, stderr: Writer, cwd: 
             try color.err(stderr, "error");
             try stderr.print(": env not configured for {s}\n", .{cwd});
             try stderr.writeAll("  sigillo setup\n");
-            try printChildScopes(allocator, stderr, cwd);
+            try printSetupHints(allocator, stderr, cwd);
             std.process.exit(1);
         },
         error.ProjectNotConfigured => {
             try color.err(stderr, "error");
             try stderr.print(": project not configured for {s}\n", .{cwd});
             try stderr.writeAll("  sigillo setup --project <PROJECT_ID> --env <SLUG>\n");
-            try printChildScopes(allocator, stderr, cwd);
+            try printSetupHints(allocator, stderr, cwd);
             std.process.exit(1);
         },
         else => return err,

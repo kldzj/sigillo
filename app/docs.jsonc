@@ -12,19 +12,17 @@
   "icons": {
     "library": "lucide"
   },
+  "layout": {
+    "mode": "compact"
+  },
   "navbar": {
     "links": [
-      { "type": "github", "href": "https://github.com/kldzj/sigillo" }
+      { "label": "GitHub", "icon": "github", "href": "https://github.com/kldzj/sigillo" }
     ],
     "primary": {
       "type": "button",
       "label": "Self-host",
       "href": "/docs/self-hosting"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/kldzj/sigillo"
     }
   },
   "navigation": {
@@ -51,7 +49,7 @@
         "groups": [
           {
             "group": "Overview",
-            "icon": "lucide:terminal",
+            "icon": "lucide:info",
             "pages": ["docs/cli/index"]
           },
           {
@@ -93,10 +91,9 @@
       }
     ],
     "global": {
-      // Anchors use placement "tabs" so they appear in the tab bar
       "anchors": [
-        { "anchor": "GitHub", "href": "https://github.com/kldzj/sigillo", "icon": "lucide:github", "placement": "tabs" },
-        { "anchor": "Changelog", "href": "https://github.com/kldzj/sigillo/releases", "icon": "lucide:newspaper", "placement": "tabs"  }
+        { "anchor": "GitHub", "href": "https://github.com/kldzj/sigillo", "icon": "lucide:github" },
+        { "anchor": "Changelog", "href": "https://github.com/kldzj/sigillo/releases", "icon": "lucide:newspaper" }
       ]
     }
   },
@@ -104,5 +101,5 @@
   "assistant": {
     "enabled": false
   },
-  // "decorativeLines": "none"
+  "decorativeLines": "none"
 }

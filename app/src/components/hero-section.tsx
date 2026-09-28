@@ -1,41 +1,33 @@
-/**
- * Full-bleed hero with VideoBackgroundShader (raw WebGL fluid sim), serif title,
- * a link to self-hosting, and links.
- *
- * Breaks out of the Above column constraint via w-screen + negative margin
- * (same pattern as holocron's own hero-section.tsx and kimaki's hero).
- *
- * Dark mode: primary-colored dots on near-black background.
- * Light mode: video is CSS-inverted, dots blend with light background.
- * Gradient overlays handled by VideoBackgroundShader's fadeTop/fadeBottom.
- */
+// Page-width hero with an ASCII VideoBackgroundShader, serif title, and two
+// CTAs: self-hosting and the GitHub repo.
 'use client'
 
-import { ArrowDown, Server } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Server } from 'lucide-react'
 import { VideoBackgroundShader } from '@holocron.so/vite/mdx'
+import { buttonVariants } from './ui/button.tsx'
 
 const HERO_FONT = "'IvarText', serif"
-
-function GithubIcon({ size = 14 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox='0 0 24 24' fill='currentColor'>
-      <path d='M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z' />
-    </svg>
-  )
-}
-
 const GITHUB_URL = 'https://github.com/kldzj/sigillo'
 
 export function HeroSection() {
+  const [fontsReady, setFontsReady] = useState(false)
+
+  useEffect(() => {
+    const timeout = setTimeout(() => setFontsReady(true), 3000)
+    void document.fonts.ready.then(() => setFontsReady(true))
+    return () => clearTimeout(timeout)
+  }, [])
+
   return (
-    <div className='relative mt-2 lg:mt-4 mb-4 lg:mb-6 w-screen ml-[calc(-50vw+50%)] flex flex-col items-center overflow-hidden'>
+    <div className='relative mt-4 lg:mt-8 mb-6 lg:mb-10 w-full rounded-xl flex flex-col items-center overflow-hidden'>
       <VideoBackgroundShader
         src='/assets/hero-bg.mp4'
         className='absolute inset-0 w-full h-full'
         canvasClassName='dark:opacity-60 opacity-40'
+        dotStyle='ascii'
         dotColor='#6ec9a0'
-        dotAlphaMultiplier={0.7}
-        dotSize={6}
+        dotSize={9}
         minDotSize={1}
         dotMargin={1}
         animSpeed={3}
@@ -45,49 +37,33 @@ export function HeroSection() {
         fluidCurl={80}
       />
 
-      {/* Foreground content */}
-      <div className='relative z-[2] flex flex-col items-center justify-center px-6 pt-10 sm:pt-14 pb-4'>
-        <div className='flex flex-col items-center text-center'>
-          <h1 className='flex flex-col items-center leading-tight'>
-            <span
-              className='text-[28px] sm:text-[36px] md:text-[44px] text-foreground'
-              style={{ fontFamily: HERO_FONT }}
-            >
-              secrets manager for
-            </span>
-            <span
-              className='text-[28px] sm:text-[36px] md:text-[44px] text-foreground -mt-1 sm:-mt-2'
-              style={{ fontFamily: HERO_FONT }}
-            >
-              humans &amp; agents.
-            </span>
-          </h1>
+      <div
+        className='relative z-[2] flex flex-col items-center justify-center text-center max-w-[820px] w-full px-5 pt-16 sm:pt-24 pb-20 lg:pb-[160px] gap-6'
+        style={{
+          opacity: fontsReady ? 1 : 0,
+          transition: 'opacity 0.3s cubic-bezier(0.23, 1, 0.32, 1)',
+        }}
+      >
+        <h1
+          className='flex flex-col items-center leading-none text-[36px] sm:text-[44px] md:text-[52px] text-foreground'
+          style={{ fontFamily: HERO_FONT }}
+        >
+          <span>Secrets manager,</span>
+          <span>open source Doppler alternative</span>
+        </h1>
 
-          <a
-            href='/docs/self-hosting'
-            className='flex items-center gap-2 mt-7 sm:mt-8 px-4 py-2 bg-primary text-primary-foreground hover:opacity-90 transition-opacity rounded-md font-medium text-xs cursor-pointer no-underline'
-          >
-            <Server size={16} />
+        <div className='flex gap-3 flex-wrap justify-center'>
+          <a href='/docs/self-hosting' className={buttonVariants({ size: 'lg', className: 'no-underline gap-2.5' })}>
+            <Server className='size-[16px]' />
             Self-host Sigillo
           </a>
-
-          <div className='flex items-center gap-5 mt-4'>
-            <a
-              target='_blank'
-              rel='noopener noreferrer'
-              className='flex items-center gap-1.5 text-[13px] mono-sm text-foreground/70 hover:text-foreground transition-colors no-underline'
-              href={GITHUB_URL}
-            >
-              <GithubIcon size={14} />
-              GitHub
-            </a>
-          </div>
           <a
-            href='#quick-start'
-            className='mt-6 mb-2 flex flex-col items-center gap-1 text-[11px] mono-sm text-foreground/30 hover:text-foreground/60 transition-colors no-underline'
+            href={GITHUB_URL}
+            target='_blank'
+            rel='noopener noreferrer'
+            className={buttonVariants({ variant: 'ghost', size: 'lg', className: 'no-underline' })}
           >
-            Learn more
-            <ArrowDown size={12} />
+            GitHub Repo ↗
           </a>
         </div>
       </div>
