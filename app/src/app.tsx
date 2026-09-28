@@ -6,7 +6,9 @@
 // 1. /* — HTML shell (head, body, fonts, ProgressBar)
 // 2. /dash/* — Authenticated app shell with sidebar
 //
-// Standalone pages (no sidebar): /, /login, /device, /invite/:id
+// Standalone pages (no sidebar): /login, /device, /approve, /invite/:id.
+// The docs and landing page are a separate static site (src/docs-site.tsx),
+// so an instance only serves the app: / goes to the dashboard.
 
 import './globals.css'
 import { Spiceflow } from 'spiceflow'
@@ -29,10 +31,11 @@ import {
 import { apiApp } from './api.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
-import { cn, loginErrorMessage } from 'sigillo-app/src/lib/utils'
+import { cn, loginErrorMessage, DOCS_URL } from 'sigillo-app/src/lib/utils'
 import { CreateOrgForm } from 'sigillo-app/src/components/create-org-form'
 import { SigilloLogo } from 'sigillo-app/src/components/logo'
-import { app as holocronApp } from '@holocron.so/vite/app'
+// Tailwind and the base styles, which the docs site loads with its pages
+import '@holocron.so/vite/src/styles/globals.css'
 
 
 const cliBannerCookieName = 'sigillo-cli-banner-dismissed'
@@ -45,9 +48,9 @@ function isTruthy<T>(value: T | null | undefined): value is T {
 // avoids sending logged-in users to API routes or obvious 404s.
 function safeRedirectPath(value: string | null): string {
   if (!value || !value.startsWith('/') || value.startsWith('//')) return '/dash'
-  if (['/', '/device', '/approve'].includes(value)) return value
+  if (['/device', '/approve'].includes(value)) return value
   if (value === '/dash' || value.startsWith('/dash/') || value.startsWith('/invite/')) return value
-  return '/'
+  return '/dash'
 }
 
 function hasCookie(args: { cookieHeader: string; name: string }) {
@@ -132,8 +135,7 @@ export const app = new Spiceflow({ tracer })
   })
 
   // ── Layout: Dashboard routes (HTML shell + sidebar chrome) ──────
-  // No global layout('/*') because holocron provides its own HTML shell
-  // for docs pages (/). Each route group registers AppShell separately.
+  // Each route group registers AppShell separately.
   .layout('/dash/*', async ({ children, request }) => {
     const { MobileMenuButton } = await import('sigillo-app/src/components/sidebar')
     return (
@@ -274,7 +276,7 @@ export const app = new Spiceflow({ tracer })
   })
 
   // ── /dash redirect → resolve user's default project+env in one hop ──
-  // The holocron navbar links to /dash. This resolves the full path
+  // / and the navbar logo link to /dash. This resolves the full path
   // (org → project → env) in a single worker invocation instead of
   // chaining through /dash/orgs/:orgId → /dash/projects/:id → /envs/:slug.
   .get('/dash', async ({ request }) => {
@@ -917,13 +919,9 @@ export const app = new Spiceflow({ tracer })
   // ── REST API (separate sub-app) ─────────────────────────────────
   .use(apiApp)
 
-  // ── Holocron docs/landing page ────────────────────────────────
-  // Mounted last so all explicit routes above take priority.
-  // Holocron handles "/" (index.mdx) with its own HTML shell, navbar, and footer.
-  .use(holocronApp)
+  .get('/', ({ request }) => Response.redirect(new URL('/dash', request.url).toString(), 302))
 
-/** Shared HTML shell for all non-holocron pages (dash, login, device, invite).
- *  Holocron provides its own shell for docs routes (/).
+/** Shared HTML shell for all pages (dash, login, device, invite).
  *  This replaces the old global layout('/*'). */
 const appThemeScript = `(function(){var d=document.documentElement;var m=document.cookie.match(/(?:^|;\\s*)color-theme=(light|dark)(?:;|$)/);var t=m?m[1]:null;if(!t)t=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';if(t==='dark')d.classList.add('dark');else d.classList.remove('dark')})()`
 
@@ -1076,14 +1074,19 @@ function Navbar({ mobileMenuSlot }: { mobileMenuSlot?: React.ReactNode }) {
         <div className="flex h-14 items-center justify-between px-4 sm:px-6">
           <div className="flex items-center gap-2">
             {mobileMenuSlot}
-            {/* Plain <a>: the docs home route is registered as '' (holocron
-                index.mdx), so '/' is not in the typed Link path union. A full
-                navigation to the docs shell is fine here. */}
-            <a href="/" className="text-primary hover:opacity-80 transition-opacity">
+            <Link href={router.href('/dash')} className="text-primary hover:opacity-80 transition-opacity">
               <SigilloLogo className="h-[36px] w-auto shrink-0" />
-            </a>
+            </Link>
           </div>
           <div className="hidden md:flex items-center gap-3">
+            <a
+              href={DOCS_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              docs
+            </a>
             <a
               href="https://github.com/kldzj/sigillo/issues/new"
               target="_blank"
@@ -1104,14 +1107,6 @@ function Navbar({ mobileMenuSlot }: { mobileMenuSlot?: React.ReactNode }) {
         </div>
       </div>
     </nav>
-  )
-}
-
-function XIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" fill="currentColor" className={className} xmlns="http://www.w3.org/2000/svg">
-      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
-    </svg>
   )
 }
 
@@ -1137,14 +1132,6 @@ async function Footer() {
           >
             <GitHubIcon className="size-4" />
           </a>
-          <a
-            href="https://x.com/__morse"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-muted-foreground hover:text-foreground transition-colors"
-          >
-            <XIcon className="size-3.5" />
-          </a>
         </div>
       </div>
     </footer>
@@ -1164,7 +1151,7 @@ async function StradaShellBrowser() {
 export type App = typeof app
 
 export default {
-  fetch: (request: Request) => {
+  fetch: async (request: Request) => {
     // Cache API keys must live on this Worker's own origin, and that origin is
     // only knowable from a real request (preview, production, and every
     // self-hosted instance run on different domains). No-op after the first call.
@@ -1179,7 +1166,11 @@ export default {
         environment: env.STRADA_ENVIRONMENT,
       })
     }
-    return app.handle(request)
+    // An instance is private: search engines shouldn't list any of it
+    const response = await app.handle(request)
+    const headers = new Headers(response.headers)
+    headers.set('X-Robots-Tag', 'noindex, nofollow')
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   },
 } satisfies ExportedHandler<Env>
 

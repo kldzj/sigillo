@@ -1,0 +1,11 @@
+/* Styles for the docs site only (src/docs-site.tsx). */
+
+/* On phones holocron hides the navbar's right side and gives the Menu
+   button a row of its own under the logo: show it next to the logo instead */
+@media (width < 64rem) {
+  .slot-navbar > .lg\:hidden {
+    position: absolute;
+    inset-block: 0;
+    right: 0;
+  }
+}

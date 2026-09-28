@@ -23,7 +23,9 @@
     "bundle:selfhost": "tsx scripts/build-selfhost-bundle.ts",
     "openapi": "tsx scripts/generate-openapi.ts",
     "generate:install": "tsx scripts/generate-install-script.ts",
-    "generate:cli-docs": "tsx scripts/generate-cli-docs.ts"
+    "generate:cli-docs": "tsx scripts/generate-cli-docs.ts",
+    "docs:export": "tsx scripts/export-docs.ts",
+    "docs:deploy": "pnpm docs:export && wrangler deploy -c wrangler.docs.jsonc"
   },
   "dependencies": {
     "@ascii-kit/font": "^0.0.6",

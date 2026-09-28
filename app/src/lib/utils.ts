@@ -41,6 +41,9 @@ export function formatTime({ ts, now, timeZone }: { ts: number; now: number; tim
   return formatAbsoluteDate({ ts, timeZone })
 }
 
+// The fork's docs, a static site of their own: instances don't serve them
+export const DOCS_URL = 'https://sigillo.kldzj.dev'
+
 // Lifetimes a new API token can have, in days. The create dialog offers
 // these and createTokenAction accepts nothing else.
 export const TOKEN_EXPIRY_DAYS = [7, 30, 90, 365] as const

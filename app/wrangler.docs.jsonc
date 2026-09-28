@@ -1,0 +1,19 @@
+// The docs site at sigillo.kldzj.dev (fork only): static files from
+// scripts/export-docs.ts, served as assets without a Worker, so the free
+// plan serves them without request or CPU limits.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "sigillo-docs",
+  "compatibility_date": "2026-04-16",
+  "assets": {
+    "directory": "./dist-docs/site",
+    // /docs/self-hosting serves docs/self-hosting.html
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "sigillo.kldzj.dev", "custom_domain": true }
+  ]
+}

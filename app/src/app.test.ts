@@ -14,7 +14,7 @@
 import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
-import { app } from './app.js'
+import worker, { app } from './app.js'
 import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
@@ -2193,6 +2193,26 @@ describe('formatIp', () => {
       '203.0.113.7',
       null,
     ])
+  })
+})
+
+describe('instance', () => {
+  test('sends / to the dashboard, serves no docs, and asks search engines not to list it', async () => {
+    const fetchPath = async (path: string) => {
+      const res = await worker.fetch(new Request(`http://localhost${path}`))
+      return { status: res.status, location: res.headers.get('location'), robots: res.headers.get('x-robots-tag') }
+    }
+    expect({
+      root: await fetchPath('/'),
+      docs: (await fetchPath('/docs/self-hosting')).status,
+      llms: (await fetchPath('/llms.txt')).status,
+      login: await fetchPath('/login'),
+    }).toEqual({
+      root: { status: 302, location: 'http://localhost/dash', robots: 'noindex, nofollow' },
+      docs: 404,
+      llms: 404,
+      login: { status: 200, location: null, robots: 'noindex, nofollow' },
+    })
   })
 })
 

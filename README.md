@@ -9,7 +9,7 @@
 
 Sigillo replaces `.env` files with a **secrets manager you self-host** on Cloudflare. Prefix your commands with `sigillo run` and secrets are injected as environment variables, never written to disk.
 
-> **This is [kldzj/sigillo](https://github.com/kldzj/sigillo)**, a maintained fork of [remorses/sigillo](https://github.com/remorses/sigillo). There is no hosted service: every instance runs on your own Cloudflare account, including its own Google login, so nothing depends on anyone else's servers. The CLI is published as [`@kldzj/sigillo`](https://www.npmjs.com/package/@kldzj/sigillo), and the fork carries fixes that are still waiting upstream.
+> **This is [kldzj/sigillo](https://github.com/kldzj/sigillo)**, a fork of [remorses/sigillo](https://github.com/remorses/sigillo) that keeps building on it for teams who want tighter control over their secrets, with features such as passkey approval for production, a signed history of every change and read, and machine tokens for CI. Some of them are opinionated in ways upstream may not want, so they live here, while fixes that suit both go upstream as pull requests. The [releases](https://github.com/kldzj/sigillo/releases) list everything the fork adds. There is no hosted service: every instance runs on your own Cloudflare account with its own Google login. The CLI is published as [`@kldzj/sigillo`](https://www.npmjs.com/package/@kldzj/sigillo), and the docs are at [sigillo.kldzj.dev](https://sigillo.kldzj.dev).
 
 ```bash
 # instead of this
@@ -587,7 +587,7 @@ npx @kldzj/sigillo self-host
 
 It logs into Cloudflare (reusing your `wrangler login` when present, or an OAuth browser flow, or a pre-filled API token link that works over SSH), deploys both Workers with their D1 databases, applies migrations, and prints your instance URL. A new deployment needs a **Google OAuth client** for its login provider: the command prints the redirect URI to register at [Google Cloud credentials](https://console.cloud.google.com/apis/credentials) and asks for the client ID and secret. It also asks who may sign in (`--allowed-users`), and for a passphrase that encrypts `~/.sigillo/selfhost.json`, the file with your deployment's keys. **Re-run the same command anytime to update** — only new migrations are applied and no secret is ever rotated.
 
-See [Self-hosting](https://github.com/kldzj/sigillo/blob/main/app/src/docs/self-hosting.mdx) for every option and [Hardening](https://github.com/kldzj/sigillo/blob/main/app/src/docs/hardening.mdx) for securing your instance.
+See [Self-hosting](https://sigillo.kldzj.dev/docs/self-hosting) for every option and [Hardening](https://sigillo.kldzj.dev/docs/hardening) for securing your instance.
 
 ```bash
 # non-interactive (CI/agents)

@@ -18,14 +18,13 @@
     ],
     "primary": {
       "type": "button",
-      "label": "Dashboard",
-      "href": "/dash"
+      "label": "Self-host",
+      "href": "/docs/self-hosting"
     }
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/kldzj/sigillo",
-      "x": "https://x.com/__morse"
+      "github": "https://github.com/kldzj/sigillo"
     }
   },
   "navigation": {
@@ -101,12 +100,9 @@
       ]
     }
   },
-  "knownPaths": [
-    "/login",
-    "/device",
-    "/invite/*",
-    "/dash/*",
-    "/api/*"
-  ],
+  // A static site: the assistant needs a server
+  "assistant": {
+    "enabled": false
+  },
   // "decorativeLines": "none"
 }
