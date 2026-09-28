@@ -90,7 +90,7 @@ function AutoJoinSection() {
 }
 
 export function OrgSettingsPage() {
-  const { orgId, orgName, projectNames, environmentCount, secretCount } = useLoaderData('/dash/orgs/:orgId/settings')
+  const { orgId, role, orgName, projectNames, environmentCount, secretCount } = useLoaderData('/dash/orgs/:orgId/settings')
   const [open, setOpen] = useState(false)
   // Deleting takes the organization's name, typed out: it can't be undone
   const [typedName, setTypedName] = useState('')
@@ -135,10 +135,12 @@ export function OrgSettingsPage() {
             <AlertTriangleIcon className="size-5" />
             Danger Zone
           </h2>
-          <p className="text-muted-foreground text-sm mt-2">
-            Deleting this organization is permanent. All projects, environments,
-            secrets, tokens, and member access will be removed immediately.
-          </p>
+          {role === 'admin' && (
+            <p className="text-muted-foreground text-sm mt-2">
+              Deleting this organization is permanent. All projects, environments,
+              secrets, tokens, and member access will be removed immediately.
+            </p>
+          )}
         </div>
         <div className="border-t border-destructive/40 px-5 py-4 flex items-center justify-between gap-4">
           <div>
@@ -151,75 +153,77 @@ export function OrgSettingsPage() {
             Leave organization
           </Button>
         </div>
-        <div className="border-t border-destructive/40 px-5 py-4 bg-destructive/5 rounded-b-lg flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium">Delete this organization</p>
-            <p className="text-xs text-muted-foreground">
-              Deletes {orgName} with all its projects. It can't be undone.
-            </p>
-          </div>
-          <Dialog open={open} onOpenChange={(next) => { setOpen(next); setTypedName(''); setDeleteError(null) }}>
-            <Button
-              variant="destructive"
-              onClick={() => setOpen(true)}
-            >
-              Delete organization
-            </Button>
-            <DialogPopup>
-              <DialogHeader>
-                <DialogTitle>Delete the organization {orgName}?</DialogTitle>
-                <DialogDescription>
-                  This deletes the whole organization with all its projects, and it can't be undone.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="px-6 pb-4">
-                {projectNames.length > 0 ? (
-                  <div>
-                    <p className="text-sm font-medium mb-2">
-                      The following {projectNames.length === 1 ? 'project' : `${projectNames.length} projects`} will be deleted:
+        {role === 'admin' && (
+          <div className="border-t border-destructive/40 px-5 py-4 bg-destructive/5 rounded-b-lg flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium">Delete this organization</p>
+              <p className="text-xs text-muted-foreground">
+                Deletes {orgName} with all its projects. It can't be undone.
+              </p>
+            </div>
+            <Dialog open={open} onOpenChange={(next) => { setOpen(next); setTypedName(''); setDeleteError(null) }}>
+              <Button
+                variant="destructive"
+                onClick={() => setOpen(true)}
+              >
+                Delete organization
+              </Button>
+              <DialogPopup>
+                <DialogHeader>
+                  <DialogTitle>Delete the organization {orgName}?</DialogTitle>
+                  <DialogDescription>
+                    This deletes the whole organization with all its projects, and it can't be undone.
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="px-6 pb-4">
+                  {projectNames.length > 0 ? (
+                    <div>
+                      <p className="text-sm font-medium mb-2">
+                        The following {projectNames.length === 1 ? 'project' : `${projectNames.length} projects`} will be deleted:
+                      </p>
+                      <ul className="text-sm text-muted-foreground space-y-1">
+                        {projectNames.map((name) => (
+                          <li key={name} className="flex items-center gap-2">
+                            <span className="size-1.5 rounded-full bg-destructive shrink-0" />
+                            {name}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      This organization has no projects.
                     </p>
-                    <ul className="text-sm text-muted-foreground space-y-1">
-                      {projectNames.map((name) => (
-                        <li key={name} className="flex items-center gap-2">
-                          <span className="size-1.5 rounded-full bg-destructive shrink-0" />
-                          {name}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">
-                    This organization has no projects.
+                  )}
+                  <p className="text-sm text-muted-foreground mt-3">
+                    With them go {environmentCount} {environmentCount === 1 ? 'environment' : 'environments'} and{' '}
+                    <strong className="text-foreground">{secretCount} {secretCount === 1 ? 'secret' : 'secrets'}</strong>,
+                    their history, every member's access, invitations and API tokens.
                   </p>
-                )}
-                <p className="text-sm text-muted-foreground mt-3">
-                  With them go {environmentCount} {environmentCount === 1 ? 'environment' : 'environments'} and{' '}
-                  <strong className="text-foreground">{secretCount} {secretCount === 1 ? 'secret' : 'secrets'}</strong>,
-                  their history, every member's access, invitations and API tokens.
-                </p>
-                <label className="flex flex-col gap-1.5 mt-4 text-sm">
-                  <span>Type <strong className="mono-sm">{orgName}</strong> to confirm</span>
-                  <Input value={typedName} onChange={(e) => setTypedName(e.target.value)} autoComplete="off" spellCheck={false} />
-                </label>
-                {deleteError && <p className="text-sm text-destructive mt-2">{deleteError}</p>}
-              </div>
-              <DialogFooter>
-                <DialogClose
-                  render={<Button variant="outline" />}
-                >
-                  Cancel
-                </DialogClose>
-                <Button
-                  variant="destructive"
-                  onClick={handleDelete}
-                  disabled={isPending || typedName !== orgName}
-                >
-                  {isPending ? 'Deleting...' : 'Delete organization'}
-                </Button>
-              </DialogFooter>
-            </DialogPopup>
-          </Dialog>
-        </div>
+                  <label className="flex flex-col gap-1.5 mt-4 text-sm">
+                    <span>Type <strong className="mono-sm">{orgName}</strong> to confirm</span>
+                    <Input value={typedName} onChange={(e) => setTypedName(e.target.value)} autoComplete="off" spellCheck={false} />
+                  </label>
+                  {deleteError && <p className="text-sm text-destructive mt-2">{deleteError}</p>}
+                </div>
+                <DialogFooter>
+                  <DialogClose
+                    render={<Button variant="outline" />}
+                  >
+                    Cancel
+                  </DialogClose>
+                  <Button
+                    variant="destructive"
+                    onClick={handleDelete}
+                    disabled={isPending || typedName !== orgName}
+                  >
+                    {isPending ? 'Deleting...' : 'Delete organization'}
+                  </Button>
+                </DialogFooter>
+              </DialogPopup>
+            </Dialog>
+          </div>
+        )}
       </div>
     </div>
   )

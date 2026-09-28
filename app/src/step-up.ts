@@ -368,14 +368,20 @@ export function isFreshSignIn({ signedIn, sessionCreatedAt }: { signedIn: boolea
 // Organizations whose admins approve this person's first passkey: those with
 // a protected environment where another admin already has a passkey. None on
 // a fresh instance, whose first admin enrolls with a fresh sign-in alone.
+// Organizations they left or were removed from count too, so leaving one,
+// adding a passkey and coming back doesn't get around its admins.
 export async function passkeyApproverOrgs(userId: string): Promise<string[]> {
   const db = getDb()
-  const memberships = await db.query.orgMember.findMany({ where: { userId }, columns: { orgId: true } })
-  if (memberships.length === 0) return []
+  const [memberships, removals] = await Promise.all([
+    db.query.orgMember.findMany({ where: { userId }, columns: { orgId: true } }),
+    db.select({ orgId: schema.orgRemoval.orgId }).from(schema.orgRemoval).where(orm.eq(schema.orgRemoval.userId, userId)),
+  ])
+  const candidates = [...new Set([...memberships, ...removals].map((row) => row.orgId))]
+  if (candidates.length === 0) return []
   const guarded = await db.selectDistinct({ orgId: schema.project.orgId })
     .from(schema.environment)
     .innerJoin(schema.project, orm.eq(schema.project.id, schema.environment.projectId))
-    .where(orm.and(orm.inArray(schema.project.orgId, memberships.map((m) => m.orgId)), orm.eq(schema.environment.protected, true)))
+    .where(orm.and(orm.inArray(schema.project.orgId, candidates), orm.eq(schema.environment.protected, true)))
   const orgIds: string[] = []
   for (const { orgId } of guarded) {
     const [admin] = await db.select({ id: schema.orgMember.id })

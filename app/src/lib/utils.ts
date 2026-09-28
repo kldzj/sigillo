@@ -166,6 +166,14 @@ export function getSecretNameError(name: string): string | null {
   return `Invalid secret name "${name}". Use letters, digits and underscores, not starting with a digit.`
 }
 
+// Names of organizations, projects and environments end up in terminals
+// through the CLI, so no control characters, which could rewrite the screen
+export function getNameError(name: string): string | null {
+  if (!name.trim()) return 'Name is required'
+  if (/\p{Cc}/u.test(name)) return 'Names can\'t contain control characters'
+  return null
+}
+
 // An environment's slug ends up in URLs, a cookie, file names and the CLI's
 // -c flag: lowercase letters, digits and dashes
 export const ENV_SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,62}$/

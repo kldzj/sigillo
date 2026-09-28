@@ -36,6 +36,7 @@ import {
   getReadableEnvironmentIds,
   ForbiddenError,
   getClaimableAutoJoinDomain,
+  requireValidName,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
 import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected, requireProjectChange } from './step-up.ts'
@@ -430,6 +431,7 @@ export const apiApp = new Spiceflow()
     response: orgMutationResponseSchema,
     async handler({ request }) {
       const body = await request.json()
+      requireValidName(body.name)
       const session = await requireApiSession(request)
 
       let autoJoinDomain: string | null = null
@@ -497,6 +499,7 @@ export const apiApp = new Spiceflow()
     response: projectMutationResponseSchema,
     async handler({ request }) {
       const body = await request.json()
+      requireValidName(body.name)
       const session = await requireApiSession(request)
       await requireApiOrgMember(session.userId, body.orgId)
       const db = getDb()
@@ -605,9 +608,10 @@ export const apiApp = new Spiceflow()
     path: '/api/v0/projects/:id',
     detail: { tags: ['Projects'], summary: 'Update project' },
     request: projectCreateRequestSchema.pick({ name: true }),
-    response: { 200: projectMutationResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
+    response: { 200: projectMutationResponseSchema, 400: errorResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
     async handler({ params, request }) {
       const body = await request.json()
+      requireValidName(body.name)
       const session = await requireApiSession(request)
       const orgId = await getOrgIdForProject(params.id)
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
@@ -683,6 +687,7 @@ export const apiApp = new Spiceflow()
     response: { 200: environmentMutationResponseSchema, 400: errorResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
     async handler({ request, params }) {
       const body = await request.json()
+      requireValidName(body.name)
       const slugError = getEnvSlugError(body.slug)
       if (slugError) return json({ error: slugError }, { status: 400 })
       const session = await requireApiSession(request)
@@ -753,6 +758,7 @@ export const apiApp = new Spiceflow()
       if (!body.name && !body.slug) {
         return json({ error: 'at least one of name or slug required' }, { status: 400 })
       }
+      if (body.name) requireValidName(body.name)
       const slugError = body.slug ? getEnvSlugError(body.slug) : null
       if (slugError) return json({ error: slugError }, { status: 400 })
       const session = await requireApiSession(request)

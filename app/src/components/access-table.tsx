@@ -101,6 +101,7 @@ export function AccessTable() {
   function getProjectAccessLabel(member: Member) {
     if (getRole(member) === 'admin') return 'All (admin)'
     if (member.projectAccess === 'all') return 'All'
+    if (!canManage) return 'Some'
     return `${member.accessRules.length} of ${orgProjects.length}`
   }
 

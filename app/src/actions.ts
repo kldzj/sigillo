@@ -28,7 +28,7 @@ import {
   getUserEnvironmentAccess,
   getEnvironmentAccessError,
   getClaimableAutoJoinDomain,
-  deleteOrgMember, setOrgMemberRole, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped,
+  deleteOrgMember, joinOrgByInvite, setOrgMemberRole, requireValidName, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped,
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
@@ -104,7 +104,7 @@ async function ensureAnotherAdminExists(orgId: string, userId: string) {
 }
 
 export async function createProjectAction({ name, orgId }: { name: string; orgId: string }) {
-  if (!name) throw new Error('Name is required')
+  requireValidName(name)
   if (!orgId) throw new Error('No org selected')
   const session = await requireSession()
   await requireOrgMember(session.userId, orgId)
@@ -161,6 +161,7 @@ export async function revealSecretsAction({ environmentId, names, download }: {
   names: string[] | null
   download?: boolean
 }) {
+  if (names !== null && !(Array.isArray(names) && names.every((name) => typeof name === 'string'))) throw new Error('Secret names must be a list')
   const session = await requireSession()
   return stepUpOr(async () => ({
     values: await readSecretValues({
@@ -366,6 +367,7 @@ export async function createEnvAction({ name, slug, projectId }: {
   projectId: string
 }) {
   if (!name || !slug) throw new Error('Name and slug are required')
+  requireValidName(name)
   const slugError = getEnvSlugError(slug)
   if (slugError) throw new Error(slugError)
   const session = await requireSession()
@@ -382,6 +384,7 @@ export async function renameEnvAction({ id, name, slug }: {
 }) {
   return stepUpOr(async () => {
     if (!name && !slug) throw new Error('At least one of name or slug is required')
+    if (name) requireValidName(name)
     const slugError = slug ? getEnvSlugError(slug) : null
     if (slugError) throw new Error(slugError)
     const session = await requireSession()
@@ -431,52 +434,15 @@ export async function createInviteAction({ orgId, projectIds }: { orgId: string;
 export async function acceptInviteAction({ invitationId }: { invitationId: string }) {
   if (!invitationId) throw new Error('Invitation ID is required')
   const session = await requireSession()
-  const db = getDb()
-  // Look up the invite without deleting — it stays valid until it expires.
-  // This avoids a race where the page re-renders after accept and shows
-  // "Invalid Invitation" because the row was already deleted.
-  const invite = await db.query.orgInvitation.findFirst({
-    where: { id: invitationId },
-  })
-  if (!invite || invite.expiresAt < Date.now()) throw new Error('Invitation not found or expired')
-  const existing = await db.query.orgMember.findFirst({
-    where: { orgId: invite.orgId, userId: session.userId },
-    columns: { id: true },
-  })
-  if (!existing) {
-    // A scoped invite whose projects were all deleted is refused: joining
-    // with access to nothing would only confuse the invitee.
-    const invitedProjectIds: string[] = invite.projectIds ? JSON.parse(invite.projectIds) : []
-    const projects = invitedProjectIds.length > 0
-      ? await db.query.project.findMany({ where: { orgId: invite.orgId, id: { in: invitedProjectIds } }, columns: { id: true } })
-      : []
-    if (invitedProjectIds.length > 0 && projects.length === 0) {
-      throw new Error('The projects in this invitation no longer exist. Ask for a new invitation.')
-    }
-    // Membership and scope in one batch, so a failure never leaves a
-    // half-scoped member behind. onConflictDoNothing keeps a double-submitted
-    // accept a no-op (unique index on org_id + user_id).
-    const memberId = ulid()
-    await db.batch([
-      db.insert(schema.orgMember)
-        .values({
-          id: memberId, orgId: invite.orgId, userId: session.userId, role: invite.role,
-          projectAccess: invitedProjectIds.length > 0 ? 'selected' : 'all',
-        })
-        .onConflictDoNothing({ target: [schema.orgMember.orgId, schema.orgMember.userId] }),
-      ...projects.map((p) => db.insert(schema.memberAccess).values({ orgMemberId: memberId, projectId: p.id })),
-      // Invited back after a removal: auto-join may add them again
-      db.delete(schema.orgRemoval).where(orm.and(orm.eq(schema.orgRemoval.orgId, invite.orgId), orm.eq(schema.orgRemoval.userId, session.userId))),
-    ])
-  }
-
-  throw redirect(router.href('/dash/orgs/:orgId', { orgId: invite.orgId }))
+  const orgId = await joinOrgByInvite({ invitationId, userId: session.userId })
+  throw redirect(router.href('/dash/orgs/:orgId', { orgId }))
 }
 
 export async function updateOrgMemberRoleAction({ memberId, role }: {
   memberId: string
   role: 'admin' | 'member'
 }) {
+  if (role !== 'admin' && role !== 'member') throw new Error('Unknown role')
   return stepUpOr(async () => {
     const session = await requireSession()
     const db = getDb()
@@ -673,7 +639,7 @@ async function syncMissingSecrets({
 }
 
 export async function createOrgAction({ name, enableAutoJoin }: { name: string; enableAutoJoin?: boolean }) {
-  if (!name) throw new Error('Name is required')
+  requireValidName(name)
   const session = await requireSession()
 
   let autoJoinDomain: string | null = null
@@ -770,6 +736,7 @@ export async function updateEnvironmentAccessRoleAction({ environmentId, accessR
   environmentId: string
   accessRole: 'admin' | 'member'
 }) {
+  if (accessRole !== 'admin' && accessRole !== 'member') throw new Error('Unknown role')
   return stepUpOr(async () => {
     const session = await requireSession()
     const orgId = await getOrgIdForEnvironment(environmentId)
@@ -802,7 +769,7 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
 
 export async function renameProjectAction({ projectId, name }: { projectId: string; name: string }) {
   return stepUpOr(async () => {
-    if (!name.trim()) throw new Error('Name is required')
+    requireValidName(name)
     const session = await requireSession()
     await requireProjectChange({ ...session, projectId })
     await getDb().update(schema.project).set({ name: name.trim(), updatedAt: Date.now() }).where(orm.eq(schema.project.id, projectId))

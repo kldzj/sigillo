@@ -9,6 +9,7 @@
 
 import { env } from 'cloudflare:workers'
 import * as orm from 'drizzle-orm'
+import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import { betterAuth } from 'better-auth/minimal'
 import { genericOAuth, deviceAuthorization, bearer } from 'better-auth/plugins'
@@ -19,7 +20,7 @@ import { makeSignature } from 'better-auth/crypto'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 import { redirect } from 'spiceflow'
 import { memoize } from './lib/memoize.ts'
-import { COMMON_EMAIL_DOMAINS, getEmailDomain, isUserAllowed } from './lib/utils.ts'
+import { COMMON_EMAIL_DOMAINS, getEmailDomain, getNameError, isUserAllowed } from './lib/utils.ts'
 export { COMMON_EMAIL_DOMAINS, getEmailDomain }
 
 // ── Drizzle client via D1 ───────────────────────────────────────────
@@ -281,6 +282,11 @@ export async function getAuth(request: Request) {
         if (ctx.path === '/passkey/verify-registration' && ctx.body?.createSession) {
           throw new APIError('BAD_REQUEST', { message: 'passkeys do not sign in', code: 'PASSKEY_SIGN_IN_DISABLED' })
         }
+        // A CLI login's device code is stored as its hash (see the after hook),
+        // so the CLI's code is looked up by its hash too
+        if (ctx.path === '/device/token' && typeof ctx.body?.device_code === 'string') {
+          return { context: { body: { ...ctx.body, device_code: await hashTokenKey(ctx.body.device_code) } } }
+        }
       }),
       after: createAuthMiddleware(async (ctx) => {
         if (ctx.path === '/passkey/verify-registration') {
@@ -290,6 +296,17 @@ export async function getAuth(request: Request) {
               request: ctx.request ?? null, userId: added.userId, actor: `user:${added.userId}`, action: 'added',
               passkeyName: typeof added.name === 'string' ? added.name : null,
             })
+          }
+          return
+        }
+        // The device code turns into a session once approved: only its hash is
+        // kept, so a device code read out of D1 during a login can't be
+        // exchanged for one
+        if (ctx.path === '/device/code') {
+          const started = ctx.context.returned as { device_code?: unknown } | undefined
+          if (typeof started?.device_code === 'string') {
+            await getDb().update(schema.deviceCode).set({ deviceCode: await hashTokenKey(started.device_code) })
+              .where(orm.eq(schema.deviceCode.deviceCode, started.device_code))
           }
           return
         }
@@ -616,6 +633,19 @@ export async function getAccessibleProjectIds(
   return access.accessibleProjectIds
 }
 
+// The newest project of an organization this person can open, with its
+// environments for picking one
+export async function firstAccessibleProject(userId: string, orgId: string) {
+  const accessibleIds = await getAccessibleProjectIds(userId, orgId)
+  if (accessibleIds !== null && accessibleIds.length === 0) return null
+  return await getDb().query.project.findFirst({
+    where: { orgId, ...(accessibleIds !== null ? { id: { in: accessibleIds } } : {}) },
+    columns: { id: true },
+    with: { environments: { columns: { slug: true, createdAt: true } } },
+    orderBy: { createdAt: 'desc' },
+  }) ?? null
+}
+
 // ── Org authorization ───────────────────────────────────────────────
 
 // Membership and environment lookups are deliberately NOT memoized: they
@@ -651,6 +681,54 @@ export async function deleteOrgMember(member: { id: string; orgId: string; userI
   ])
 }
 
+// People who left an organization or were removed from it
+export async function listFormerMembers(orgId: string) {
+  return getDb().select({ id: schema.user.id, name: schema.user.name }).from(schema.orgRemoval)
+    .innerJoin(schema.user, orm.eq(schema.user.id, schema.orgRemoval.userId))
+    .where(orm.eq(schema.orgRemoval.orgId, orgId))
+}
+
+// Joins an organization with an invite link. The link stays valid until it
+// expires, for everyone it was shared with. An invitation made before someone
+// left or was removed doesn't bring them back: that takes a new one.
+export async function joinOrgByInvite({ invitationId, userId }: { invitationId: string; userId: string }) {
+  const db = getDb()
+  const invite = await db.query.orgInvitation.findFirst({ where: { id: invitationId } })
+  if (!invite || invite.expiresAt < Date.now()) throw new Error('Invitation not found or expired')
+  const existing = await db.query.orgMember.findFirst({ where: { orgId: invite.orgId, userId }, columns: { id: true } })
+  if (existing) return invite.orgId
+  const [removal] = await db.select({ createdAt: schema.orgRemoval.createdAt }).from(schema.orgRemoval)
+    .where(orm.and(orm.eq(schema.orgRemoval.orgId, invite.orgId), orm.eq(schema.orgRemoval.userId, userId)))
+  if (removal && removal.createdAt >= invite.createdAt) {
+    throw new Error('You left or were removed from this organization after this invitation was made: ask an admin for a new one.')
+  }
+  // A scoped invite whose projects were all deleted is refused: joining
+  // with access to nothing would only confuse the invitee.
+  const invitedProjectIds: string[] = invite.projectIds ? JSON.parse(invite.projectIds) : []
+  const projects = invitedProjectIds.length > 0
+    ? await db.query.project.findMany({ where: { orgId: invite.orgId, id: { in: invitedProjectIds } }, columns: { id: true } })
+    : []
+  if (invitedProjectIds.length > 0 && projects.length === 0) {
+    throw new Error('The projects in this invitation no longer exist. Ask for a new invitation.')
+  }
+  // Membership and scope in one batch, so a failure never leaves a
+  // half-scoped member behind. onConflictDoNothing keeps a double-submitted
+  // accept a no-op (unique index on org_id + user_id).
+  const memberId = ulid()
+  await db.batch([
+    db.insert(schema.orgMember)
+      .values({
+        id: memberId, orgId: invite.orgId, userId, role: invite.role,
+        projectAccess: invitedProjectIds.length > 0 ? 'selected' : 'all',
+      })
+      .onConflictDoNothing({ target: [schema.orgMember.orgId, schema.orgMember.userId] }),
+    ...projects.map((p) => db.insert(schema.memberAccess).values({ orgMemberId: memberId, projectId: p.id })),
+    // Invited back after a removal: auto-join may add them again
+    db.delete(schema.orgRemoval).where(orm.and(orm.eq(schema.orgRemoval.orgId, invite.orgId), orm.eq(schema.orgRemoval.userId, userId))),
+  ])
+  return invite.orgId
+}
+
 // Inviting is up to admins: a demoted admin's invite links stop working, as
 // a removed member's do
 export async function setOrgMemberRole({ member, role }: { member: { id: string; orgId: string; userId: string }; role: 'admin' | 'member' }) {
@@ -671,6 +749,11 @@ export class InvalidInputError extends Error {
     super(message)
     this.name = 'InvalidInputError'
   }
+}
+
+export function requireValidName(name: string) {
+  const error = getNameError(name)
+  if (error) throw new InvalidInputError(error)
 }
 
 // Distinct class instead of `new Error('FORBIDDEN')` so the API/page wrappers

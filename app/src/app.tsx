@@ -29,11 +29,13 @@ import {
   isSessionFresh,
   actorOf,
   countSecrets,
+  listFormerMembers,
+  firstAccessibleProject,
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
-import { cn, loginErrorMessage, DOCS_URL } from 'sigillo-app/src/lib/utils'
+import { cn, loginErrorMessage, DOCS_URL, ENV_SLUG_REGEX } from 'sigillo-app/src/lib/utils'
 import { CreateOrgForm } from 'sigillo-app/src/components/create-org-form'
 import { SigilloLogo } from 'sigillo-app/src/components/logo'
 // Tailwind and the base styles, which the docs site loads with its pages
@@ -154,6 +156,7 @@ export const app = new Spiceflow({ tracer })
     const match = request.method === 'GET' ? envPagePath.exec(url.pathname) : null
     if (!match || !(response instanceof Response) || response.status !== 200) return response
     const [, projectId, envSlug] = match
+    if (!ENV_SLUG_REGEX.test(envSlug!)) return response
     const headers = new Headers(response.headers)
     headers.append('Set-Cookie', [
       `${envCookieName(decodeURIComponent(projectId!))}=${envSlug}`,
@@ -221,18 +224,20 @@ export const app = new Spiceflow({ tracer })
     const db = getDb()
     const session = await requirePageSession(request)
     const { role } = await requirePageOrgMember(session.userId, params.orgId)
+    // What deleting the organization takes with it, only for the admins who
+    // can: a member may not know every project's name
     const [sidebar, orgRow, projects] = await Promise.all([
       orgSidebar({ request, userId: session.userId, orgId: params.orgId }),
       db.query.org.findFirst({ where: { id: params.orgId }, columns: { name: true, autoJoinDomain: true } }),
-      db.query.project.findMany({ where: { orgId: params.orgId }, columns: { id: true, name: true }, orderBy: { createdAt: 'asc' } }),
+      role === 'admin' ? db.query.project.findMany({ where: { orgId: params.orgId }, columns: { id: true, name: true }, orderBy: { createdAt: 'asc' } }) : [],
     ])
-    // What deleting the organization takes with it, for the admins who can
-    const environments = role === 'admin' && projects.length > 0
+    const environments = projects.length > 0
       ? await db.query.environment.findMany({ where: { projectId: { in: projects.map((p) => p.id) } }, columns: { id: true } })
       : []
     const secretCounts = await countSecrets(environments.map((env) => env.id))
     return {
       ...sidebar,
+      role,
       orgName: orgRow?.name ?? 'Organization',
       autoJoinDomain: orgRow?.autoJoinDomain ?? null,
       projectNames: projects.map((p) => p.name),
@@ -331,38 +336,29 @@ export const app = new Spiceflow({ tracer })
       where: { userId: session.userId },
       with: { org: true },
     })
-    const lastOrg = members
+    const orgs = members
       .filter((m) => m.org != null)
       .sort((a, b) => b.org!.createdAt! - a.org!.createdAt!)
-      [0]
-    if (!lastOrg) {
+    if (orgs.length === 0) {
       return Response.redirect(new URL('/dash/new-org', request.url).toString(), 302)
     }
-    const firstProject = await db.query.project.findFirst({
-      where: { orgId: lastOrg.org!.id },
-      columns: { id: true },
-      with: { environments: { columns: { slug: true, createdAt: true } } },
-      orderBy: { createdAt: 'desc' },
-    })
-    if (firstProject) {
+    // The newest project they can open, in the newest organization that has
+    // one: a member with access to only some projects may have none in theirs
+    for (const member of orgs) {
+      const firstProject = await firstAccessibleProject(session.userId, member.orgId)
+      if (!firstProject) continue
       const envSlug = projectEnvSlug(request, firstProject.id, firstProject.environments || []) ?? '_'
       const href = `/dash/projects/${encodeURIComponent(firstProject.id)}/envs/${encodeURIComponent(envSlug)}`
       return Response.redirect(new URL(href, request.url).toString(), 302)
     }
-    return Response.redirect(new URL(`/dash/orgs/${encodeURIComponent(lastOrg.org!.id)}`, request.url).toString(), 302)
+    return Response.redirect(new URL(`/dash/orgs/${encodeURIComponent(orgs[0]!.org!.id)}`, request.url).toString(), 302)
   })
 
   // ── Org root redirect → resolve first project+env in one hop ──
   .get('/dash/orgs/:orgId', async ({ params, request }) => {
     const session = await requirePageSession(request)
     await requirePageOrgMember(session.userId, params.orgId)
-    const db = getDb()
-    const firstProject = await db.query.project.findFirst({
-      where: { orgId: params.orgId },
-      columns: { id: true },
-      with: { environments: { columns: { slug: true, createdAt: true } } },
-      orderBy: { createdAt: 'desc' },
-    })
+    const firstProject = await firstAccessibleProject(session.userId, params.orgId)
     if (firstProject) {
       const envSlug = projectEnvSlug(request, firstProject.id, firstProject.environments || []) ?? '_'
       const href = `/dash/projects/${encodeURIComponent(firstProject.id)}/envs/${encodeURIComponent(envSlug)}`
@@ -375,16 +371,19 @@ export const app = new Spiceflow({ tracer })
   .page('/dash/orgs/:orgId', async ({ params, request }) => {
     const session = await requirePageSession(request)
     await requirePageOrgMember(session.userId, params.orgId)
-    const db = getDb()
 
-    const projects = await db.query.project.findMany({
-        where: { orgId: params.orgId },
-        orderBy: { createdAt: 'desc' },
-      })
-    const projectList = projects.map((p) => ({ id: p.id, name: p.name }))
-
-    if (projectList[0]) {
-      return Response.redirect(new URL(`/dash/projects/${encodeURIComponent(projectList[0].id)}`, request.url).toString(), 302)
+    const firstProject = await firstAccessibleProject(session.userId, params.orgId)
+    if (firstProject) {
+      return Response.redirect(new URL(`/dash/projects/${encodeURIComponent(firstProject.id)}`, request.url).toString(), 302)
+    }
+    const anyProject = await getDb().query.project.findFirst({ where: { orgId: params.orgId }, columns: { id: true } })
+    if (anyProject) {
+      return (
+        <div className="max-w-3xl">
+          <h1 className="text-2xl font-bold tracking-tight mb-2">No projects for you yet</h1>
+          <p className="text-muted-foreground">Ask an admin of this organization for access to a project.</p>
+        </div>
+      )
     }
 
     const { NewProjectButton } = await import('sigillo-app/src/components/sidebar')
@@ -509,7 +508,9 @@ export const app = new Spiceflow({ tracer })
     if (!orgId) throw redirect('/')
     const { role } = await requirePageOrgMember(session.userId, orgId)
 
-    const [members, orgProjects] = await Promise.all([
+    // Which projects there are and who opens which, only for admins: a
+    // member may not know every project's name
+    const [allMembers, orgProjects] = await Promise.all([
       db.query.orgMember.findMany({
         where: { orgId },
         with: {
@@ -518,23 +519,32 @@ export const app = new Spiceflow({ tracer })
         },
         orderBy: { createdAt: 'asc' },
       }),
-      db.query.project.findMany({
+      role === 'admin' ? db.query.project.findMany({
         where: { orgId },
         columns: { id: true, name: true },
         orderBy: { createdAt: 'asc' },
-      }),
+      }) : [],
     ])
+    const members = role === 'admin' ? allMembers : allMembers.map((member) => ({ ...member, accessRules: [] }))
 
-    // Admins see who has passkeys, and every passkey added or removed
+    // Admins see who has passkeys, and every passkey added or removed. People
+    // who left still need this organization's approval for a first passkey,
+    // so their requests show here too.
     const userIds = members.map((member) => member.userId)
+    const formerMembers = role === 'admin' ? await listFormerMembers(orgId) : []
     const [passkeys, events, enrollments] = role === 'admin'
       ? await Promise.all([
         db.query.passkey.findMany({ where: { userId: { in: userIds } }, columns: { userId: true } }),
         db.query.passkeyEvent.findMany({ where: { userId: { in: userIds } }, orderBy: { createdAt: 'desc' }, limit: 50 }),
-        pendingEnrollments({ userIds, orgId }),
+        pendingEnrollments({ userIds: [...userIds, ...formerMembers.map((user) => user.id)], orgId }),
       ])
       : [[], [], []]
-    const nameOf = (userId: string) => members.find((member) => member.userId === userId)?.user?.name ?? 'Former member'
+    const nameOf = (userId: string) => {
+      const member = members.find((member) => member.userId === userId)?.user
+      if (member) return member.name
+      const former = formerMembers.find((user) => user.id === userId)
+      return former ? `${former.name} (left)` : 'Former member'
+    }
     const passkeyCounts = Object.fromEntries(userIds.map((userId) => [userId, passkeys.filter((p) => p.userId === userId).length]))
     const passkeyEvents = events.map((event) => ({
       id: event.id,

@@ -17,7 +17,7 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import worker, { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
@@ -266,6 +266,24 @@ describe('projects CRUD', () => {
 })
 
 // ── Environments CRUD ───────────────────────────────────────────────
+
+describe('names', () => {
+  test('of organizations, projects and environments can\'t carry terminal control characters', async () => {
+    const user = await createTestUser({ name: 'Naming User' })
+    const af = authedFetch(user.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Café Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Café', orgId } })).id
+    const clipboard = 'api\u001b]52;c;ZWNobyBoaQ==\u0007'
+    const status = (result: unknown) => result instanceof Error ? (result as { status?: number }).status : 200
+    expect({
+      org: status(await af('/api/v0/orgs', { method: 'POST', body: { name: clipboard } })),
+      project: status(await af('/api/v0/projects', { method: 'POST', body: { name: clipboard, orgId } })),
+      rename: status(await af('/api/v0/projects/:id', { method: 'PATCH', params: { id: projectId }, body: { name: 'C1\u009b2J' } })),
+      environment: status(await af('/api/v0/projects/:projectId/environments', { method: 'POST', params: { projectId }, body: { name: clipboard, slug: 'staging' } })),
+      environmentRename: status(await af('/api/v0/projects/:projectId/environments/:id', { method: 'PATCH', params: { projectId, id: 'dev' }, body: { name: '\r' } })),
+    }).toEqual({ org: 400, project: 400, rename: 400, environment: 400, environmentRename: 400 })
+  })
+})
 
 describe('environments CRUD', () => {
   test('a slug is lowercase letters, digits and dashes', async () => {
@@ -1797,6 +1815,36 @@ describe('member access — project scoping', () => {
   })
 })
 
+describe('landing on the dashboard', () => {
+  test('a member who can open none of the newest organization\'s projects lands on a page, not in a redirect loop', async () => {
+    const admin = await createTestUser({ name: 'Landing Admin' })
+    const member = await createTestUser({ name: 'Landing Member' })
+    const af = authedFetch(admin.token)
+    const olderOrg = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Older Org' } })).id
+    const reachable = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Reachable', orgId: olderOrg } })).id
+    const newerOrg = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Newer Org' } })).id
+    await getDb().update(schema.org).set({ createdAt: Date.now() + 1000 }).where(orm.eq(schema.org.id, newerOrg))
+    assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Not Theirs', orgId: newerOrg } }))
+    await getDb().insert(schema.orgMember).values([
+      { orgId: olderOrg, userId: member.user.id, role: 'member' },
+      { orgId: newerOrg, userId: member.user.id, role: 'member', projectAccess: 'selected' },
+    ])
+    // Follows redirects, as a browser would, for a few hops
+    const follow = async (path: string) => {
+      for (let hop = 0; hop < 5; hop++) {
+        const res = await app.handle(new Request(`http://e.ly${path}`, { headers: { authorization: `Bearer ${member.token}` }, redirect: 'manual' }))
+        if (res.status < 300 || res.status >= 400) return { path: path.split('/').slice(0, 4).join('/'), status: res.status }
+        path = new URL(res.headers.get('location')!, 'http://e.ly').pathname
+      }
+      return { path, status: 'loop' }
+    }
+    expect({ dash: await follow('/dash'), newerOrg: await follow(`/dash/orgs/${newerOrg}`) }).toEqual({
+      dash: { path: `/dash/projects/${reachable}`, status: 200 },
+      newerOrg: { path: `/dash/orgs/${newerOrg}`, status: 200 },
+    })
+  })
+})
+
 describe('environment access roles', () => {
   let adminToken: string
   let memberToken: string
@@ -2131,6 +2179,23 @@ describe('session tokens read out of D1', () => {
       signed: (await call('/api/v0/me', { token: issued.access_token })).status,
       raw: (await call('/api/v0/me', { token: issued.access_token.split('.')[0] })).status,
     }).toEqual({ signed: 200, raw: 401 })
+  })
+
+  test('a device code read out of D1 during a CLI login can\'t be exchanged for the session', async () => {
+    const { token: approver } = await createTestUser()
+    const code = await (await call('/api/auth/device/code', { body: { client_id: 'sigillo-cli' } })).json() as { device_code: string; user_code: string }
+    const stored = (await getDb().query.deviceCode.findFirst({ where: { userCode: code.user_code } }))!.deviceCode
+    await call(`/api/auth/device?user_code=${code.user_code}`, { token: approver })
+    await call('/api/auth/device/approve', { body: { userCode: code.user_code }, token: approver })
+    const exchange = async (deviceCode: string) => {
+      const res = await call('/api/auth/device/token', { body: { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: deviceCode, client_id: 'sigillo-cli' } })
+      return { status: res.status, token: typeof (await res.json() as { access_token?: unknown }).access_token }
+    }
+    expect({ storedRaw: stored === code.device_code, fromD1: await exchange(stored), fromCli: await exchange(code.device_code) }).toEqual({
+      storedRaw: false,
+      fromD1: { status: 400, token: 'undefined' },
+      fromCli: { status: 200, token: 'string' },
+    })
   })
 })
 
@@ -3582,6 +3647,38 @@ describe('passkey enrollment', () => {
       approved: 'ok',
       afterApproval: 200,
       usedUp: 403,
+    })
+  })
+
+  test('leaving an organization doesn\'t get around its approval of a first passkey, nor does its old invite link bring you back', async () => {
+    const admin = await createTestUser({ name: 'Leave Admin' })
+    const member = await createTestUser({ name: 'Leave Member' })
+    const af = authedFetch(admin.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Leave Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Leave', orgId } })).id
+    const prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+    await setEnvironmentProtection({ request: new Request(origin), environmentId: prod, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    expect(await register(admin.token)).toBe(200)
+    const invite = async (createdAt: number) => (await getDb().insert(schema.orgInvitation).values({ orgId, createdBy: admin.user.id, createdAt, expiresAt: Date.now() + 60_000 }).returning())[0]!.id
+    const oldInvite = await invite(Date.now() - 1000)
+    const joined = await outcomeOf(() => joinOrgByInvite({ invitationId: oldInvite, userId: member.user.id }))
+    // Someone with the member's Google account leaves, adds a passkey, and comes back
+    await deleteOrgMember((await getDb().query.orgMember.findFirst({ where: { orgId, userId: member.user.id } }))!)
+    const approverOrgs = await passkeyApproverOrgs(member.user.id)
+    const withoutApproval = await register(member.token)
+    const backWithOldInvite = await outcomeOf(() => joinOrgByInvite({ invitationId: oldInvite, userId: member.user.id }))
+    // The organization's admins still see the request, from a former member
+    const asked = await requestEnrollment({ request: new Request(origin), ...await loginOf(member.token), viaCode: false })
+    const shown = (await pendingEnrollments({ userIds: (await listFormerMembers(orgId)).map((user) => user.id), orgId })).map((row) => row.id)
+    const backWithNewInvite = await outcomeOf(async () => joinOrgByInvite({ invitationId: await invite(Date.now() + 1), userId: member.user.id }))
+    expect({ joined, approverOrgs, withoutApproval, backWithOldInvite, shown, backWithNewInvite, afterRejoining: await passkeyApproverOrgs(member.user.id) }).toEqual({
+      joined: 'ok',
+      approverOrgs: [orgId],
+      withoutApproval: 403,
+      backWithOldInvite: 'You left or were removed from this organization after this invitation was made: ask an admin for a new one.',
+      shown: [asked.id],
+      backWithNewInvite: 'ok',
+      afterRejoining: [orgId],
     })
   })
 
