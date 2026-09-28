@@ -27,7 +27,7 @@ import {
   isSessionFresh,
 } from './db.ts'
 import { apiApp } from './api.ts'
-import { isFreshSignIn } from './step-up.ts'
+import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
 import { cn, loginErrorMessage } from 'sigillo-app/src/lib/utils'
 import { CreateOrgForm } from 'sigillo-app/src/components/create-org-form'
@@ -94,6 +94,19 @@ export const app = new Spiceflow({ tracer })
   // DO boundary via sqlite-proxy.
   .use(async ({ request }, next) => {
     const url = new URL(request.url)
+    // Approving a CLI login makes a login that outlives this session: once
+    // you have a passkey, it takes an approval with it (step-up.ts)
+    if (url.pathname === '/api/auth/device/approve' && request.method === 'POST') {
+      const session = await getSession(request)
+      if (session) {
+        try {
+          await requirePasskeyOnceEnrolled(session)
+        } catch (error) {
+          if (!(error instanceof StepUpRequiredError)) throw error
+          return Response.json({ code: 'PASSKEY_APPROVAL_REQUIRED', message: 'Approve with your passkey first' }, { status: 403 })
+        }
+      }
+    }
     if (url.pathname.startsWith('/api/auth')) {
       const auth = await getAuth(request)
       const res = await auth.handler(request)
@@ -471,12 +484,13 @@ export const app = new Spiceflow({ tracer })
 
     // Admins see who has passkeys, and every passkey added or removed
     const userIds = members.map((member) => member.userId)
-    const [passkeys, events] = role === 'admin'
+    const [passkeys, events, enrollments] = role === 'admin'
       ? await Promise.all([
         db.query.passkey.findMany({ where: { userId: { in: userIds } }, columns: { userId: true } }),
         db.query.passkeyEvent.findMany({ where: { userId: { in: userIds } }, orderBy: { createdAt: 'desc' }, limit: 50 }),
+        pendingEnrollments(userIds),
       ])
-      : [[], []]
+      : [[], [], []]
     const nameOf = (userId: string) => members.find((member) => member.userId === userId)?.user?.name ?? 'Former member'
     const passkeyCounts = Object.fromEntries(userIds.map((userId) => [userId, passkeys.filter((p) => p.userId === userId).length]))
     const passkeyEvents = events.map((event) => ({
@@ -489,6 +503,17 @@ export const app = new Spiceflow({ tracer })
       createdAt: event.createdAt,
     }))
 
+    // Members asking an admin to approve their first passkey
+    const passkeyRequests = enrollments.map((row) => ({
+      id: row.id,
+      member: nameOf(row.userId),
+      isYou: row.userId === session.userId,
+      userAgent: row.userAgent,
+      ipAddress: row.ipAddress,
+      country: row.country,
+      createdAt: row.createdAt,
+    }))
+
     return {
       orgId,
       role,
@@ -497,6 +522,7 @@ export const app = new Spiceflow({ tracer })
       orgProjects,
       passkeyCounts,
       passkeyEvents,
+      passkeyRequests,
     }
   })
 
@@ -660,6 +686,9 @@ export const app = new Spiceflow({ tracer })
       // further one a login from the last day (better-auth's freshAge)
       freshSignIn: isFreshSignIn(session),
       recentLogin: await isSessionFresh(request, session.sessionCreatedAt),
+      // Approvals to add a passkey: on another device, or by an admin
+      enrollment: await enrollmentState(session),
+      approveUrl: new URL('/approve', getRequestOrigin(request)).toString(),
     }
   })
 
@@ -782,10 +811,10 @@ export const app = new Spiceflow({ tracer })
     // User must be logged in to approve device codes
     const session = await getSession(request)
     if (!session) return Response.redirect(new URL('/login', request.url).toString(), 302)
-    const url = new URL(request.url)
-    const userCode = url.searchParams.get('user_code') ?? ''
+    // The code is typed, never taken from the link (like /approve): a link
+    // someone sends you then approves nothing
     const { DeviceFlow } = await import('sigillo-app/src/components/device-flow')
-    return <ContentFrame><DeviceFlow initialCode={userCode} /></ContentFrame>
+    return <ContentFrame><DeviceFlow /></ContentFrame>
   })
 
   // ── Sign out ────────────────────────────────────────────────────

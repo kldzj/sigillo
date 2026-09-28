@@ -111,7 +111,7 @@ npx @kldzj/sigillo self-host
 
 **2. Add your secrets** in your instance's web UI. Create a project, add environments, and paste in your secrets.
 
-**3. Login from the terminal** (opens a browser for device flow authentication):
+**3. Login from the terminal** (opens a browser for device flow authentication: type the code the terminal shows, then approve; once you have a passkey, approving takes it):
 
 ```bash
 sigillo login --api-url https://sigillo.<your-subdomain>.workers.dev

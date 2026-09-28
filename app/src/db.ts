@@ -13,7 +13,7 @@ import { getDb, schema } from 'db'
 import { betterAuth } from 'better-auth/minimal'
 import { genericOAuth, deviceAuthorization, bearer } from 'better-auth/plugins'
 import { passkey } from '@better-auth/passkey'
-import { canAddPasskey, logPasskeyEvent } from './step-up.ts'
+import { canAddPasskey, logPasskeyEvent, useUpEnrollment } from './step-up.ts'
 import { APIError, createAuthMiddleware } from 'better-auth/api'
 import { makeSignature } from 'better-auth/crypto'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
@@ -281,6 +281,9 @@ export async function getAuth(request: Request) {
               request: ctx.request ?? null, userId: added.userId, actor: `user:${added.userId}`, action: 'added',
               passkeyName: typeof added.name === 'string' ? added.name : null,
             })
+            // An approval to add a passkey adds one
+            const sessionId = ctx.context.session?.session.id
+            if (sessionId) await useUpEnrollment({ userId: added.userId, sessionId })
           }
           return
         }

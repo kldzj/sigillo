@@ -52,7 +52,7 @@ Shows current user and organizations. If it errors with "not logged in" or "no S
 
 If a command fails with `not signed in, or the session expired: run sigillo login`, the saved login no longer works (it expired, was ended, or predates signed sessions): run `sigillo login --api-url <instance>` again. An API token that fails with `API token expired` needs a new one from the project's **Tokens** tab.
 
-**2. Login (opens browser device flow):**
+**2. Login (opens browser device flow):** the user types the code the command prints on the page that opens, and approves, with their passkey once they have one. Show them the code; never approve it yourself.
 
 ```bash
 sigillo login --api-url https://<instance>

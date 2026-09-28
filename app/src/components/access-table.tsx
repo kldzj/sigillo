@@ -5,7 +5,7 @@
 
 import { useState } from "react"
 import { TrashIcon, PencilIcon } from "lucide-react"
-import { removeOrgMemberAction, updateOrgMemberRoleAction, updateMemberAccessAction, removeMemberPasskeysAction } from "sigillo-app/src/actions"
+import { removeOrgMemberAction, updateOrgMemberRoleAction, updateMemberAccessAction, removeMemberPasskeysAction, approveEnrollmentAction, declineEnrollmentAction } from "sigillo-app/src/actions"
 import { withStepUp } from "./step-up.ts"
 import { InviteButton } from "sigillo-app/src/components/invite-dialog"
 import { Button } from "sigillo-app/src/components/ui/button"
@@ -14,7 +14,7 @@ import { NativeSelect } from "sigillo-app/src/components/ui/native-select"
 import { Spinner } from "sigillo-app/src/components/ui/spinner"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "sigillo-app/src/components/ui/dialog"
 import { useLoaderData } from "spiceflow/react"
-import { formatIp } from "sigillo-app/src/lib/utils"
+import { formatIp, describeUserAgent } from "sigillo-app/src/lib/utils"
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
@@ -235,6 +235,7 @@ export function AccessTable() {
         </Table>
       </Frame>
 
+      {canManage ? <PasskeyRequests /> : null}
       {canManage ? <PasskeyChanges /> : null}
 
       <ManageAccessDialog
@@ -243,6 +244,70 @@ export function AccessTable() {
         open={!!editingMember}
         onClose={() => setEditingMemberId(null)}
       />
+    </div>
+  )
+}
+
+// ── Passkey requests ──────────────────────────────────────────────────
+// Members asking for their first passkey, once the organization has an admin
+// with one: an admin approves it with their own passkey, never their own
+
+function PasskeyRequests() {
+  const { passkeyRequests } = useLoaderData('/dash/projects/:projectId/access')
+  const [error, setError] = useState<string | null>(null)
+  if (passkeyRequests.length === 0) return null
+  const answer = async (requestId: string, approve: boolean) => {
+    setError(null)
+    try {
+      await withStepUp(() => (approve ? approveEnrollmentAction : declineEnrollmentAction)({ requestId }))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to answer the request")
+    }
+  }
+  return (
+    <div className="flex flex-col gap-2 mt-4">
+      <h2 className="text-sm font-semibold">Passkey requests</h2>
+      <p className="text-sm text-muted-foreground">
+        Approve only a request you know the member just made, from the device shown. The passkey can approve access to protected environments.
+      </p>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      <Frame className="w-full overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="w-32">Asked</TableHead>
+              <TableHead>Member</TableHead>
+              <TableHead>Device</TableHead>
+              <TableHead className="w-40">IP address</TableHead>
+              <TableHead className="w-40" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {passkeyRequests.map((row) => (
+              <TableRow key={row.id}>
+                <TableCell><TimeAgo ts={row.createdAt} className="text-muted-foreground text-xs tabular-nums" /></TableCell>
+                <TableCell className="text-sm">{row.member}</TableCell>
+                <TableCell className="text-sm">{describeUserAgent(row.userAgent)}</TableCell>
+                <TableCell>
+                  <code className="block truncate text-xs text-muted-foreground mono-sm" title={row.ipAddress ?? undefined}>
+                    {formatIp(row.ipAddress) ?? "—"}{row.country ? ` (${row.country})` : ""}
+                  </code>
+                </TableCell>
+                <TableCell className="text-right">
+                  {row.isYou ? (
+                    <span className="text-xs text-muted-foreground">Another admin approves yours</span>
+                  ) : (
+                    <span className="flex gap-3 justify-end">
+                      <button className="text-xs text-muted-foreground hover:text-destructive cursor-pointer" onClick={() => void answer(row.id, false)}>Decline</button>
+                      <button className="text-xs font-medium hover:underline cursor-pointer" onClick={() => void answer(row.id, true)}>Approve</button>
+                    </span>
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </Frame>
     </div>
   )
 }

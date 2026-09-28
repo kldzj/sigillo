@@ -88,6 +88,13 @@ export function formatIp(ip: string | null): string | null {
   return `${groups.slice(0, best.start).join(':')}::${groups.slice(best.start + best.length).join(':')}`
 }
 
+// A login or approval code as XXXX-XXXX, however it was typed or pasted:
+// better-auth's device codes have no dash, approval codes have one.
+export function formatUserCode(code: string): string {
+  const letters = code.replace(/[^a-z0-9]/gi, '').toUpperCase()
+  return letters.length > 4 ? `${letters.slice(0, 4)}-${letters.slice(4)}` : letters
+}
+
 export function describeUserAgent(userAgent: string | null): string {
   if (!userAgent) return 'Unknown device'
   const cli = /^sigillo-cli\/(\S+)/.exec(userAgent)

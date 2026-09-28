@@ -36,6 +36,7 @@ import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSec
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
   requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireProtectedAccess, resetMemberPasskeys, type Purpose,
+  requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
 } from './step-up.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 
@@ -220,6 +221,37 @@ export async function removeMemberPasskeysAction({ memberId }: { memberId: strin
     const member = await db.query.orgMember.findFirst({ where: { id: memberId }, columns: { orgId: true, userId: true } })
     if (!member) throw new Error('Member not found')
     await resetMemberPasskeys({ request: getActionRequest(), actor: session, userId: member.userId })
+    return { ok: true }
+  })
+}
+
+// Adding a passkey that someone approves first: on another device of yours
+// with a code, or, for a first passkey, by an admin
+export async function requestEnrollmentAction({ viaCode }: { viaCode: boolean }) {
+  const session = await requireSession()
+  const request = getActionRequest()
+  const row = await requestEnrollment({ request, ...session, viaCode })
+  return { requestId: row.id, userCode: row.userCode, expiresAt: row.expiresAt }
+}
+
+export async function enrollmentStatusAction({ requestId }: { requestId: string }) {
+  const session = await requireSession()
+  return { status: await stepUpRequestStatus({ requestId, sessionId: session.sessionId }) }
+}
+
+// An admin answers a member's request for their first passkey
+export async function approveEnrollmentAction({ requestId }: { requestId: string }) {
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    await approveEnrollment({ requestId, approver: session })
+    return { ok: true }
+  })
+}
+
+export async function declineEnrollmentAction({ requestId }: { requestId: string }) {
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    await declineEnrollment({ requestId, approver: session })
     return { ok: true }
   })
 }
@@ -534,6 +566,8 @@ async function createToken({ name, projectId, environmentIds, expiresInDays, pro
   await requireTokenScopeAccess({ userId: session.userId, projectId, environmentIds: uniqueEnvIds })
   const db = getDb()
 
+  // A token outlives the session that makes it
+  await requirePasskeyOnceEnrolled({ userId: session.userId, sessionId: session.sessionId })
   if (protectedAccess) {
     await requireMachineTokenApproval({ userId: session.userId, sessionId: session.sessionId, projectId, expiresInDays })
   }

@@ -75,8 +75,9 @@ export const stepUpRequest = sqliteCore.sqliteTable('step_up_request', {
   userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   // The session that asked, and that gets the grant
   sessionId: sqliteCore.text('session_id').notNull().references(() => session.id, { onDelete: 'cascade' }),
-  // access: reading and changing environmentIds; admin: admin actions and managing passkeys
-  purpose: sqliteCore.text('purpose', { enum: ['access', 'admin'] }).notNull(),
+  // access: reading and changing environmentIds; admin: admin actions and managing
+  // passkeys; enroll: adding one passkey, approved on another device or by an admin
+  purpose: sqliteCore.text('purpose', { enum: ['access', 'admin', 'enroll'] }).notNull(),
   environmentIds: sqliteCore.text('environment_ids', { mode: 'json' }).$type<string[]>().notNull(),
   // Typed on /approve for a CLI request, never part of a link; null when the browser asks for itself
   userCode: sqliteCore.text('user_code'),
@@ -98,7 +99,7 @@ export const stepUpGrant = sqliteCore.sqliteTable('step_up_grant', {
   userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   // Ends with the session it was approved for
   sessionId: sqliteCore.text('session_id').notNull().references(() => session.id, { onDelete: 'cascade' }),
-  purpose: sqliteCore.text('purpose', { enum: ['access', 'admin'] }).notNull(),
+  purpose: sqliteCore.text('purpose', { enum: ['access', 'admin', 'enroll'] }).notNull(),
   environmentIds: sqliteCore.text('environment_ids', { mode: 'json' }).$type<string[]>().notNull(),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
   expiresAt: epochMs('expires_at').notNull(),

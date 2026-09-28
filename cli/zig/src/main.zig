@@ -406,6 +406,13 @@ const AuditVerify = zeke.cmd("audit verify", "Check an env's secret changes and 
 // tarballs) still discover the command and get pointed at npx.
 const SelfHost = zeke.cmd("self-host", "Deploy Sigillo to your own Cloudflare account (npm package only)");
 
+// The login code as XXXX-XXXX, the way the website and approval codes show
+// it: better-auth sends it without the dash, and takes it either way
+fn formatUserCode(allocator: std.mem.Allocator, code: []const u8) ![]const u8 {
+    if (code.len != 8 or std.mem.indexOfScalar(u8, code, '-') != null) return code;
+    return std.fmt.allocPrint(allocator, "{s}-{s}", .{ code[0..4], code[4..] });
+}
+
 fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void {
     const stderr = getStderr();
     const stdout = getStdout();
@@ -470,23 +477,22 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
         try stderr.print(": device code response missing user_code\n", .{});
         std.process.exit(1);
     };
-    const verification_uri = client.jsonString(allocator, code_res.body, "verification_uri_complete") orelse blk: {
-        const fallback = client.jsonString(allocator, code_res.body, "verification_uri") orelse {
-            try color.err(stderr, "error");
-            try stderr.print(": device code response missing verification URI\n", .{});
-            std.process.exit(1);
-        };
-        break :blk fallback;
+    // The page without the code: it's typed there, so a link someone sends
+    // you approves nothing
+    const verification_uri = client.jsonString(allocator, code_res.body, "verification_uri") orelse {
+        try color.err(stderr, "error");
+        try stderr.print(": device code response missing verification URI\n", .{});
+        std.process.exit(1);
     };
     const interval_seconds = client.jsonInt(allocator, code_res.body, "interval") orelse 5;
 
     try stdout.writeAll("\n");
-    try color.bold(stdout, "Open this URL in your browser:\n");
+    try color.bold(stdout, "Open this URL in your browser and enter the code:\n");
     try stdout.writeAll("  ");
     try color.cyan(stdout, verification_uri);
     try stdout.writeAll("\n\n");
     try color.blue(stdout, "Code: ");
-    try color.bold(stdout, user_code);
+    try color.bold(stdout, try formatUserCode(allocator, user_code));
     try stdout.writeAll("\n\n");
     try color.dim(stdout, "Waiting for approval...");
 
@@ -2734,6 +2740,15 @@ fn isSupportedShell(shell_path: []const u8) bool {
         if (std.mem.endsWith(u8, shell_path, suffix)) return true;
     }
     return false;
+}
+
+test "formatUserCode writes a login code as XXXX-XXXX" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectEqualStrings("ABCD-EFGH", try formatUserCode(allocator, "ABCDEFGH"));
+    try std.testing.expectEqualStrings("ABCD-EFGH", try formatUserCode(allocator, "ABCD-EFGH"));
+    try std.testing.expectEqualStrings("ABCDEFGHJK", try formatUserCode(allocator, "ABCDEFGHJK"));
 }
 
 test "high entropy strings are treated as likely secrets" {

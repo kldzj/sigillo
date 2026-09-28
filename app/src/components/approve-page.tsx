@@ -11,7 +11,7 @@ import { z } from "zod";
 import { parseFormData } from "spiceflow";
 import { startAuthentication } from "@simplewebauthn/browser";
 import { Button } from "sigillo-app/src/components/ui/button";
-import { Input } from "sigillo-app/src/components/ui/input";
+import { CodeInput } from "./code-input.tsx";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
 import { describeUserAgent, formatIp } from "sigillo-app/src/lib/utils";
 import { findApprovalAction, approvalOptionsAction, finishStepUpAction } from "../actions.ts";
@@ -33,7 +33,9 @@ export function ApprovePage() {
         <div className="text-center max-w-sm">
           <h1 className="text-2xl font-bold mb-2">Approved</h1>
           <p className="text-muted-foreground">
-            The CLI can read and change these environments for the next 15 minutes. You can close this page.
+            {request?.purpose === "enroll"
+              ? "That device can add its passkey now, within the next 15 minutes. You can close this page."
+              : "The CLI can read and change these environments for the next 15 minutes. You can close this page."}
           </p>
         </div>
       </div>
@@ -61,14 +63,21 @@ export function ApprovePage() {
     return (
       <div className="flex justify-center items-center min-h-[60vh]">
         <div className="max-w-md w-full flex flex-col gap-4">
-          <h1 className="text-2xl font-bold text-center">Approve access?</h1>
+          <h1 className="text-2xl font-bold text-center">{request.purpose === "enroll" ? "Approve a new passkey?" : "Approve access?"}</h1>
           <div className="rounded-lg border border-border p-4 text-sm flex flex-col gap-2">
-            <div>
-              <span className="text-muted-foreground">Environments: </span>
-              <span className="font-medium">
-                {request.environments.map((env) => `${env.project} / ${env.name}`).join(", ")}
-              </span>
-            </div>
+            {request.purpose === "enroll" ? (
+              <div>
+                <span className="text-muted-foreground">Adds a passkey for your account on the device below. </span>
+                <span className="font-medium">It can then approve access to protected environments.</span>
+              </div>
+            ) : (
+              <div>
+                <span className="text-muted-foreground">Environments: </span>
+                <span className="font-medium">
+                  {request.environments.map((env) => `${env.project} / ${env.name}`).join(", ")}
+                </span>
+              </div>
+            )}
             <div>
               <span className="text-muted-foreground">From: </span>
               {describeUserAgent(request.userAgent)}
@@ -81,7 +90,9 @@ export function ApprovePage() {
             </div>
           </div>
           <p className="text-sm text-muted-foreground text-center">
-            Approve only if <strong>you</strong> just ran the command asking for this, and the code matches the one in your own terminal.
+            {request.purpose === "enroll"
+              ? <>Approve only if <strong>you</strong> are adding a passkey on that device right now, and the code matches the one it shows.</>
+              : <>Approve only if <strong>you</strong> just ran the command asking for this, and the code matches the one in your own terminal.</>}
           </p>
           {error && <p className="text-sm text-destructive text-center">{error}</p>}
           <div className="flex gap-3 justify-center">
@@ -113,7 +124,7 @@ export function ApprovePage() {
         <p className="text-sm text-muted-foreground">
           Enter the code your terminal shows to approve access to a protected environment.
         </p>
-        <Input name={codeFields.userCode} placeholder="XXXX-XXXX" autoComplete="off" autoFocus className="text-center mono-sm tracking-[0.25em] uppercase" />
+        <CodeInput name={codeFields.userCode} placeholder="XXXX-XXXX" autoFocus />
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Button type="submit" loading={pending} disabled={pending}>Continue</Button>
       </form>

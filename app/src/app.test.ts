@@ -20,9 +20,9 @@ import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
-import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys } from './step-up.js'
+import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
-import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp } from './lib/utils.js'
+import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
 
@@ -2196,6 +2196,20 @@ describe('formatIp', () => {
   })
 })
 
+describe('formatUserCode', () => {
+  test('writes a code as XXXX-XXXX however it was typed, also partly typed', () => {
+    expect(['abcdefgh', 'ABCD-EFGH', ' bcdf ghjk ', 'BCDFGHJ', 'ABCD-', 'AB', ''].map(formatUserCode)).toEqual([
+      'ABCD-EFGH',
+      'ABCD-EFGH',
+      'BCDF-GHJK',
+      'BCDF-GHJ',
+      'ABCD',
+      'AB',
+      '',
+    ])
+  })
+})
+
 describe('describeUserAgent', () => {
   test('names the CLI, a browser and its OS, or else the client itself', () => {
     expect([
@@ -2677,7 +2691,8 @@ describe('step-up', () => {
     const statusOf = async (token: string) => { const res = await call(token, `/api/v0/step-up/${request.id}`); return res.status === 200 ? (await res.json() as { status: string }).status : res.status }
     const stranger = await createTestUser()
     const beforeApproval = { status: await statusOf(cli), read: (await call(cli, reads(protectedEnv)[1]!)).status }
-    const found = await findStepUpRequest({ userId: admin.user.id, userCode: request.userCode.toLowerCase() })
+    // Typed without the dash and in lowercase
+    const found = await findStepUpRequest({ userId: admin.user.id, userCode: request.userCode.replace('-', '').toLowerCase() })
     const options = await approvalOptions({ request: new Request(origin), requestId: request.id, userId: admin.user.id })
     const approved = await approveStepUpRequest({ request: new Request(origin), requestId: request.id, userId: admin.user.id, response: await authenticator.authenticate(options) })
     expect({
@@ -3002,7 +3017,7 @@ describe('protected writes and admin actions', () => {
 
   test('every action that can need a passkey answers { stepUp } instead of failing', () => {
     const source = (import.meta.glob('./actions.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>)['./actions.ts']!
-    const gate = /\b(requireOrgAdmin|requireProtectedAccess|requireAdminApproval|requireMachineTokenApproval|appendSecretEvents|recordSecretRead|readSecretValues|readEventValue|setEnvironmentProtection)\(/
+    const gate = /\b(requireOrgAdmin|requireProtectedAccess|requireAdminApproval|requireMachineTokenApproval|appendSecretEvents|recordSecretRead|readSecretValues|readEventValue|setEnvironmentProtection|resetMemberPasskeys|approveEnrollment|declineEnrollment|requirePasskeyOnceEnrolled)\(/
     const functions = source.split(/\n(?=(?:export )?async function )/)
     const nameOf = (fn: string) => fn.match(/async function (\w+)/)?.[1] ?? ''
     const gatedHelpers = functions.filter((fn) => fn.startsWith('async function') && gate.test(fn)).map(nameOf)
@@ -3133,6 +3148,103 @@ describe('passkey enrollment', () => {
     const location = async (path: string) => new URL((await app.handle(new Request(`${origin}${path}`))).headers.get('location')!).searchParams.get('post_logout_redirect_uri')
     expect({ sessions: await location('/logout?redirect=/dash/sessions'), elsewhere: await location('/logout?redirect=https://evil.example'), none: await location('/logout') })
       .toEqual({ sessions: `${origin}/login?redirect=%2Fdash%2Fsessions`, elsewhere: `${origin}/login?redirect=%2Fdash`, none: `${origin}/login` })
+  })
+
+  // A login as the Passkeys page sees it
+  const loginOf = async (token: string) => {
+    const row = (await getDb().query.session.findFirst({ where: { token: token.split('.')[0]! } }))!
+    return { userId: row.userId, sessionId: row.id, signedIn: row.signedIn, sessionCreatedAt: row.createdAt }
+  }
+
+  test('once an admin has a passkey, a member\'s first passkey needs an admin\'s approval', async () => {
+    const admin = await createTestUser({ name: 'Enroll Admin' })
+    const member = await createTestUser({ name: 'Enroll Member' })
+    const outsider = await createTestUser({ name: 'Other Org Admin' })
+    const af = authedFetch(admin.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Enroll Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Enroll', orgId } })).id
+    const prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+    await setEnvironmentProtection({ request: new Request(origin), environmentId: prod, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    // The first admin enrolls with a fresh sign-in alone
+    const firstAdminPasskey = await register(admin.token)
+    await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    // An admin of an organization of their own, which the member also joined
+    const outsiderOrg = assertOk(await authedFetch(outsider.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Outsider Org' } })).id
+    await getDb().insert(schema.orgMember).values({ orgId: outsiderOrg, userId: member.user.id, role: 'member' })
+    const approverOrgs = await passkeyApproverOrgs(member.user.id)
+    const withoutApproval = await register(member.token)
+    const asked = await requestEnrollment({ request: new Request(origin), ...await loginOf(member.token), viaCode: false })
+    const approve = async (who: typeof admin) => {
+      const sessionId = await sessionIdOf(who.token)
+      return outcomeOf(() => approveEnrollment({ requestId: asked.id, approver: { userId: who.user.id, sessionId } }))
+    }
+    const bySelf = await approve(member)
+    const byOutsider = await approve(outsider)
+    const withoutPasskeyApproval = await approve(admin)
+    await grantAdmin(admin.token)
+    const approved = await approve(admin)
+    const afterApproval = await register(member.token)
+    const usedUp = await register(member.token)
+    expect({ firstAdminPasskey, approverOrgs, withoutApproval, bySelf, byOutsider, withoutPasskeyApproval, approved, afterApproval, usedUp }).toEqual({
+      firstAdminPasskey: 200,
+      approverOrgs: [orgId],
+      withoutApproval: 403,
+      bySelf: 'Another admin approves your own first passkey',
+      byOutsider: 'An admin of each of their organizations with protected environments approves it',
+      withoutPasskeyApproval: 'step-up:admin',
+      approved: 'ok',
+      afterApproval: 200,
+      usedUp: 403,
+    })
+  })
+
+  test('a passkey on another device is approved on /approve with a code, from a fresh sign-in only', async () => {
+    const user = await createTestUser()
+    const laptop = await createSoftAuthenticator({ rpID: 'e.ly', origin })
+    // The first passkey, from the laptop's fresh sign-in
+    const optionsRes = await send('/api/auth/passkey/generate-register-options', { token: user.token })
+    const cookie = optionsRes.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ')
+    expect((await send('/api/auth/passkey/verify-registration', { token: user.token, cookie, body: { response: await laptop.register(await optionsRes.json() as { challenge: string }) } })).status).toBe(200)
+    // The phone signs in
+    const auth = await getTestAuth()
+    const signIn = await auth.api.signInEmail({ body: { email: user.user.email, password: 'test-password-123' } })
+    const phone = `${signIn.token}.${await makeSignature(signIn.token, (await auth.$context).secret)}`
+    const withoutApproval = await register(phone)
+    const asked = await requestEnrollment({ request: new Request(origin), ...await loginOf(phone), viaCode: true })
+    // On the laptop: the code typed on /approve, and its passkey
+    const found = await findStepUpRequest({ userId: user.user.id, userCode: asked.userCode!.toLowerCase() })
+    const options = await approvalOptions({ request: new Request(origin), requestId: asked.id, userId: user.user.id })
+    const approved = await approveStepUpRequest({ request: new Request(origin), requestId: asked.id, userId: user.user.id, response: await laptop.authenticate(options) })
+    const afterApproval = await register(phone)
+    const usedUp = await register(phone)
+    // An old login can't even ask
+    await getDb().update(schema.session).set({ createdAt: Date.now() - 10 * 60 * 1000 }).where(orm.eq(schema.session.id, await sessionIdOf(phone)))
+    const oldLogin = await outcomeOf(async () => requestEnrollment({ request: new Request(origin), ...await loginOf(phone), viaCode: true }))
+    expect({ withoutApproval, purpose: found?.purpose, approved, afterApproval, usedUp, oldLogin }).toEqual({
+      withoutApproval: 403, purpose: 'enroll', approved: true, afterApproval: 200, usedUp: 403,
+      oldLogin: 'Sign in again first: asking to add a passkey takes a sign-in from the last 5 minutes',
+    })
+  })
+
+  test('approving a CLI login, or making a token, takes your passkey once you have one', async () => {
+    const user = await createTestUser()
+    const sessionId = await sessionIdOf(user.token)
+    const approveLogin = async () => {
+      const code = await (await send('/api/auth/device/code', { body: { client_id: 'sigillo-cli' } })).json() as { user_code: string }
+      await send(`/api/auth/device?user_code=${code.user_code}`, { token: user.token })
+      const res = await send('/api/auth/device/approve', { token: user.token, body: { userCode: code.user_code } })
+      return res.status === 403 ? (await res.json() as { code: string }).code : res.status
+    }
+    const token = () => outcomeOf(() => requirePasskeyOnceEnrolled({ userId: user.user.id, sessionId }))
+    const before = { login: await approveLogin(), token: await token() }
+    expect(await register(user.token)).toBe(200)
+    const withPasskey = { login: await approveLogin(), token: await token() }
+    await grantAdmin(user.token)
+    expect({ before, withPasskey, approved: { login: await approveLogin(), token: await token() } }).toEqual({
+      before: { login: 200, token: 'ok' },
+      withPasskey: { login: 'PASSKEY_APPROVAL_REQUIRED', token: 'step-up:admin' },
+      approved: { login: 200, token: 'ok' },
+    })
   })
 
   test('signing in from /approve comes back to it', async () => {
