@@ -2,6 +2,40 @@
 
 <!-- https://github.com/remorses/sigillo/releases -->
 
+## 0.14.0
+
+1. **Git worktrees pick up the right project and env**, including in monorepo subfolders.
+
+   - A worktree inherits the main checkout's setup **at the same relative path**. Before, `sigillo run` in `<worktree>/app` used the repo root setup and ignored the one saved for `<main>/app`.
+   - A setup saved inside a worktree always overrides the main checkout. Before, it could lose when the worktree path was shorter than the main checkout path.
+   - Interactive `sigillo setup` inside a worktree asks whether to save for the main checkout and all worktrees, or for this worktree only.
+   - When a worktree has no setup, the error shows the command to fix it and lists subfolders configured in the main checkout. `sigillo me` shows which checkout a worktree belongs to.
+
+2. **New `sigillo setup --scope <dir>`** saves the setup for another directory. From a worktree, pass the main checkout path so every worktree gets it:
+
+   ```bash
+   sigillo setup --scope ~/Documents/GitHub/repo --project proj_abc --env dev
+   ```
+
+3. **`self-host` can bind a separate encryption key** with `SIGILLO_ENCRYPTION_KEY` on the first deploy. The default (key derived from `BETTER_AUTH_SECRET`) is unchanged:
+
+   ```bash
+   SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx sigillo self-host
+   ```
+
+4. **`self-host` never adopts a database it cannot decrypt.** If a deploy would generate a new `BETTER_AUTH_SECRET` for a D1 database that already stores secrets (worker gone, no saved secret in `~/.sigillo/selfhost.json`), it now stops. Before, it deployed anyway and every stored secret became unreadable.
+
+5. **The saved token is never sent to another server.**
+
+   - If `SIGILLO_API_URL` or `--api-url` points to a server other than the one the token was saved for, the token is withheld with a warning. `--token` and `SIGILLO_TOKEN` still work as given.
+   - Authenticated requests no longer follow redirects. Point `--api-url` at the final URL, for example `https://`.
+
+6. **`run --mount` is safer.** The file is created owner-only (`0600`), never overwrites an existing file or follows a symlink, and is deleted even when sigillo gets `SIGTERM` or `SIGHUP`. These signals are now forwarded to the child instead of killing sigillo.
+
+7. **`sigillo environments rename` works with only `--name` or only `--slug`.** Before, the missing field was sent as `null` and the rename failed with `(422): unknown error`.
+
+Fixes https://github.com/remorses/sigillo/issues/18
+
 ## 0.13.0
 
 1. **New `npx sigillo self-host`** — deploy Sigillo to your own Cloudflare account with one command. No git clone, no build step, no wrangler config:
