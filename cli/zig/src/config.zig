@@ -70,8 +70,10 @@ pub fn readConfig(allocator: std.mem.Allocator) !ConfigFile {
             else => continue,
         };
 
+        // Keys saved before scopes were realpath'd (e.g. /tmp/x on macOS) are
+        // canonicalized here so resolve, setup and logout all see one key.
         var record: ScopeRecord = .{
-            .scope = entry.key_ptr.*,
+            .scope = try normalizeScope(allocator, entry.key_ptr.*),
             .entry = .{},
         };
 
@@ -91,10 +93,21 @@ pub fn readConfig(allocator: std.mem.Allocator) !ConfigFile {
             if (value == .string) record.entry.environment = value.string;
         }
 
-        try config.scopes.append(allocator, record);
+        try appendMerged(allocator, &config, record);
     }
 
     return config;
+}
+
+/// Append `record`, or merge it into an existing record with the same key.
+/// Later records win, matching setScope which appends new keys at the end.
+fn appendMerged(allocator: std.mem.Allocator, config: *ConfigFile, record: ScopeRecord) !void {
+    for (config.scopes.items) |*existing| {
+        if (!std.mem.eql(u8, existing.scope, record.scope)) continue;
+        try mergeEntry(allocator, &existing.entry, record.entry);
+        return;
+    }
+    try config.scopes.append(allocator, record);
 }
 
 pub fn writeConfig(allocator: std.mem.Allocator, config: *const ConfigFile) !void {
@@ -419,17 +432,18 @@ pub const ChildScope = struct {
     entry: ScopedEntry,
 };
 
-/// Configured scopes with a project strictly below `parent_dir`. Inside a
-/// linked worktree, subfolders set up in the main checkout are included too;
-/// a worktree's own scope wins over the main checkout's for the same subfolder.
+/// Subfolders below `parent_dir` with a project configured, each shown with the
+/// project and env that `resolve` would actually use there. Inside a linked
+/// worktree, subfolders set up in the main checkout are included too.
 pub fn findChildScopes(allocator: std.mem.Allocator, parent_dir: []const u8) ![]const ChildScope {
     const cfg = try readConfig(allocator);
     const parent = try normalizeScope(allocator, parent_dir);
+    const worktree = findGitWorktree(allocator, parent);
 
     var results = std.ArrayListUnmanaged(ChildScope).empty;
-    try appendChildScopes(allocator, &results, &cfg, parent);
-    if (findGitWorktree(allocator, parent)) |wt| {
-        try appendChildScopes(allocator, &results, &cfg, try wt.toMain(allocator, parent));
+    try appendChildScopes(allocator, &results, &cfg, parent, parent, worktree);
+    if (worktree) |wt| {
+        try appendChildScopes(allocator, &results, &cfg, try wt.toMain(allocator, parent), parent, worktree);
     }
     return results.items;
 }
@@ -438,17 +452,25 @@ fn appendChildScopes(
     allocator: std.mem.Allocator,
     results: *std.ArrayListUnmanaged(ChildScope),
     cfg: *const ConfigFile,
+    search_root: []const u8,
     parent: []const u8,
+    worktree: ?GitWorktree,
 ) !void {
     outer: for (cfg.scopes.items) |record| {
         if (record.entry.project == null) continue;
-        const relative = relativeTo(record.scope, parent) orelse continue;
+        const relative = relativeTo(record.scope, search_root) orelse continue;
         const trimmed = std.mem.trimLeft(u8, relative, std.fs.path.sep_str);
         if (trimmed.len == 0) continue;
         for (results.items) |existing| {
             if (std.mem.eql(u8, existing.relative_path, trimmed)) continue :outer;
         }
-        try results.append(allocator, .{ .relative_path = trimmed, .entry = record.entry });
+        var scoped: ScopeResolution = .{};
+        scoped.apply(cfg, try std.fs.path.join(allocator, &.{ parent, trimmed }), worktree);
+        try results.append(allocator, .{ .relative_path = trimmed, .entry = .{
+            .project = scoped.result.project,
+            .project_name = scoped.result.project_name,
+            .environment = scoped.result.environment,
+        } });
     }
 }
 
@@ -482,6 +504,13 @@ pub fn findGitWorktree(allocator: std.mem.Allocator, dir: []const u8) ?GitWorktr
         const marker = std.fs.path.sep_str ++ ".git" ++ std.fs.path.sep_str ++ "worktrees" ++ std.fs.path.sep_str;
         // Anything else (e.g. a submodule's .git/modules/<name>) is not a worktree.
         const idx = std.mem.indexOf(u8, gitdir, marker) orelse return null;
+        // Git links back from `<gitdir>/gitdir` to this `.git` file. Require it,
+        // so a hand-written `.git` file cannot borrow another repo's setup.
+        const back_link_path = std.fs.path.join(allocator, &.{ gitdir, "gitdir" }) catch return null;
+        const back_link = std.fs.cwd().readFileAlloc(allocator, back_link_path, 4096) catch return null;
+        const linked = std.fs.path.resolve(allocator, &.{ gitdir, std.mem.trim(u8, back_link, " \t\r\n") }) catch return null;
+        if (!samePath(allocator, linked, dot_git_path)) return null;
+
         const main_root = gitdir[0..idx];
         return .{
             .root = current,
@@ -490,12 +519,17 @@ pub fn findGitWorktree(allocator: std.mem.Allocator, dir: []const u8) ?GitWorktr
     }
 }
 
+fn samePath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) bool {
+    const real_a = std.fs.cwd().realpathAlloc(allocator, a) catch return false;
+    const real_b = std.fs.cwd().realpathAlloc(allocator, b) catch return false;
+    return std.mem.eql(u8, real_a, real_b);
+}
+
 fn mergeEntry(allocator: std.mem.Allocator, destination: *ScopedEntry, updates: ScopedEntry) !void {
-    if (updates.token) |value| {
-        destination.token = try allocator.dupe(u8, value);
-    }
-    if (updates.api_url) |value| {
-        destination.api_url = try allocator.dupe(u8, value);
+    // token and api_url move together: a saved token is bound to its api url.
+    if (updates.token != null or updates.api_url != null) {
+        destination.token = if (updates.token) |value| try allocator.dupe(u8, value) else null;
+        destination.api_url = if (updates.api_url) |value| try allocator.dupe(u8, value) else null;
     }
     if (updates.project) |value| {
         destination.project = try allocator.dupe(u8, value);
@@ -591,11 +625,23 @@ test "findGitWorktree parses absolute and relative gitdir from a subfolder" {
     // Git writes relative paths when worktree.useRelativePaths=true.
     try tmp_base.dir.writeFile(.{ .sub_path = "rel/.git", .data = "gitdir: ../main-repo/.git/worktrees/rel\n" });
 
+    // Without git's back link, a `.git` file is not trusted.
+    try std.testing.expect(findGitWorktree(allocator, try std.fs.path.join(allocator, &.{ tmp_path, "abs", "app" })) == null);
+
+    const abs_back = try std.fs.path.join(allocator, &.{ tmp_path, "abs", ".git" });
+    try tmp_base.dir.writeFile(.{ .sub_path = "main-repo/.git/worktrees/abs/gitdir", .data = try std.fmt.allocPrint(allocator, "{s}\n", .{abs_back}) });
+    try tmp_base.dir.writeFile(.{ .sub_path = "main-repo/.git/worktrees/rel/gitdir", .data = "../../../../rel/.git\n" });
+
     for ([_][]const u8{ "abs", "rel" }) |name| {
         const wt = findGitWorktree(allocator, try std.fs.path.join(allocator, &.{ tmp_path, name, "app" })).?;
         try std.testing.expectEqualStrings(try std.fs.path.join(allocator, &.{ tmp_path, name }), wt.root);
         try std.testing.expectEqualStrings(main_root, wt.main_root);
     }
+
+    // A forged `.git` pointing at a real worktree entry that links elsewhere.
+    try tmp_base.dir.makePath("forged");
+    try tmp_base.dir.writeFile(.{ .sub_path = "forged/.git", .data = try std.fmt.allocPrint(allocator, "gitdir: {s}\n", .{abs_gitdir}) });
+    try std.testing.expect(findGitWorktree(allocator, try std.fs.path.join(allocator, &.{ tmp_path, "forged" })) == null);
 }
 
 test "worktree resolution mirrors the main checkout at the same relative path" {
