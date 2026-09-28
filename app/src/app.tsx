@@ -509,7 +509,7 @@ export const app = new Spiceflow({ tracer })
       ? await Promise.all([
         db.query.passkey.findMany({ where: { userId: { in: userIds } }, columns: { userId: true } }),
         db.query.passkeyEvent.findMany({ where: { userId: { in: userIds } }, orderBy: { createdAt: 'desc' }, limit: 50 }),
-        pendingEnrollments(userIds),
+        pendingEnrollments({ userIds, orgId }),
       ])
       : [[], [], []]
     const nameOf = (userId: string) => members.find((member) => member.userId === userId)?.user?.name ?? 'Former member'
@@ -533,6 +533,8 @@ export const app = new Spiceflow({ tracer })
       ipAddress: row.ipAddress,
       country: row.country,
       createdAt: row.createdAt,
+      approvedHere: row.approvedHere,
+      waitingForOthers: row.waitingForOthers,
     }))
 
     return {
@@ -772,6 +774,8 @@ export const app = new Spiceflow({ tracer })
           .map((row) => row.environment?.name)
           .filter((name): name is string => Boolean(name)),
         createdBy: t.creator?.name ?? '—',
+        // Its creator or an admin deletes it
+        deletable: access?.role === 'admin' || t.createdBy === session.userId,
         createdAt: t.createdAt,
         expiresAt: t.expiresAt,
         lastUsedAt: t.lastUsedAt,
@@ -845,28 +849,17 @@ export const app = new Spiceflow({ tracer })
   // This is a full navigation (not authClient.signOut() in the browser)
   // because the second half has to be a cross-origin redirect the browser
   // follows, so the provider can set its own expired Set-Cookie.
+  // Another site's link or form doesn't sign anyone out unasked: it gets a
+  // page that asks first. Sigillo's own pages and a typed address go through.
   .get('/logout', async ({ request }) => {
-    const origin = getRequestOrigin(request)
-    // "Sign in again" comes back to the page it was on
-    const login = new URL('/login', origin)
-    const back = new URL(request.url).searchParams.get('redirect')
-    if (back) login.searchParams.set('redirect', safeRedirectPath(back))
-    const providerSignOut = new URL('/sign-out', env.PROVIDER_URL)
-    providerSignOut.searchParams.set('client_id', await ensureOAuthClient(request))
-    providerSignOut.searchParams.set('post_logout_redirect_uri', login.toString())
-
-    const res = new Response(null, { status: 302, headers: { Location: providerSignOut.toString() } })
-
-    // signOut throws when there is no session cookie, so only call it when a
-    // session actually resolved. Hitting /logout while already signed out is
-    // normal and must still forward to the provider.
-    if (await getSession(request)) {
-      const auth = await getAuth(request)
-      const { headers } = await auth.api.signOut({ headers: request.headers, returnHeaders: true })
-      for (const cookie of headers.getSetCookie()) res.headers.append('Set-Cookie', cookie)
-    }
-
-    return res
+    const site = request.headers.get('sec-fetch-site')
+    if (site && site !== 'same-origin' && site !== 'none') return confirmLogout(request)
+    return logout(request)
+  })
+  .post('/logout', async ({ request }) => {
+    const origin = request.headers.get('origin')
+    if (origin && origin !== new URL(request.url).origin) return confirmLogout(request)
+    return logout(request)
   })
 
   // ── Login page (standalone, no sidebar) ─────────────────────────
@@ -937,6 +930,53 @@ export const app = new Spiceflow({ tracer })
   .use(apiApp)
 
   .get('/', ({ request }) => Response.redirect(new URL('/dash', request.url).toString(), 302))
+
+// Signs out of the app, then of the login provider, which sends the browser
+// back to /login
+async function logout(request: Request) {
+  const origin = getRequestOrigin(request)
+  // "Sign in again" comes back to the page it was on
+  const login = new URL('/login', origin)
+  const back = new URL(request.url).searchParams.get('redirect')
+  if (back) login.searchParams.set('redirect', safeRedirectPath(back))
+  const providerSignOut = new URL('/sign-out', env.PROVIDER_URL)
+  providerSignOut.searchParams.set('client_id', await ensureOAuthClient(request))
+  providerSignOut.searchParams.set('post_logout_redirect_uri', login.toString())
+
+  const res = new Response(null, { status: 302, headers: { Location: providerSignOut.toString() } })
+
+  // signOut throws when there is no session cookie, so only call it when a
+  // session actually resolved. Hitting /logout while already signed out is
+  // normal and must still forward to the provider.
+  if (await getSession(request)) {
+    const auth = await getAuth(request)
+    const { headers } = await auth.api.signOut({ headers: request.headers, returnHeaders: true })
+    for (const cookie of headers.getSetCookie()) res.headers.append('Set-Cookie', cookie)
+  }
+
+  return res
+}
+
+function confirmLogout(request: Request) {
+  const back = new URL(request.url).searchParams.get('redirect')
+  const action = back ? `/logout?${new URLSearchParams({ redirect: safeRedirectPath(back) })}` : '/logout'
+  const escaped = action.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')
+  return new Response(`<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log out · Sigillo</title>
+<style>
+  body { margin: 0; min-height: 90vh; display: grid; place-items: center; font: 16px system-ui, sans-serif; color: #171717; background: #fdfcfb; }
+  @media (prefers-color-scheme: dark) { body { color: #f5f5f5; background: #0a0a0a; } }
+</style>
+<form method="post" action="${escaped}">
+  <p>Log out of Sigillo?</p>
+  <button type="submit">Log out</button> <a href="/dash">Cancel</a>
+</form>
+</html>
+`, { headers: { 'content-type': 'text/html; charset=utf-8' } })
+}
 
 /** Shared HTML shell for all pages (dash, login, device, invite).
  *  This replaces the old global layout('/*'). */

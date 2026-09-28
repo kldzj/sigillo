@@ -166,6 +166,15 @@ export function getSecretNameError(name: string): string | null {
   return `Invalid secret name "${name}". Use letters, digits and underscores, not starting with a digit.`
 }
 
+// An environment's slug ends up in URLs, a cookie, file names and the CLI's
+// -c flag: lowercase letters, digits and dashes
+export const ENV_SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,62}$/
+
+export function getEnvSlugError(slug: string): string | null {
+  if (ENV_SLUG_REGEX.test(slug)) return null
+  return `Invalid slug "${slug}". Use lowercase letters, digits and dashes, starting with a letter or digit, at most 63.`
+}
+
 // Names safe to emit as a line key in text formats. Looser than
 // SECRET_NAME_REGEX (dotenv key grammar) so legacy names like
 // "my-api-key" still download; anything else is dropped.

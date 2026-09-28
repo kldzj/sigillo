@@ -11,6 +11,8 @@
 // so ensureOAuthClient finds the pre-seeded oauth_domain row and returns
 // early without calling the provider.
 
+import { betterAuth } from 'better-auth'
+import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
@@ -20,7 +22,7 @@ import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
-import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition } from './step-up.js'
+import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode } from './lib/utils.js'
 
@@ -266,6 +268,27 @@ describe('projects CRUD', () => {
 // ── Environments CRUD ───────────────────────────────────────────────
 
 describe('environments CRUD', () => {
+  test('a slug is lowercase letters, digits and dashes', async () => {
+    const user = await createTestUser({ name: 'Slug User' })
+    const uf = authedFetch(user.token)
+    const orgId = assertOk(await uf('/api/v0/orgs', { method: 'POST', body: { name: 'Slug Org' } })).id
+    const projectId = assertOk(await uf('/api/v0/projects', { method: 'POST', body: { name: 'Slug Project', orgId } })).id
+    const create = (slug: string) => app.handle(new Request(`http://e.ly/api/v0/projects/${projectId}/environments`, {
+      method: 'POST', headers: { authorization: `Bearer ${user.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ name: slug, slug }),
+    })).then((res) => res.status)
+    const created = assertOk(await uf('/api/v0/projects/:projectId/environments', { method: 'POST', params: { projectId }, body: { name: 'Staging', slug: 'staging-2' } })).id
+    const rename = await app.handle(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${created}`, {
+      method: 'PATCH', headers: { authorization: `Bearer ${user.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ slug: 'Prod Old' }),
+    }))
+    expect({
+      refused: await Promise.all(['Prod', 'prod env', 'prod;x=1', '-prod', 'x'.repeat(64)].map(create)),
+      rename: [rename.status, await rename.json()],
+    }).toEqual({
+      refused: [400, 400, 400, 400, 400],
+      rename: [400, { error: 'Invalid slug "Prod Old". Use lowercase letters, digits and dashes, starting with a letter or digit, at most 63.' }],
+    })
+  })
+
   let af: ReturnType<typeof authedFetch>
   let projectId: string
 
@@ -619,6 +642,26 @@ describe('secrets — download formats', () => {
 // ── API tokens ──────────────────────────────────────────────────────
 
 describe('api tokens', () => {
+  test('only its creator or an org admin deletes a token', async () => {
+    const admin = await createTestUser({ name: 'Token Admin' })
+    const owner = await createTestUser({ name: 'Token Owner' })
+    const colleague = await createTestUser({ name: 'Token Colleague' })
+    const orgId = assertOk(await authedFetch(admin.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Token Org' } })).id
+    const tokenProject = assertOk(await authedFetch(admin.token)('/api/v0/projects', { method: 'POST', body: { name: 'Token Project', orgId } })).id
+    for (const user of [owner, colleague]) await getDb().insert(schema.orgMember).values({ orgId, userId: user.user.id, role: 'member' })
+    const token = { createdBy: owner.user.id, projectId: tokenProject }
+    const deletes = async (who: typeof admin) => {
+      try {
+        await requireTokenDeletion({ userId: who.user.id, sessionId: await sessionIdOf(who.token), token })
+        return 'ok'
+      } catch (error) {
+        return (error as Error).message
+      }
+    }
+    expect({ owner: await deletes(owner), colleague: await deletes(colleague), admin: await deletes(admin) })
+      .toEqual({ owner: 'ok', colleague: 'Only its creator or an org admin deletes a token', admin: 'ok' })
+  })
+
   test('a token acts with its creator\'s current access to its project', async () => {
     const admin = await createTestUser({ name: 'Scope Admin' })
     const member = await createTestUser({ name: 'Scope Member' })
@@ -2163,6 +2206,18 @@ describe('sign-in allowlist (ALLOWED_USERS)', () => {
 })
 
 describe('your sessions', () => {
+  test('a login ends 30 days after its sign-in, however often it is used', async () => {
+    const user = await createTestUser({ name: 'Old Login' })
+    const sessionId = await sessionIdOf(user.token)
+    const age = (days: number) => getDb().update(schema.session).set({ createdAt: Date.now() - days * 24 * 60 * 60 * 1000 }).where(orm.eq(schema.session.id, sessionId))
+    const me = async () => (await app.handle(new Request('http://e.ly/api/v0/me', { headers: { authorization: `Bearer ${user.token}` } }))).status
+    await age(29)
+    const at29 = await me()
+    await age(31)
+    const at31 = await me()
+    expect({ at29, at31, left: !!await getDb().query.session.findFirst({ where: { id: sessionId } }) }).toEqual({ at29: 200, at31: 401, left: false })
+  })
+
   const me = (headers: Record<string, string>) => app.handle(new Request('http://e.ly/api/v0/me', { headers }))
   const bearer = (token: string) => ({ authorization: `Bearer ${token}` })
   const as = (token: string) => new Request('http://e.ly/dash/sessions', { headers: bearer(token) })
@@ -2327,6 +2382,20 @@ describe('instance headers', () => {
 })
 
 describe('better-auth endpoints', () => {
+  test('rate limits are counted per IP in D1', async () => {
+    // The app's own rate limits are off in tests: their requests have no IP
+    const limited = betterAuth({
+      database: drizzleAdapter(getDb(), { provider: 'sqlite' }),
+      secret: 'test-secret-at-least-32-characters-long!!',
+      baseURL: 'http://e.ly',
+      advanced: { ipAddress: { ipAddressHeaders: ['cf-connecting-ip'] } },
+      rateLimit: { enabled: true, storage: 'database', customRules: { '/ok': { window: 60, max: 2 } } },
+    })
+    const ok = (ip: string) => limited.handler(new Request('http://e.ly/api/auth/ok', { headers: { 'cf-connecting-ip': ip } })).then((res) => res.status)
+    const statuses = [await ok('203.0.113.50'), await ok('203.0.113.50'), await ok('203.0.113.50'), await ok('203.0.113.51')]
+    expect(statuses).toEqual([200, 200, 429, 200])
+  })
+
   test('the ones the app never uses are off, so nobody renames themselves', async () => {
     const user = await createTestUser({ name: 'Real Name' })
     const post = (path: string, body: unknown) => app.handle(new Request(`http://e.ly/api/auth${path}`, {
@@ -3418,6 +3487,22 @@ describe('passkey enrollment', () => {
       .toEqual({ sessions: `${origin}/login?redirect=%2Fdash%2Fsessions`, elsewhere: `${origin}/login?redirect=%2Fdash`, none: `${origin}/login` })
   })
 
+  test('another site\'s link to /logout asks before signing out', async () => {
+    const user = await createTestUser({ name: 'Logout User' })
+    const signedIn = async () => !!await getDb().query.session.findFirst({ where: { token: user.token.split('.')[0]! } })
+    const visit = (site: string) => app.handle(new Request(`${origin}/logout?redirect=/dash/sessions`, { headers: { authorization: `Bearer ${user.token}`, 'sec-fetch-site': site } }))
+    const fromElsewhere = await visit('cross-site')
+    const page = await fromElsewhere.text()
+    const stillIn = await signedIn()
+    const fromSigillo = await visit('same-origin')
+    expect({
+      fromElsewhere: [fromElsewhere.status, page.includes('<form method="post" action="/logout?redirect=%2Fdash%2Fsessions">')],
+      stillIn,
+      fromSigillo: fromSigillo.status,
+      signedOut: !await signedIn(),
+    }).toEqual({ fromElsewhere: [200, true], stillIn: true, fromSigillo: 302, signedOut: true })
+  })
+
   // A login as the Passkeys page sees it
   const loginOf = async (token: string) => {
     const row = (await getDb().query.session.findFirst({ where: { token: token.split('.')[0]! } }))!
@@ -3458,7 +3543,7 @@ describe('passkey enrollment', () => {
       approverOrgs: [orgId],
       withoutApproval: 403,
       bySelf: 'Another admin approves your own first passkey',
-      byOutsider: 'An admin of each of their organizations with protected environments approves it',
+      byOutsider: 'An admin of one of their organizations with protected environments approves it',
       withoutPasskeyApproval: 'step-up:admin',
       approved: 'ok',
       afterApproval: 200,
@@ -3502,6 +3587,37 @@ describe('passkey enrollment', () => {
     expect(await canAddPasskey(aged)).toBe(true)
     // Two registrations reach the check at once
     expect((await Promise.all([claimPasskeyAddition(aged), claimPasskeyAddition(aged)])).sort()).toEqual([false, true])
+  })
+
+  test('a member of two organizations gets a first passkey once an admin of each has approved', async () => {
+    const guardedOrg = async (name: string) => {
+      const admin = await createTestUser({ name: `${name} Admin` })
+      const af = authedFetch(admin.token)
+      const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name } })).id
+      const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: `${name} Project`, orgId } })).id
+      const prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+      await setEnvironmentProtection({ request: new Request(origin), environmentId: prod, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+      expect(await register(admin.token)).toBe(200)
+      await grantAdmin(admin.token)
+      return { admin, orgId }
+    }
+    const first = await guardedOrg('First Guarded')
+    const second = await guardedOrg('Second Guarded')
+    const member = await createTestUser({ name: 'Two Org Member' })
+    for (const { orgId } of [first, second]) await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    const asked = await requestEnrollment({ request: new Request(origin), ...await loginOf(member.token), viaCode: false })
+    const approve = async (who: typeof first.admin) => approveEnrollment({ requestId: asked.id, approver: { userId: who.user.id, sessionId: await sessionIdOf(who.token) } })
+    const byFirst = await approve(first.admin)
+    const accessTab = (await pendingEnrollments({ userIds: [member.user.id], orgId: first.orgId })).map((row) => [row.approvedHere, row.waitingForOthers])
+    const beforeSecond = await register(member.token)
+    const bySecond = await approve(second.admin)
+    expect({ byFirst, accessTab, beforeSecond, bySecond, afterBoth: await register(member.token) }).toEqual({
+      byFirst: { waitingFor: 1 },
+      accessTab: [[true, 1]],
+      beforeSecond: 403,
+      bySecond: { waitingFor: 0 },
+      afterBoth: 200,
+    })
   })
 
   test('a passkey on another device is approved on /approve with a code, from a fresh sign-in only', async () => {

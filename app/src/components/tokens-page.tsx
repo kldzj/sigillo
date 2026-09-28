@@ -150,7 +150,7 @@ function TokensTable() {
                 )}
               </TableCell>
               <TableCell className="p-0">
-                <button
+                {token.deletable && <button
                   onClick={async () => {
                     if (confirm(`Delete token "${token.name}"? This cannot be undone.`)) {
                       try {
@@ -164,7 +164,7 @@ function TokensTable() {
                   title="Delete token"
                 >
                   <TrashIcon className="size-3.5" />
-                </button>
+                </button>}
               </TableCell>
             </TableRow>
           ))}

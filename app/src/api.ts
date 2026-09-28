@@ -40,7 +40,7 @@ import {
 import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
 import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected } from './step-up.ts'
 import { memoize } from './lib/memoize.ts'
-import { SECRET_NAME_REGEX, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
+import { SECRET_NAME_REGEX, getEnvSlugError, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
 
 // Latest GitHub release carrying a self-host bundle asset. Memoized via the
 // Cache API so the GitHub API is hit at most every few minutes.
@@ -703,6 +703,8 @@ export const apiApp = new Spiceflow()
     response: { 200: environmentMutationResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
     async handler({ request, params }) {
       const body = await request.json()
+      const slugError = getEnvSlugError(body.slug)
+      if (slugError) return json({ error: slugError }, { status: 400 })
       const session = await requireApiSession(request)
       const orgId = await getOrgIdForProject(params.projectId)
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
@@ -771,6 +773,8 @@ export const apiApp = new Spiceflow()
       if (!body.name && !body.slug) {
         return json({ error: 'at least one of name or slug required' }, { status: 400 })
       }
+      const slugError = body.slug ? getEnvSlugError(body.slug) : null
+      if (slugError) return json({ error: slugError }, { status: 400 })
       const session = await requireApiSession(request)
       const environment = await requireApiEnvironmentAccess({ userId: session.userId, environmentRef: params.id, projectId: params.projectId })
       await requireAdminForProtected({ ...session, environmentIds: [environment.id] })

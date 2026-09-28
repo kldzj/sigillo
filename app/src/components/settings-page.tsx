@@ -18,7 +18,7 @@ import {
   DialogDescription,
   DialogClose,
 } from 'sigillo-app/src/components/ui/dialog'
-import { deleteOrgAction, updateAutoJoinDomainAction } from '../actions.ts'
+import { deleteOrgAction, leaveOrgAction, updateAutoJoinDomainAction } from '../actions.ts'
 import { withStepUp } from './step-up.ts'
 import { COMMON_EMAIL_DOMAINS, getEmailDomain } from '../lib/utils.ts'
 
@@ -99,6 +99,16 @@ export function SettingsPage() {
     })
   }
 
+  const [leaveError, setLeaveError] = useState<string | null>(null)
+  function handleLeave() {
+    if (!confirm(`Leave ${orgName}? You lose access to its projects, and your API tokens for them stop working. Only an invitation brings you back.`)) return
+    setLeaveError(null)
+    startTransition(async () => {
+      const result = await leaveOrgAction({ orgId })
+      if (result?.error) setLeaveError(result.error)
+    })
+  }
+
   return (
     <div className="flex flex-col gap-8 w-full max-w-2xl">
       <div>
@@ -120,6 +130,17 @@ export function SettingsPage() {
             Deleting this organization is permanent. All projects, environments,
             secrets, tokens, and member access will be removed immediately.
           </p>
+        </div>
+        <div className="border-t border-destructive/40 px-5 py-4 flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium">Leave organization</p>
+            <p className="text-xs text-muted-foreground">
+              {leaveError ?? 'Only an invitation brings you back. The last admin can\'t leave.'}
+            </p>
+          </div>
+          <Button variant="outline" disabled={isPending} onClick={handleLeave}>
+            Leave organization
+          </Button>
         </div>
         <div className="border-t border-destructive/40 px-5 py-4 bg-destructive/5 rounded-b-lg flex items-center justify-between">
           <div>

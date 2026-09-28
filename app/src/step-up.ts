@@ -15,7 +15,7 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
 } from '@simplewebauthn/server'
 import { getDb, schema } from 'db'
-import { ForbiddenError, getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
+import { ForbiddenError, getOrgIdForProject, getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
 import { MACHINE_TOKEN_MAX_DAYS, formatUserCode } from './lib/utils.ts'
 
 // How long an approval lasts for the session, and how long a request waits
@@ -189,6 +189,17 @@ export async function requireAdminForProtected({ userId, sessionId, environmentI
     .innerJoin(schema.project, orm.eq(schema.project.id, schema.environment.projectId))
     .where(orm.and(orm.inArray(schema.environment.id, environmentIds), orm.eq(schema.environment.protected, true)))
   for (const orgId of new Set(rows.map((row) => row.orgId))) await requireOrgAdmin({ userId, sessionId, orgId })
+}
+
+// Deleting a token stops whatever uses it: up to its creator, or an org admin
+// (an admin action, with an admin approval once the org has a protected
+// environment)
+export async function requireTokenDeletion({ userId, sessionId, token }: { userId: string; sessionId: string; token: { createdBy: string; projectId: string } }) {
+  if (token.createdBy === userId) return
+  const access = await getProjectMemberAccess(userId, token.projectId)
+  if (access?.role !== 'admin') throw new ForbiddenError('Only its creator or an org admin deletes a token')
+  const orgId = await getOrgIdForProject(token.projectId)
+  if (orgId) await requireOrgAdmin({ userId, sessionId, orgId })
 }
 
 // A machine token reads and changes protected environments without a
@@ -412,11 +423,13 @@ export async function requestEnrollment({ request, userId, sessionId, signedIn, 
   return insertRequest({ request, userId, sessionId, environmentIds: [], withCode: viaCode, purpose: 'enroll', lifetimeMs: viaCode ? REQUEST_MS : ADMIN_REQUEST_MS })
 }
 
-// A member's request for a first passkey, for an admin of every organization
-// that needs it (so an admin of an organization made for the purpose can't
-// approve it), never the member themselves
+// A member's request for a first passkey. Each of their organizations that
+// needs it approves it through one of its admins, never the member: an admin
+// of one organization, maybe one made for the purpose, can't approve it for
+// the others. Returns the organizations this approver answers for.
 async function enrollmentForAdmin({ requestId, approver }: { requestId: string; approver: { userId: string; sessionId: string } }) {
-  const row = await getDb().query.stepUpRequest.findFirst({
+  const db = getDb()
+  const row = await db.query.stepUpRequest.findFirst({
     where: { id: requestId, purpose: 'enroll', userCode: { isNull: true }, status: 'pending', expiresAt: { gt: Date.now() } },
   })
   if (!row) throw new Error('This request expired or was already answered')
@@ -424,29 +437,42 @@ async function enrollmentForAdmin({ requestId, approver }: { requestId: string; 
   const orgIds = await passkeyApproverOrgs(row.userId)
   // Only a first passkey that an admin has to approve: otherwise anyone
   // would pass the checks below
-  const hasPasskey = !!await getDb().query.passkey.findFirst({ where: { userId: row.userId }, columns: { id: true } })
+  const hasPasskey = !!await db.query.passkey.findFirst({ where: { userId: row.userId }, columns: { id: true } })
   if (orgIds.length === 0 || hasPasskey) throw new Error('This request needs no admin approval')
-  for (const orgId of orgIds) {
-    const admin = await getDb().query.orgMember.findFirst({ where: { orgId, userId: approver.userId }, columns: { role: true } })
-    if (admin?.role !== 'admin') throw new Error('An admin of each of their organizations with protected environments approves it')
-  }
+  const answering = (await db.query.orgMember.findMany({
+    where: { userId: approver.userId, orgId: { in: orgIds }, role: 'admin' },
+    columns: { orgId: true },
+  })).map((member) => member.orgId)
+  if (answering.length === 0) throw new Error('An admin of one of their organizations with protected environments approves it')
   // An admin action, with the admin approval these organizations need
-  for (const orgId of orgIds) await requireOrgAdmin({ ...approver, orgId })
-  return row
+  for (const orgId of answering) await requireOrgAdmin({ ...approver, orgId })
+  return { row, orgIds, answering }
 }
 
-export async function approveEnrollment({ requestId, approver }: { requestId: string; approver: { userId: string; sessionId: string } }) {
-  const row = await enrollmentForAdmin({ requestId, approver })
+// Approves for the organizations this admin answers for. Once every one of
+// them has, the member's session may add one passkey.
+export async function approveEnrollment({ requestId, approver }: { requestId: string; approver: { userId: string; sessionId: string } }): Promise<{ waitingFor: number }> {
+  const { row, orgIds, answering } = await enrollmentForAdmin({ requestId, approver })
   const db = getDb()
-  const now = Date.now()
-  await db.batch([
-    db.update(schema.stepUpRequest).set({ status: 'approved' }).where(orm.eq(schema.stepUpRequest.id, row.id)),
-    db.insert(schema.stepUpGrant).values({ userId: row.userId, sessionId: row.sessionId, purpose: 'enroll', environmentIds: [], createdAt: now, expiresAt: now + GRANT_MS.enroll }),
-  ])
+  const [first, ...rest] = answering.map((orgId) => db.insert(schema.enrollmentApproval).values({ requestId: row.id, orgId, approverId: approver.userId }).onConflictDoNothing())
+  await db.batch([first!, ...rest])
+  const approved = new Set((await db.select({ orgId: schema.enrollmentApproval.orgId }).from(schema.enrollmentApproval)
+    .where(orm.eq(schema.enrollmentApproval.requestId, row.id))).map((approval) => approval.orgId))
+  const waitingFor = orgIds.filter((orgId) => !approved.has(orgId)).length
+  if (waitingFor > 0) return { waitingFor }
+  // The approval that completes it answers the request, once
+  const [answered] = await db.update(schema.stepUpRequest).set({ status: 'approved' })
+    .where(orm.and(orm.eq(schema.stepUpRequest.id, row.id), orm.eq(schema.stepUpRequest.status, 'pending')))
+    .returning({ id: schema.stepUpRequest.id })
+  if (answered) {
+    const now = Date.now()
+    await db.insert(schema.stepUpGrant).values({ userId: row.userId, sessionId: row.sessionId, purpose: 'enroll', environmentIds: [], createdAt: now, expiresAt: now + GRANT_MS.enroll })
+  }
+  return { waitingFor: 0 }
 }
 
 export async function declineEnrollment({ requestId, approver }: { requestId: string; approver: { userId: string; sessionId: string } }) {
-  const row = await enrollmentForAdmin({ requestId, approver })
+  const { row } = await enrollmentForAdmin({ requestId, approver })
   await getDb().delete(schema.stepUpRequest).where(orm.eq(schema.stepUpRequest.id, row.id))
 }
 
@@ -464,21 +490,38 @@ export async function enrollmentState({ userId, sessionId }: { userId: string; s
     hasGrant({ userId, sessionId, purpose: 'enroll' }),
     db.query.passkey.findFirst({ where: { userId }, columns: { id: true } }),
   ])
+  const approverOrgs = passkey ? [] : await passkeyApproverOrgs(userId)
+  // For a request to admins: how many of the organizations have approved
+  const approvedBy = pending && !pending.userCode
+    ? (await db.select({ orgId: schema.enrollmentApproval.orgId }).from(schema.enrollmentApproval)
+      .where(orm.eq(schema.enrollmentApproval.requestId, pending.id))).filter((row) => approverOrgs.includes(row.orgId)).length
+    : 0
   return {
-    pending: pending ?? null,
+    pending: pending ? { ...pending, approvedBy, approversNeeded: approverOrgs.length } : null,
     approved,
-    needsAdmin: !passkey && (await passkeyApproverOrgs(userId)).length > 0,
+    needsAdmin: approverOrgs.length > 0,
   }
 }
 
-// Members' requests for a first passkey, for their admins to answer
-export async function pendingEnrollments(userIds: string[]) {
+// Members' requests for a first passkey that this organization approves:
+// whether it has, and how many of their other organizations still have to
+export async function pendingEnrollments({ userIds, orgId }: { userIds: string[]; orgId: string }) {
   if (userIds.length === 0) return []
-  return getDb().query.stepUpRequest.findMany({
+  const db = getDb()
+  const rows = await db.query.stepUpRequest.findMany({
     where: { userId: { in: userIds }, purpose: 'enroll', userCode: { isNull: true }, status: 'pending', expiresAt: { gt: Date.now() } },
     columns: { id: true, userId: true, ipAddress: true, country: true, userAgent: true, createdAt: true },
     orderBy: { createdAt: 'desc' },
   })
+  if (rows.length === 0) return []
+  const approvals = await db.select({ requestId: schema.enrollmentApproval.requestId, orgId: schema.enrollmentApproval.orgId })
+    .from(schema.enrollmentApproval).where(orm.inArray(schema.enrollmentApproval.requestId, rows.map((row) => row.id)))
+  const requests = await Promise.all(rows.map(async (row) => {
+    const orgIds = await passkeyApproverOrgs(row.userId)
+    const approved = new Set(approvals.filter((approval) => approval.requestId === row.id).map((approval) => approval.orgId))
+    return { ...row, approves: orgIds.includes(orgId), approvedHere: approved.has(orgId), waitingForOthers: orgIds.filter((id) => id !== orgId && !approved.has(id)).length }
+  }))
+  return requests.filter((request) => request.approves)
 }
 
 // What gives lasting access to your account: approving a CLI login, making an

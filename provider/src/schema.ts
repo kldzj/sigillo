@@ -97,6 +97,15 @@ export const verification = sqliteCore.sqliteTable('verification', {
   updatedAt: epochMs('updated_at').notNull().$defaultFn(() => Date.now()),
 })
 
+// better-auth's rate limits, in D1 so that every isolate counts together
+export const rateLimit = sqliteCore.sqliteTable('rate_limit', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  key: sqliteCore.text('key').notNull().unique(),
+  count: sqliteCore.integer('count').notNull(),
+  lastRequest: sqliteCore.integer('last_request').notNull(),
+})
+
+
 // ── oauthProvider plugin tables ─────────────────────────────────────
 // Field names match @better-auth/oauth-provider@1.7.6 schema definition.
 // string[] fields are stored as JSON text by BetterAuth's drizzle adapter.

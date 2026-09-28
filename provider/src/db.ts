@@ -62,6 +62,16 @@ export function getAuth() {
     baseURL: env.BETTER_AUTH_URL,
     secret: env.BETTER_AUTH_SECRET,
     database: drizzleAdapter(db, { provider: 'sqlite' }),
+    // The client's IP as Cloudflare saw it: X-Forwarded-For is whatever the
+    // client sends, and would let it pick a fresh count per request
+    advanced: { ipAddress: { ipAddressHeaders: ['cf-connecting-ip'] } },
+    // Per IP, counted in D1 so every isolate sees the same counts. Anyone may
+    // register a client, as the app does when it first starts: a few an hour.
+    rateLimit: {
+      enabled: true,
+      storage: 'database',
+      customRules: { '/oauth2/register': { window: 3600, max: 10 } },
+    },
     // Google's OAuth tokens are encrypted in D1. Rows written
     // before this stay readable: better-auth passes unencrypted values through.
     account: { encryptOAuthTokens: true },

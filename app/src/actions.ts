@@ -11,7 +11,7 @@
 'use server'
 
 import { ulid } from 'ulid'
-import { getSecretNameError, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
+import { getEnvSlugError, getSecretNameError, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
 import * as orm from 'drizzle-orm'
 import { schema } from 'db'
 import { getActionRequest, redirect } from 'spiceflow'
@@ -35,7 +35,7 @@ import {
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
-  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProtectedAccess, resetMemberPasskeys, type Purpose,
+  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
   requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
 } from './step-up.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
@@ -243,8 +243,7 @@ export async function enrollmentStatusAction({ requestId }: { requestId: string 
 export async function approveEnrollmentAction({ requestId }: { requestId: string }) {
   return stepUpOr(async () => {
     const session = await requireSession()
-    await approveEnrollment({ requestId, approver: session })
-    return { ok: true }
+    return approveEnrollment({ requestId, approver: session })
   })
 }
 
@@ -366,6 +365,8 @@ export async function createEnvAction({ name, slug, projectId }: {
   projectId: string
 }) {
   if (!name || !slug) throw new Error('Name and slug are required')
+  const slugError = getEnvSlugError(slug)
+  if (slugError) throw new Error(slugError)
   const session = await requireSession()
   await requireProjectAccess(session.userId, projectId)
   const db = getDb()
@@ -380,6 +381,8 @@ export async function renameEnvAction({ id, name, slug }: {
 }) {
   return stepUpOr(async () => {
     if (!name && !slug) throw new Error('At least one of name or slug is required')
+    const slugError = slug ? getEnvSlugError(slug) : null
+    if (slugError) throw new Error(slugError)
     const session = await requireSession()
     await requireEnvironmentAccess(session.userId, id)
     await requireAdminForProtected({ ...session, environmentIds: [id] })
@@ -597,10 +600,11 @@ export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
     const db = getDb()
     const token = await db.query.apiToken.findFirst({
       where: { id: tokenId },
-      columns: { projectId: true, protectedAccess: true },
+      columns: { projectId: true, protectedAccess: true, createdBy: true },
       with: { environments: { columns: { environmentId: true } } },
     })
     if (!token) throw new Error('Token not found')
+    await requireTokenDeletion({ ...session, token })
     await requireTokenScopeAccess({
       userId: session.userId,
       projectId: token.projectId,
@@ -793,6 +797,23 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
     })
     return { ok: true, environmentId, protect }
   })
+}
+
+// A member leaves an organization, as if an admin removed them: auto-join
+// doesn't add them back. The last admin can't leave.
+export async function leaveOrgAction({ orgId }: { orgId: string }) {
+  const session = await requireSession()
+  const member = await getDb().query.orgMember.findFirst({
+    where: { orgId, userId: session.userId },
+    columns: { id: true, orgId: true, userId: true, role: true },
+  })
+  if (!member) return { error: 'You are not a member of this organization' }
+  if (member.role === 'admin') {
+    const admins = await getDb().query.orgMember.findMany({ where: { orgId, role: 'admin' }, columns: { userId: true } })
+    if (admins.length === 1) return { error: 'This organization needs at least one admin: make someone else an admin first' }
+  }
+  await deleteOrgMember(member)
+  throw redirect(router.href('/dash'))
 }
 
 export async function deleteOrgAction({ orgId }: { orgId: string }) {

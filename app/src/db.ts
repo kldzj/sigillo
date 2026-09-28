@@ -254,6 +254,15 @@ export async function getAuth(request: Request) {
     // on its next request, not up to 5 minutes later. It costs one D1 read.
     // Sessions record the client IP Cloudflare puts in cf-connecting-ip.
     advanced: { ipAddress: { ipAddressHeaders: ['cf-connecting-ip'] } },
+    // Per IP, counted in D1 so every isolate sees the same counts. The device
+    // plugin allows 5 code lookups per 30 minutes, which a team behind one
+    // office IP would run out of: 30 per 10 minutes still can't guess a code.
+    // Off in tests, whose requests have no IP and would share one count.
+    rateLimit: {
+      enabled: !process.env.VITEST,
+      storage: 'database',
+      customRules: { '/device': { window: 600, max: 30 } },
+    },
     // The provider's OAuth tokens are encrypted in D1. Rows written before
     // this stay readable: better-auth passes unencrypted values through.
     account: { encryptOAuthTokens: true },
@@ -408,6 +417,8 @@ export function getSession(request: Request): Promise<Session | null> {
   return promise
 }
 
+const MAX_SESSION_AGE_MS = 30 * 24 * 60 * 60 * 1000
+
 async function resolveSession(request: Request): Promise<Session | null> {
   const hasCookie = request.headers.has('cookie')
   const hasAuthorization = request.headers.has('authorization')
@@ -419,10 +430,17 @@ async function resolveSession(request: Request): Promise<Session | null> {
   const session = await auth.api.getSession({ headers: request.headers })
   // A session made before its user left the allowlist ends with it
   if (!session || !isAllowed(session.user)) return null
+  // A login renews itself while in use, so a stolen cookie or CLI login in
+  // daily use would never end: each ends 30 days after its sign-in
+  const sessionCreatedAt = new Date(session.session.createdAt).getTime()
+  if (Date.now() - sessionCreatedAt > MAX_SESSION_AGE_MS) {
+    await getDb().delete(schema.session).where(orm.eq(schema.session.id, session.session.id))
+    return null
+  }
   return {
     userId: session.user.id,
     sessionId: session.session.id,
-    sessionCreatedAt: new Date(session.session.createdAt).getTime(),
+    sessionCreatedAt,
     signedIn: !!session.session.signedIn,
     user: { id: session.user.id, name: session.user.name, email: session.user.email, emailVerified: session.user.emailVerified },
   }

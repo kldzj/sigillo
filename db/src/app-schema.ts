@@ -94,6 +94,19 @@ export const stepUpRequest = sqliteCore.sqliteTable('step_up_request', {
   sqliteCore.index('step_up_request_user_id_idx').on(table.userId),
 ])
 
+// An admin's approval of a member's first passkey, for one organization. The
+// passkey can be added once every organization that needs it has approved,
+// so no one person has to be an admin of all of them.
+export const enrollmentApproval = sqliteCore.sqliteTable('enrollment_approval', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  requestId: sqliteCore.text('request_id').notNull().references(() => stepUpRequest.id, { onDelete: 'cascade' }),
+  orgId: sqliteCore.text('org_id').notNull().references(() => org.id, { onDelete: 'cascade' }),
+  approverId: sqliteCore.text('approver_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+}, (table) => [
+  sqliteCore.uniqueIndex('enrollment_approval_request_id_org_id_unique').on(table.requestId, table.orgId),
+])
+
 export const stepUpGrant = sqliteCore.sqliteTable('step_up_grant', {
   id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
   userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
@@ -149,6 +162,14 @@ export const verification = sqliteCore.sqliteTable('verification', {
   expiresAt: epochMs('expires_at').notNull(),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
   updatedAt: epochMs('updated_at').notNull().$defaultFn(() => Date.now()),
+})
+
+// better-auth's rate limits, in D1 so that every isolate counts together
+export const rateLimit = sqliteCore.sqliteTable('rate_limit', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  key: sqliteCore.text('key').notNull().unique(),
+  count: sqliteCore.integer('count').notNull(),
+  lastRequest: sqliteCore.integer('last_request').notNull(),
 })
 
 // ── Org tables ──────────────────────────────────────────────────────

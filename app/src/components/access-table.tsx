@@ -268,7 +268,7 @@ function PasskeyRequests() {
     <div className="flex flex-col gap-2 mt-4">
       <h2 className="text-sm font-semibold">Passkey requests</h2>
       <p className="text-sm text-muted-foreground">
-        Approve only a request you know the member just made, from the device shown. The passkey can approve access to protected environments.
+        Approve only a request you know the member just made, from the device shown. The passkey can approve access to protected environments. A member of several organizations with protected environments needs an approval from each.
       </p>
       {error && <p className="text-sm text-destructive">{error}</p>}
       <Frame className="w-full overflow-x-auto">
@@ -296,6 +296,12 @@ function PasskeyRequests() {
                 <TableCell className="text-right">
                   {row.isYou ? (
                     <span className="text-xs text-muted-foreground">Another admin approves yours</span>
+                  ) : row.approvedHere ? (
+                    <span className="text-xs text-muted-foreground">
+                      {row.waitingForOthers === 0
+                        ? "Approved"
+                        : `Approved here, waiting for ${row.waitingForOthers === 1 ? "another organization" : `${row.waitingForOthers} other organizations`}`}
+                    </span>
                   ) : (
                     <span className="flex gap-3 justify-end">
                       <button className="text-xs text-muted-foreground hover:text-destructive cursor-pointer" onClick={() => void answer(row.id, false)}>Decline</button>
