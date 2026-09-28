@@ -28,14 +28,14 @@ import {
   getUserEnvironmentAccess,
   getEnvironmentAccessError,
   getClaimableAutoJoinDomain,
-  deleteOrgMember, setOrgMemberRole, requireOrgDeletionTyped, requireEnvironmentDeletionTyped,
+  deleteOrgMember, setOrgMemberRole, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped,
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
-  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
+  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
   requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
 } from './step-up.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
@@ -797,6 +797,29 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
       request: getActionRequest(), environmentId, protect, author: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId },
     })
     return { ok: true, environmentId, protect }
+  })
+}
+
+export async function renameProjectAction({ projectId, name }: { projectId: string; name: string }) {
+  return stepUpOr(async () => {
+    if (!name.trim()) throw new Error('Name is required')
+    const session = await requireSession()
+    await requireProjectChange({ ...session, projectId })
+    await getDb().update(schema.project).set({ name: name.trim(), updatedAt: Date.now() }).where(orm.eq(schema.project.id, projectId))
+    return { ok: true }
+  })
+}
+
+// Deleting a project deletes its environments and secrets: it takes its
+// name, typed out
+export async function deleteProjectAction({ projectId, typedName }: { projectId: string; typedName: string }) {
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    await requireProjectChange({ ...session, projectId })
+    await requireProjectDeletionTyped({ projectId, typed: typedName })
+    const project = await getDb().query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } })
+    await getDb().delete(schema.project).where(orm.eq(schema.project.id, projectId))
+    throw redirect(project ? router.href('/dash/orgs/:orgId', { orgId: project.orgId }) : router.href('/dash'))
   })
 }
 

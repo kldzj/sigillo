@@ -17,7 +17,7 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import worker, { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
@@ -3333,6 +3333,8 @@ describe('deleting', () => {
       emptyEnv: await outcome(() => requireEnvironmentDeletionTyped({ environmentId: dev, typed: undefined })),
       prodUntyped: await outcome(() => requireEnvironmentDeletionTyped({ environmentId: prod, typed: undefined })),
       prodTyped: await outcome(() => requireEnvironmentDeletionTyped({ environmentId: prod, typed: 'prod' })),
+      projectUntyped: await outcome(() => requireProjectDeletionTyped({ projectId, typed: 'website' })),
+      projectTyped: await outcome(() => requireProjectDeletionTyped({ projectId, typed: 'Website' })),
     }).toEqual({
       counts: { [dev]: 0, [prod]: 2 },
       orgUntyped: "Type the organization's name to delete it",
@@ -3341,6 +3343,8 @@ describe('deleting', () => {
       emptyEnv: 'ok',
       prodUntyped: "Type the environment's slug to delete it and its 2 secrets",
       prodTyped: 'ok',
+      projectUntyped: "Type the project's name to delete it",
+      projectTyped: 'ok',
     })
   })
 })

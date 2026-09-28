@@ -38,7 +38,7 @@ import {
   getClaimableAutoJoinDomain,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
-import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected } from './step-up.ts'
+import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected, requireProjectChange } from './step-up.ts'
 import { memoize } from './lib/memoize.ts'
 import { SECRET_NAME_REGEX, getEnvSlugError, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
 
@@ -611,20 +611,10 @@ export const apiApp = new Spiceflow()
       const session = await requireApiSession(request)
       const orgId = await getOrgIdForProject(params.id)
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      const access = await getMemberAccess({ userId: session.userId, orgId })
-      if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(params.id))) {
-        return json({ error: 'forbidden' }, { status: 403 })
-      }
-      const db = getDb()
       // The CLI finds a project by its name: renaming one would let another
-      // project take its place, so one with an admin-only or protected
-      // environment takes an admin, as deleting it does
-      if (access.role !== 'admin') {
-        const adminOnly = await db.query.environment.findFirst({ where: { projectId: params.id, accessRole: 'admin' }, columns: { id: true } })
-        if (adminOnly) return json({ error: 'admin access required for this environment' }, { status: 403 })
-      }
-      const environments = await db.query.environment.findMany({ where: { projectId: params.id }, columns: { id: true } })
-      await requireAdminForProtected({ ...session, environmentIds: environments.map((env) => env.id) })
+      // project take its place, so it takes what deleting it takes
+      await requireProjectChange({ ...session, projectId: params.id })
+      const db = getDb()
       const [updated] = await db.update(schema.project)
         .set({ name: body.name, updatedAt: Date.now() })
         .where(orm.eq(schema.project.id, params.id))
@@ -645,18 +635,8 @@ export const apiApp = new Spiceflow()
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
       // getMemberProjectAccess also verifies org membership (single query),
       // so no separate requireApiOrgMember round-trip is needed.
-      const access = await getMemberAccess({ userId: session.userId, orgId })
-      if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(params.id))) {
-        return json({ error: 'forbidden' }, { status: 403 })
-      }
+      await requireProjectChange({ ...session, projectId: params.id })
       const db = getDb()
-      // Deleting a project deletes its environments, so an admin-only one needs an admin.
-      if (access?.role !== 'admin') {
-        const adminOnly = await db.query.environment.findFirst({ where: { projectId: params.id, accessRole: 'admin' }, columns: { id: true } })
-        if (adminOnly) return json({ error: 'admin access required for this environment' }, { status: 403 })
-      }
-      const environments = await db.query.environment.findMany({ where: { projectId: params.id }, columns: { id: true } })
-      await requireAdminForProtected({ ...session, environmentIds: environments.map((env) => env.id) })
       const [deleted] = await db.delete(schema.project).where(orm.eq(schema.project.id, params.id)).returning({ id: schema.project.id })
       if (!deleted) return json({ error: 'not found' }, { status: 404 })
       return { ok: true, id: deleted.id }

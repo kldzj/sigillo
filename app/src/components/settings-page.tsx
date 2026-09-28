@@ -1,5 +1,5 @@
-// Settings page for org-level configuration.
-// Contains auto-join domain toggle and "Danger Zone" org deletion.
+// An organization's settings, linked from the sidebar: auto-join, leaving it,
+// and in the "Danger Zone" deleting it.
 // The confirm dialog shows the list of projects that will be deleted
 // so the user knows exactly what they are losing.
 
@@ -24,7 +24,7 @@ import { withStepUp } from './step-up.ts'
 import { COMMON_EMAIL_DOMAINS, getEmailDomain } from '../lib/utils.ts'
 
 function AutoJoinSection() {
-  const { orgId, autoJoinDomain } = useLoaderData('/dash/projects/:projectId/settings')
+  const { orgId, autoJoinDomain } = useLoaderData('/dash/orgs/:orgId/settings')
   const { user } = useLoaderData('/dash/*')
   const [isPending, startTransition] = useTransition()
   const [currentDomain, setCurrentDomain] = useState(autoJoinDomain)
@@ -89,8 +89,8 @@ function AutoJoinSection() {
   )
 }
 
-export function SettingsPage() {
-  const { orgId, orgName, projectNames, environmentCount, secretCount } = useLoaderData('/dash/projects/:projectId/settings')
+export function OrgSettingsPage() {
+  const { orgId, orgName, projectNames, environmentCount, secretCount } = useLoaderData('/dash/orgs/:orgId/settings')
   const [open, setOpen] = useState(false)
   // Deleting takes the organization's name, typed out: it can't be undone
   const [typedName, setTypedName] = useState('')
@@ -121,9 +121,9 @@ export function SettingsPage() {
   return (
     <div className="flex flex-col gap-8 w-full max-w-2xl">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
+        <h1 className="text-2xl font-bold tracking-tight">Organization settings</h1>
         <p className="text-muted-foreground text-sm mt-1">
-          Manage your organization settings.
+          {orgName}: auto-join, leaving it, and deleting it.
         </p>
       </div>
 
@@ -155,7 +155,7 @@ export function SettingsPage() {
           <div>
             <p className="text-sm font-medium">Delete this organization</p>
             <p className="text-xs text-muted-foreground">
-              Deletes {orgName} with all its projects, not only this one. It can't be undone.
+              Deletes {orgName} with all its projects. It can't be undone.
             </p>
           </div>
           <Dialog open={open} onOpenChange={(next) => { setOpen(next); setTypedName(''); setDeleteError(null) }}>
@@ -169,7 +169,7 @@ export function SettingsPage() {
               <DialogHeader>
                 <DialogTitle>Delete the organization {orgName}?</DialogTitle>
                 <DialogDescription>
-                  This deletes the whole organization, not only this project, and it can't be undone.
+                  This deletes the whole organization with all its projects, and it can't be undone.
                 </DialogDescription>
               </DialogHeader>
               <div className="px-6 pb-4">

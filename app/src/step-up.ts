@@ -191,6 +191,16 @@ export async function requireAdminForProtected({ userId, sessionId, environmentI
   for (const orgId of new Set(rows.map((row) => row.orgId))) await requireOrgAdmin({ userId, sessionId, orgId })
 }
 
+// Renaming or deleting a project: someone who can open it, an admin when it
+// has an admin-only environment, and one with a passkey when a protected one
+export async function requireProjectChange({ userId, sessionId, projectId }: { userId: string; sessionId: string; projectId: string }) {
+  const access = await getProjectMemberAccess(userId, projectId)
+  if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(projectId))) throw new ForbiddenError()
+  const environments = await getDb().query.environment.findMany({ where: { projectId }, columns: { id: true, accessRole: true } })
+  if (access.role !== 'admin' && environments.some((env) => env.accessRole === 'admin')) throw new ForbiddenError('admin access required for this environment')
+  await requireAdminForProtected({ userId, sessionId, environmentIds: environments.map((env) => env.id) })
+}
+
 // Deleting a token stops whatever uses it: up to its creator, or an org admin
 // (an admin action, with an admin approval once the org has a protected
 // environment)

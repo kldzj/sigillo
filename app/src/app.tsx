@@ -211,28 +211,43 @@ export const app = new Spiceflow({ tracer })
   })
 
   .loader('/dash/orgs/:orgId', async ({ params, request }) => {
-    const db = getDb()
     const session = await requirePageSession(request)
     await requirePageOrgMember(session.userId, params.orgId)
+    return orgSidebar({ request, userId: session.userId, orgId: params.orgId })
+  })
 
-    const accessibleIds = await getAccessibleProjectIds(session.userId, params.orgId)
-    const allProjects = await db.query.project.findMany({
-      where: { orgId: params.orgId },
-      with: { environments: true },
-      orderBy: { createdAt: 'desc' },
-    })
-
-    const projects = allProjects
-      .filter((p) => accessibleIds === null || accessibleIds.includes(p.id))
-      .map((p) => ({ id: p.id, name: p.name, envSlug: projectEnvSlug(request, p.id, p.environments || []) }))
-
+  // ── Organization settings ───────────────────────────────────────
+  .loader('/dash/orgs/:orgId/settings', async ({ params, request }) => {
+    const db = getDb()
+    const session = await requirePageSession(request)
+    const { role } = await requirePageOrgMember(session.userId, params.orgId)
+    const [sidebar, orgRow, projects] = await Promise.all([
+      orgSidebar({ request, userId: session.userId, orgId: params.orgId }),
+      db.query.org.findFirst({ where: { id: params.orgId }, columns: { name: true, autoJoinDomain: true } }),
+      db.query.project.findMany({ where: { orgId: params.orgId }, columns: { id: true, name: true }, orderBy: { createdAt: 'asc' } }),
+    ])
+    // What deleting the organization takes with it, for the admins who can
+    const environments = role === 'admin' && projects.length > 0
+      ? await db.query.environment.findMany({ where: { projectId: { in: projects.map((p) => p.id) } }, columns: { id: true } })
+      : []
+    const secretCounts = await countSecrets(environments.map((env) => env.id))
     return {
-      orgId: params.orgId,
-      projectId: null,
-      projects,
-      environments: [],
-      currentProjectEnvSlug: null,
+      ...sidebar,
+      orgName: orgRow?.name ?? 'Organization',
+      autoJoinDomain: orgRow?.autoJoinDomain ?? null,
+      projectNames: projects.map((p) => p.name),
+      environmentCount: environments.length,
+      secretCount: Object.values(secretCounts).reduce((sum, count) => sum + count, 0),
     }
+  })
+
+  .page('/dash/orgs/:orgId/settings', async () => {
+    const { OrgSettingsPage } = await import('sigillo-app/src/components/settings-page')
+    return (
+      <div className="flex flex-col gap-3 w-full">
+        <OrgSettingsPage />
+      </div>
+    )
   })
 
   .loader('/dash/projects/:projectId/*', async ({ params, request }) => {
@@ -807,35 +822,23 @@ export const app = new Spiceflow({ tracer })
     const db = getDb()
     const session = await requirePageSession(request)
     const orgId = await getOrgIdForProject(params.projectId)
-    if (!orgId) throw redirect('/')
-    const { role } = await requirePageOrgMember(session.userId, orgId)
-
-    const [orgRow, projects] = await Promise.all([
-      db.query.org.findFirst({ where: { id: orgId }, columns: { name: true, autoJoinDomain: true } }),
-      db.query.project.findMany({ where: { orgId }, columns: { id: true, name: true }, orderBy: { createdAt: 'asc' } }),
-    ])
-    // What deleting the organization takes with it, for the admins who can
-    const environments = role === 'admin' && projects.length > 0
-      ? await db.query.environment.findMany({ where: { projectId: { in: projects.map((p) => p.id) } }, columns: { id: true } })
-      : []
+    if (!orgId) throw redirect('/dash')
+    await requirePageOrgMember(session.userId, orgId)
+    // What deleting the project takes with it
+    const environments = await db.query.environment.findMany({ where: { projectId: params.projectId }, columns: { id: true } })
     const secretCounts = await countSecrets(environments.map((env) => env.id))
-
     return {
-      orgId,
-      orgName: orgRow?.name ?? 'Organization',
-      autoJoinDomain: orgRow?.autoJoinDomain ?? null,
-      projectNames: projects.map((p) => p.name),
       environmentCount: environments.length,
       secretCount: Object.values(secretCounts).reduce((sum, count) => sum + count, 0),
     }
   })
 
   .page('/dash/projects/:projectId/settings', async () => {
-    const { SettingsPage } = await import('sigillo-app/src/components/settings-page')
+    const { ProjectSettingsPage } = await import('sigillo-app/src/components/project-settings-page')
 
     return (
       <div className="flex flex-col gap-3 w-full">
-        <SettingsPage />
+        <ProjectSettingsPage />
       </div>
     )
   })
@@ -990,6 +993,26 @@ function confirmLogout(request: Request) {
 </form>
 </html>
 `, { headers: { 'content-type': 'text/html; charset=utf-8' } })
+}
+
+// The projects of an organization for its sidebar
+async function orgSidebar({ request, userId, orgId }: { request: Request; userId: string; orgId: string }) {
+  const accessibleIds = await getAccessibleProjectIds(userId, orgId)
+  const allProjects = await getDb().query.project.findMany({
+    where: { orgId },
+    with: { environments: true },
+    orderBy: { createdAt: 'desc' },
+  })
+  const projects = allProjects
+    .filter((p) => accessibleIds === null || accessibleIds.includes(p.id))
+    .map((p) => ({ id: p.id, name: p.name, envSlug: projectEnvSlug(request, p.id, p.environments || []) }))
+  return {
+    orgId,
+    projectId: null,
+    projects,
+    environments: [],
+    currentProjectEnvSlug: null,
+  }
 }
 
 /** Shared HTML shell for all pages (dash, login, device, invite).

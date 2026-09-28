@@ -951,6 +951,11 @@ export async function requireOrgDeletionTyped({ orgId, typed }: { orgId: string;
   if (!org || typed !== org.name) throw new Error("Type the organization's name to delete it")
 }
 
+export async function requireProjectDeletionTyped({ projectId, typed }: { projectId: string; typed: string | undefined }) {
+  const project = await getDb().query.project.findFirst({ where: { id: projectId }, columns: { name: true } })
+  if (!project || typed !== project.name) throw new Error("Type the project's name to delete it")
+}
+
 export async function requireEnvironmentDeletionTyped({ environmentId, typed }: { environmentId: string; typed: string | undefined }) {
   const environment = await getDb().query.environment.findFirst({ where: { id: environmentId }, columns: { slug: true } })
   if (!environment) return
