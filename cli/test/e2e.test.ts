@@ -34,14 +34,14 @@ const currentCwd = resolve(repoRoot)
 
 let cliContext: CliContext
 
+// One build of the binary for every suite in this file
+beforeAll(() => {
+  const build = spawnSync('zig', ['build'], { cwd: cliDir, encoding: 'utf8' })
+  expect(build.status, build.stderr).toBe(0)
+}, 120_000)
+
 describe('sigillo cli e2e', () => {
   beforeAll(async () => {
-    const build = spawnSync('zig', ['build'], {
-      cwd: cliDir,
-      encoding: 'utf8',
-    })
-    expect(build.status, build.stderr).toBe(0)
-
     const resolved = resolveConfiguredAuth(currentCwd)
     const me = await apiRequest({ method: 'GET', path: '/api/v0/me', context: resolved })
     expect(Array.isArray(me.orgs)).toBe(true)
@@ -409,11 +409,9 @@ describe('sigillo login', () => {
   let apiUrl: string
 
   beforeAll(() => {
-    const build = spawnSync('zig', ['build'], { cwd: cliDir, encoding: 'utf8' })
-    expect(build.status, build.stderr).toBe(0)
     // Only the server URL: this suite needs no working login
     apiUrl = resolveConfiguredAuth(currentCwd).apiUrl
-  }, 120_000)
+  })
 
   test('starts the device flow even when a token is saved', async () => {
     // A saved token that no longer works must not stop `sigillo login`
