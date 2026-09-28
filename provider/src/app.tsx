@@ -518,5 +518,14 @@ export const app = new Spiceflow()
 export type App = typeof app
 
 export default {
-  fetch: (request: Request) => app.handle(request),
+  fetch: async (request: Request) => {
+    const response = await app.handle(request)
+    // The sign-in and consent pages are not meant to be embedded: another
+    // page could frame them and have someone click through them unseen
+    const headers = new Headers(response.headers)
+    headers.set('X-Frame-Options', 'DENY')
+    headers.set('Content-Security-Policy', "frame-ancestors 'none'")
+    headers.set('X-Content-Type-Options', 'nosniff')
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+  },
 } satisfies ExportedHandler<Env>

@@ -169,7 +169,7 @@ The same pattern works for any secret copy, between environments, or when seedin
 
 ### Protected environments need the user's passkey
 
-In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` needs a passkey approval, and is recorded in its Read Log with your login, the secret names and your IP address. So does every change: `secrets set`, `secrets delete`, and deleting the environment. Read only what the task needs, and change a protected environment only when the user asked for that change.
+In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` needs a passkey approval, and is recorded in its Read Log with your login, the secret names and your IP address. So does every change: `secrets set` and `secrets delete`. Deleting or renaming it, or its project, is up to an org admin. Read only what the task needs, and change a protected environment only when the user asked for that change.
 
 Without an approval, the command prints a link and a code on stderr, then waits up to 10 minutes:
 

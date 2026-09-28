@@ -38,7 +38,7 @@ import {
   getClaimableAutoJoinDomain,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
-import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess } from './step-up.ts'
+import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected } from './step-up.ts'
 import { memoize } from './lib/memoize.ts'
 import { SECRET_NAME_REGEX, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
 
@@ -248,7 +248,7 @@ const auditChainRowSchema = z.object({
 const auditResponseSchema = z.object({
   environmentId: z.string(),
   publicKey: z.string(),
-  events: z.object({ rows: z.array(auditChainRowSchema), outside: z.number() }),
+  events: z.object({ rows: z.array(auditChainRowSchema), outside: z.number(), adopted: z.number() }),
   reads: z.object({ rows: z.array(auditChainRowSchema) }),
 })
 
@@ -406,11 +406,19 @@ function renderDownloadedSecrets(
 export const apiApp = new Spiceflow()
   .use(openapi({ path: '/api/v0/openapi.json' }))
 
+  // An error answers with a status and a message, never a stack or a query.
   // Reading or changing a protected environment without a passkey approval
-  // or a machine token: 403 with a code the CLI acts on
+  // or a machine token: 403 with a code the CLI acts on.
   .onError(({ error }) => {
-    if (!(error instanceof StepUpRequiredError)) return
-    return json({ error: error.message, code: error.code, purpose: error.purpose, environmentIds: error.environmentIds }, { status: 403 })
+    if (error instanceof StepUpRequiredError) {
+      return json({ error: error.message, code: error.code, purpose: error.purpose, environmentIds: error.environmentIds }, { status: 403 })
+    }
+    if (error instanceof ForbiddenError) return json({ error: error.message === 'FORBIDDEN' ? 'forbidden' : error.message }, { status: 403 })
+    if (/UNIQUE constraint failed/.test(String((error as { cause?: unknown })?.cause ?? error))) return json({ error: 'already exists' }, { status: 409 })
+    // Validation errors and the like carry their own status
+    const status = (error as { status?: unknown })?.status
+    if (typeof status === 'number' && status >= 400 && status < 500) return json({ error: (error as Error).message }, { status })
+    return json({ error: 'internal error' }, { status: 500 })
   })
 
   // ── Orgs ────────────────────────────────────────────────────────
@@ -603,14 +611,20 @@ export const apiApp = new Spiceflow()
       const session = await requireApiSession(request)
       const orgId = await getOrgIdForProject(params.id)
       if (!orgId) return json({ error: 'not found' }, { status: 404 })
-      // getMemberProjectAccess also verifies org membership (single query),
-      // so no separate requireApiOrgMember round-trip is needed.
-      if (!await getMemberProjectAccess({ userId: session.userId, orgId, projectId: params.id })) return json({ error: 'forbidden' }, { status: 403 })
+      const access = await getMemberAccess({ userId: session.userId, orgId })
+      if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(params.id))) {
+        return json({ error: 'forbidden' }, { status: 403 })
+      }
       const db = getDb()
-      // The CLI finds a project by its name: renaming one with a protected
-      // environment would let another project take its place
+      // The CLI finds a project by its name: renaming one would let another
+      // project take its place, so one with an admin-only or protected
+      // environment takes an admin, as deleting it does
+      if (access.role !== 'admin') {
+        const adminOnly = await db.query.environment.findFirst({ where: { projectId: params.id, accessRole: 'admin' }, columns: { id: true } })
+        if (adminOnly) return json({ error: 'admin access required for this environment' }, { status: 403 })
+      }
       const environments = await db.query.environment.findMany({ where: { projectId: params.id }, columns: { id: true } })
-      await requireProtectedAccess({ environmentIds: environments.map((env) => env.id), reader: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId } })
+      await requireAdminForProtected({ ...session, environmentIds: environments.map((env) => env.id) })
       const [updated] = await db.update(schema.project)
         .set({ name: body.name, updatedAt: Date.now() })
         .where(orm.eq(schema.project.id, params.id))
@@ -641,9 +655,8 @@ export const apiApp = new Spiceflow()
         const adminOnly = await db.query.environment.findFirst({ where: { projectId: params.id, accessRole: 'admin' }, columns: { id: true } })
         if (adminOnly) return json({ error: 'admin access required for this environment' }, { status: 403 })
       }
-      // And a protected one the same passkey approval as changing it
       const environments = await db.query.environment.findMany({ where: { projectId: params.id }, columns: { id: true } })
-      await requireProtectedAccess({ environmentIds: environments.map((env) => env.id), reader: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId } })
+      await requireAdminForProtected({ ...session, environmentIds: environments.map((env) => env.id) })
       const [deleted] = await db.delete(schema.project).where(orm.eq(schema.project.id, params.id)).returning({ id: schema.project.id })
       if (!deleted) return json({ error: 'not found' }, { status: 404 })
       return { ok: true, id: deleted.id }
@@ -739,8 +752,7 @@ export const apiApp = new Spiceflow()
     async handler({ params, request }) {
       const session = await requireApiSession(request)
       const environment = await requireApiEnvironmentAccess({ userId: session.userId, environmentRef: params.id, projectId: params.projectId })
-      // Deleting a protected environment deletes its secrets: the same approval as changing them
-      await requireProtectedAccess({ environmentIds: [environment.id], reader: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId } })
+      await requireAdminForProtected({ ...session, environmentIds: [environment.id] })
       const db = getDb()
       const [deleted] = await db.delete(schema.environment).where(orm.eq(schema.environment.id, environment.id)).returning({ id: schema.environment.id })
       if (!deleted) return json({ error: 'not found' }, { status: 404 })
@@ -761,8 +773,7 @@ export const apiApp = new Spiceflow()
       }
       const session = await requireApiSession(request)
       const environment = await requireApiEnvironmentAccess({ userId: session.userId, environmentRef: params.id, projectId: params.projectId })
-      // A protected environment's slug is what the CLI and CI ask for
-      await requireProtectedAccess({ environmentIds: [environment.id], reader: { userId: session.userId, apiTokenId: null, sessionId: session.sessionId } })
+      await requireAdminForProtected({ ...session, environmentIds: [environment.id] })
       const db = getDb()
       const updates: Partial<{ name: string; slug: string; updatedAt: number }> = { updatedAt: Date.now() }
       if (body.name) updates.name = body.name

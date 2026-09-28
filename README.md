@@ -304,9 +304,12 @@ sigillo run --command 'echo $MY_SECRET'                          # shell string 
 sigillo run --mount .env -- npm start                            # write to file, clean up after
 sigillo run --mount config.json --mount-format json -- next dev  # mount as JSON
 sigillo run --disable-redaction -- ./my-script.sh                # opt out of output redaction
+sigillo run --allow-env NODE_OPTIONS -- next build               # let a secret set NODE_OPTIONS
 ```
 
 Use **`--command`** when you need shell features like `&&`, pipes, redirects, or `$VARIABLE` expansion. Wrap the command in single quotes so your parent shell does not expand secret variables before Sigillo injects them.
+
+A secret named like a variable that decides which programs run and what they load, such as `PATH`, `NODE_OPTIONS`, `LD_PRELOAD` or `BASH_ENV`, is skipped with a warning: anyone who can change the environment's secrets would otherwise run code on your machine. Pass **`--allow-env NAME`** to use one.
 
 ```bash
 # Wrong: your shell expands $DATABASE_URL before sigillo starts

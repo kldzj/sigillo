@@ -596,9 +596,9 @@ fn approveInBrowser(args: RequestArgs, environment_ids: []const []const u8) !boo
     };
 
     try stderr.writeAll("This environment is protected: approve with your passkey.\n  Open ");
-    try color.cyan(stderr, request_info.approveUrl);
+    try color.cyan(stderr, try color.plain(args.allocator, request_info.approveUrl));
     try stderr.writeAll(" and enter ");
-    try color.bold(stderr, request_info.userCode);
+    try color.bold(stderr, try color.plain(args.allocator, request_info.userCode));
     try stderr.writeAll("\n");
     try color.dim(stderr, "Waiting for your approval...\n");
 

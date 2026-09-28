@@ -27,6 +27,7 @@ import {
   getProjectMemberAccess,
   listUserSessions,
   isSessionFresh,
+  actorOf,
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
@@ -42,6 +43,25 @@ const cliBannerCookieName = 'sigillo-cli-banner-dismissed'
 
 function isTruthy<T>(value: T | null | undefined): value is T {
   return value != null
+}
+
+// Names for the authors the history chains record, 'user:<id>' or
+// 'token:<id>': the rows' user_id and api_token_id aren't covered by them
+async function actorNames(actors: (string | null)[]): Promise<Map<string, string>> {
+  const db = getDb()
+  const ids = (prefix: string) => [...new Set(actors.filter((a): a is string => !!a?.startsWith(prefix)).map((a) => a.slice(prefix.length)))]
+  const [users, tokens] = await Promise.all([
+    db.query.user.findMany({ where: { id: { in: ids('user:') } }, columns: { id: true, name: true } }),
+    db.query.apiToken.findMany({ where: { id: { in: ids('token:') } }, columns: { id: true, name: true } }),
+  ])
+  return new Map<string, string>([
+    ...users.map((u) => [`user:${u.id}`, u.name] as const),
+    ...tokens.map((t) => [`token:${t.id}`, `${t.name} (token)`] as const),
+  ])
+}
+
+function actorName(names: Map<string, string>, actor: string | null): string {
+  return (actor && names.get(actor)) ?? (actor?.startsWith('token:') ? 'Deleted token' : 'Deleted user')
 }
 
 // Only allow local app paths for redirects — prevents open redirects and
@@ -97,6 +117,14 @@ export const app = new Spiceflow({ tracer })
   // DO boundary via sqlite-proxy.
   .use(async ({ request }, next) => {
     const url = new URL(request.url)
+    // The REST API takes the session cookie too, and parses any body as JSON:
+    // a write that a page on another origin sends with the cookie is
+    // refused. The CLI and scripts send a bearer token and no Origin.
+    const origin = request.headers.get('origin')
+    if (url.pathname.startsWith('/api/v0/') && !['GET', 'HEAD', 'OPTIONS'].includes(request.method)
+      && !request.headers.has('authorization') && origin && origin !== url.origin) {
+      return Response.json({ error: 'cross-origin request refused' }, { status: 403 })
+    }
     // Approving a CLI login makes a login that outlives this session: once
     // you have a passkey, it takes an approval with it (step-up.ts)
     if (url.pathname === '/api/auth/device/approve' && request.method === 'POST') {
@@ -414,20 +442,11 @@ export const app = new Spiceflow({ tracer })
       selectedEnvId: locked ? null : selectedEnvId,
     })
     if (selectedEnvId && !locked) {
-      // Resolve all secret authors in ONE query instead of findFirst per user.
-      const userIds = [...new Set(derived.map((d) => d.userId).filter(isTruthy))]
-      const userMap = new Map<string, { id: string; name: string }>()
-      if (userIds.length > 0) {
-        const users = await db.query.user.findMany({
-          where: { id: { in: userIds } },
-          columns: { id: true, name: true },
-        })
-        for (const u of users) userMap.set(u.id, u)
-      }
+      const names = await actorNames(derived.map((d) => d.actor))
       secrets = derived.map((d) => ({
         id: d.id, name: d.name,
         createdAt: d.createdAt, updatedAt: d.updatedAt,
-        createdBy: d.userId ? (userMap.get(d.userId) ?? null) : null,
+        createdBy: { id: d.actor, name: actorName(names, d.actor) },
       }))
     }
 
@@ -536,6 +555,10 @@ export const app = new Spiceflow({ tracer })
 
   // ── Event Log page ─────────────────────────────────────────────
   .get('/dash/projects/:projectId/event-log', async ({ params, request, redirect }) => {
+    // Only someone who can open the project learns its environments' slugs
+    const session = await requirePageSession(request)
+    const access = await getProjectMemberAccess(session.userId, params.projectId)
+    if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(params.projectId))) throw redirect('/dash')
     const db = getDb()
     const environments = await db.query.environment.findMany({
       where: { projectId: params.projectId },
@@ -568,12 +591,9 @@ export const app = new Spiceflow({ tracer })
       const envMap = new Map(environments.map((e) => [e.id, e.name]))
       const rows = await db.query.secretEvent.findMany({
         where: { environmentId: selectedEnvId },
-        with: {
-          user: { columns: { id: true, name: true } },
-          apiToken: { columns: { id: true, name: true } },
-        },
         orderBy: { createdAt: 'desc' },
       })
+      const names = await actorNames(rows.map((r) => r.actor ?? actorOf(r)))
       events = rows.map((r) => ({
         id: r.id,
         name: r.name,
@@ -582,7 +602,9 @@ export const app = new Spiceflow({ tracer })
         iv: r.iv,
         createdAt: r.createdAt,
         environmentName: envMap.get(r.environmentId) ?? '—',
-        userName: r.user?.name ?? r.apiToken?.name ?? '—',
+        userName: actorName(names, r.actor ?? actorOf(r)),
+        // Not part of the signed history: added to the database around it
+        unsigned: r.seq === null,
       }))
     }
 
@@ -610,6 +632,10 @@ export const app = new Spiceflow({ tracer })
   // ── Read Log page ──────────────────────────────────────────────
   // Reads of a protected environment's values, for org admins
   .get('/dash/projects/:projectId/read-log', async ({ params, request, redirect }) => {
+    // Only someone who can open the project learns its environments' slugs
+    const session = await requirePageSession(request)
+    const access = await getProjectMemberAccess(session.userId, params.projectId)
+    if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(params.projectId))) throw redirect('/dash')
     const db = getDb()
     const environments = await db.query.environment.findMany({
       where: { projectId: params.projectId },
@@ -639,19 +665,10 @@ export const app = new Spiceflow({ tracer })
         orderBy: { seq: 'desc' },
         limit: 500,
       })
-      // actor is 'user:<id>' or 'token:<id>'
-      const ids = (prefix: string) => [...new Set(rows.filter((r) => r.actor.startsWith(prefix)).map((r) => r.actor.slice(prefix.length)))]
-      const [users, tokens] = await Promise.all([
-        db.query.user.findMany({ where: { id: { in: ids('user:') } }, columns: { id: true, name: true } }),
-        db.query.apiToken.findMany({ where: { id: { in: ids('token:') } }, columns: { id: true, name: true } }),
-      ])
-      const names = new Map<string, string>([
-        ...users.map((u) => [`user:${u.id}`, u.name] as const),
-        ...tokens.map((t) => [`token:${t.id}`, `${t.name} (token)`] as const),
-      ])
+      const names = await actorNames(rows.map((r) => r.actor))
       reads = rows.map((r) => ({
         id: r.id, seq: r.seq, kind: r.kind, names: r.names, ipAddress: r.ipAddress, createdAt: r.createdAt,
-        who: names.get(r.actor) ?? (r.actor.startsWith('token:') ? 'Deleted token' : 'Deleted user'),
+        who: actorName(names, r.actor),
       }))
     }
 
@@ -1170,6 +1187,15 @@ export default {
     const response = await app.handle(request)
     const headers = new Headers(response.headers)
     headers.set('X-Robots-Tag', 'noindex, nofollow')
+    // No page is meant to be embedded: another page could frame /device or
+    // /approve and have someone click through them unseen
+    headers.set('X-Frame-Options', 'DENY')
+    headers.set('Content-Security-Policy', "frame-ancestors 'none'")
+    headers.set('X-Content-Type-Options', 'nosniff')
+    headers.set('Referrer-Policy', 'same-origin')
+    // Secret values, names and logins stay out of the browser's and any
+    // proxy's cache; the static assets don't come through here
+    if (!headers.has('Cache-Control')) headers.set('Cache-Control', 'no-store')
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   },
 } satisfies ExportedHandler<Env>

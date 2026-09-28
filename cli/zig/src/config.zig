@@ -150,6 +150,9 @@ pub fn writeConfig(allocator: std.mem.Allocator, config: *const ConfigFile) !voi
 
     const file = try std.fs.createFileAbsolute(file_path, .{ .truncate = true, .read = false, .mode = 0o600 });
     defer file.close();
+    // The mode only applies to a new file: one that already existed, from an
+    // older version or a copied backup, may be readable by others
+    if (builtin.os.tag != .windows) try file.chmod(0o600);
 
     var file_writer = file.writer(&.{});
     try file_writer.interface.writeAll(out.written());
@@ -292,6 +295,16 @@ fn applyOverrides(scoped: ScopeResolution, overrides: Overrides) Resolved {
         return .{ .config = result, .withheld_token_api_url = saved_token_api_url };
     }
     return .{ .config = result };
+}
+
+// login saves the server it signs in to for its scope. A server that didn't
+// come from --api-url (SIGILLO_API_URL, which a repo's .envrc can set, or
+// another directory's login) doesn't replace a different one already saved
+// there. Returns that saved server when it would.
+pub fn loginReplacesServer(saved: ?ScopedEntry, api_url: []const u8, from_flag: bool) ?[]const u8 {
+    if (from_flag) return null;
+    const saved_url = (saved orelse return null).api_url orelse return null;
+    return if (sameApiUrl(saved_url, api_url)) null else saved_url;
 }
 
 pub fn resolve(allocator: std.mem.Allocator, cwd_input: []const u8, flags: ResolvedConfig) !ResolvedConfig {
@@ -535,6 +548,14 @@ test "saved token is only sent to the api url it was saved with" {
     legacy.apply(&legacy_file, "/repo");
     try std.testing.expectEqualStrings("legacy", applyOverrides(legacy, .{}).config.token.?);
     try std.testing.expect(applyOverrides(legacy, .{ .env = .{ .api_url = "http://localhost:5188" } }).config.token == null);
+}
+
+test "login replaces a saved server only with one given as --api-url" {
+    const saved: ScopedEntry = .{ .token = "t", .api_url = "https://secrets.acme.com" };
+    try std.testing.expectEqualStrings("https://secrets.acme.com", loginReplacesServer(saved, "https://repo-chosen.example", false).?);
+    try std.testing.expect(loginReplacesServer(saved, "https://repo-chosen.example", true) == null);
+    try std.testing.expect(loginReplacesServer(saved, "https://secrets.acme.com/", false) == null);
+    try std.testing.expect(loginReplacesServer(null, "https://repo-chosen.example", false) == null);
 }
 
 test "there is no default server" {

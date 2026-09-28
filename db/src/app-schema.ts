@@ -183,6 +183,17 @@ export const orgMember = sqliteCore.sqliteTable('org_member', {
   sqliteCore.uniqueIndex('org_member_org_id_user_id_unique').on(table.orgId, table.userId),
 ])
 
+// Someone removed from an org. Auto-join by email domain doesn't add them
+// back; accepting an invite does.
+export const orgRemoval = sqliteCore.sqliteTable('org_removal', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  orgId: sqliteCore.text('org_id').notNull().references(() => org.id, { onDelete: 'cascade' }),
+  userId: sqliteCore.text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+}, (table) => [
+  sqliteCore.uniqueIndex('org_removal_org_id_user_id_unique').on(table.orgId, table.userId),
+])
+
 // ── Org invitation table ────────────────────────────────────────────
 // Secret invite links: anyone with the link can join the org after login.
 // No email column — not tied to a specific user. No status column — just
@@ -269,6 +280,9 @@ export const secretEvent = sqliteCore.sqliteTable('secret_event', {
   seq: sqliteCore.integer('seq'),
   hash: sqliteCore.text('hash'),
   signature: sqliteCore.text('signature'),
+  // Joined the chain from before it existed: the Worker signed a row it found
+  // in the database, not a change it made. Its preimage says so.
+  adopted: sqliteCore.integer('adopted', { mode: 'boolean' }).notNull().default(false),
 }, (table) => [
   sqliteCore.index('secret_event_env_name_idx').on(table.environmentId, table.name, table.createdAt),
   sqliteCore.uniqueIndex('secret_event_env_seq_unique').on(table.environmentId, table.seq),

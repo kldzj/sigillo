@@ -28,14 +28,14 @@ import {
   getUserEnvironmentAccess,
   getEnvironmentAccessError,
   getClaimableAutoJoinDomain,
-  deleteOrgMember,
+  deleteOrgMember, setOrgMemberRole,
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
-  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireProtectedAccess, resetMemberPasskeys, type Purpose,
+  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProtectedAccess, resetMemberPasskeys, type Purpose,
   requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
 } from './step-up.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
@@ -144,7 +144,7 @@ export async function deleteSecretAction({ name, environmentIds }: {
 
 // An action that needs a passkey approval first: the browser asks for one
 // (startStepUpAction) and runs the action again
-type StepUp = { stepUp: { purpose: Purpose; environmentIds: string[] } }
+type StepUp = { stepUp: { purpose: 'access' | 'admin'; environmentIds: string[] } }
 
 async function stepUpOr<T>(action: () => Promise<T>): Promise<T | StepUp> {
   try {
@@ -180,7 +180,7 @@ export async function revealEventValueAction({ eventId }: { eventId: string }) {
 // ── Step-up in the browser ──────────────────────────────────────────
 
 // Asks this browser session's own approval: the passkey challenge to sign
-export async function startStepUpAction({ purpose, environmentIds }: { purpose: Purpose; environmentIds: string[] }) {
+export async function startStepUpAction({ purpose, environmentIds }: { purpose: 'access' | 'admin'; environmentIds: string[] }) {
   const session = await requireSession()
   const request = getActionRequest()
   const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds, withCode: false, purpose })
@@ -353,8 +353,7 @@ export async function deleteEnvAction({ id }: { id: string }) {
   return stepUpOr(async () => {
     const session = await requireSession()
     await requireEnvironmentAccess(session.userId, id)
-    // Deleting a protected environment deletes its secrets: the same approval as changing them
-    await requireProtectedAccess({ environmentIds: [id], reader: authorOf(session) })
+    await requireAdminForProtected({ ...session, environmentIds: [id] })
     const db = getDb()
     await db.delete(schema.environment).where(orm.eq(schema.environment.id, id))
     return { ok: true }
@@ -383,9 +382,7 @@ export async function renameEnvAction({ id, name, slug }: {
     if (!name && !slug) throw new Error('At least one of name or slug is required')
     const session = await requireSession()
     await requireEnvironmentAccess(session.userId, id)
-    // A protected environment's slug is what the CLI and CI ask for: moving it
-    // aside would let an unprotected one take its place
-    await requireProtectedAccess({ environmentIds: [id], reader: authorOf(session) })
+    await requireAdminForProtected({ ...session, environmentIds: [id] })
     const db = getDb()
     const updates: Partial<{ name: string; slug: string; updatedAt: number }> = { updatedAt: Date.now() }
     if (name) updates.name = name
@@ -464,6 +461,8 @@ export async function acceptInviteAction({ invitationId }: { invitationId: strin
         })
         .onConflictDoNothing({ target: [schema.orgMember.orgId, schema.orgMember.userId] }),
       ...projects.map((p) => db.insert(schema.memberAccess).values({ orgMemberId: memberId, projectId: p.id })),
+      // Invited back after a removal: auto-join may add them again
+      db.delete(schema.orgRemoval).where(orm.and(orm.eq(schema.orgRemoval.orgId, invite.orgId), orm.eq(schema.orgRemoval.userId, session.userId))),
     ])
   }
 
@@ -493,10 +492,7 @@ export async function updateOrgMemberRoleAction({ memberId, role }: {
       await ensureAnotherAdminExists(member.orgId, member.userId)
     }
 
-    await db.update(schema.orgMember)
-      .set({ role })
-      .where(orm.eq(schema.orgMember.id, member.id))
-      .limit(1)
+    await setOrgMemberRole({ member, role })
 
     return { id: member.id, role }
   })

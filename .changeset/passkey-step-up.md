@@ -16,7 +16,7 @@ Reading or changing a protected environment now takes a passkey, and so do admin
   ✔ Approved for 15 minutes
   ```
 
-- Deleting or renaming a protected environment, or its project, takes a passkey too.
+- Deleting or renaming a protected environment, or its project, is up to an org admin with their passkey.
 - Once you have a passkey, approving a CLI login on `/device` and creating an API token take it too, since both outlive the session that makes them.
 - `sigillo login` opens the login page without the code, and you type the code it shows; the page no longer takes a code from a link.
 - **Admin actions** in an organization with a protected environment take a passkey, covering 5 minutes: invites, roles, a member's projects, removing members, auto-join, an environment's min role or protection, resetting passkeys, machine tokens and deleting the organization.

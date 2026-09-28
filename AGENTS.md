@@ -72,7 +72,9 @@ The value must be valid base64 — `atob()` is used to decode it at runtime. If 
 Rules:
 - **Only `appendSecretEvents()` writes `secret_event`.** A row inserted any other way has no `seq`, so once the environment has a chain the replay ignores it and verify reports it. Tests that need old-style rows insert them before the environment's first chained write; those join the chain in order.
 - **Never change a preimage's fields or their order.** Rows are verified by rebuilding their preimage, so any change breaks every existing row. A new field needs a new preimage version.
-- A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it.
+- A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it. Values have no AAD, so a ciphertext copied into another environment still decrypts there; only a chained row's digest catches it.
+- Rows from before the chain are adopted on their environment's next write (and on the audit GET) with `adopted` set and the preimage kind `adopted` instead of `event`. Adopting a chain's rows a second time, after someone cleared their `seq` in D1, changes every hash, so a saved witness no longer matches. Never adopt with the `event` kind.
+- The chains prove what `audit verify` has already seen. A D1 writer can still grant themselves access, read through the Worker, and delete the newest rows before the next check; the docs say so.
 - Every route that returns secret values calls `recordSecretRead()` **before** the values leave, and must let it throw: a read that can't be recorded fails.
 - Pages send secret names, never values. The web UI fetches a value when someone reveals, downloads or copies it, through `readSecretValues()` / `readEventValue()`, so the read log shows who looked at which value, not who opened a page.
 - Changing `BETTER_AUTH_SECRET` changes the signing key. Old rows then no longer verify, and `sigillo audit verify` reports the new key.

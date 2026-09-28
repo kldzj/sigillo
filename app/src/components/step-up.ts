@@ -9,7 +9,7 @@ import { startAuthentication } from "@simplewebauthn/browser";
 import { router } from "spiceflow/react";
 import { startStepUpAction, finishStepUpAction } from "../actions.ts";
 
-type StepUp = { stepUp: { purpose: "access" | "admin" | "enroll"; environmentIds: string[] } };
+type StepUp = { stepUp: { purpose: "access" | "admin"; environmentIds: string[] } };
 
 function isStepUp(value: unknown): value is StepUp {
   return typeof value === "object" && value !== null && "stepUp" in value;

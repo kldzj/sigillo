@@ -26,7 +26,8 @@ pub const ChainRow = struct {
 pub const AuditResponse = struct {
     environmentId: []const u8,
     publicKey: []const u8,
-    events: struct { rows: []const ChainRow, outside: u64 },
+    // adopted: rows from before the chain, which the server signed as it found them
+    events: struct { rows: []const ChainRow, outside: u64, adopted: u64 = 0 },
     reads: struct { rows: []const ChainRow },
 };
 
@@ -120,7 +121,15 @@ fn readWitnesses(allocator: std.mem.Allocator) !Witnesses {
 }
 
 // Witnesses are kept per server and environment
-pub fn witnessKey(allocator: std.mem.Allocator, api_url: []const u8, environment_id: []const u8) ![]const u8 {
+// Keyed by what you asked to check, not by what the server answers: an
+// environment recreated in the database under a new id, with its history
+// moved over and adopted again, still meets the head seen before
+pub fn witnessKey(allocator: std.mem.Allocator, api_url: []const u8, project: []const u8, environment: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ std.mem.trimRight(u8, api_url, "/"), project, environment });
+}
+
+// How witnesses were keyed before: by the environment id the server sent
+pub fn legacyWitnessKey(allocator: std.mem.Allocator, api_url: []const u8, environment_id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s} {s}", .{ api_url, environment_id });
 }
 

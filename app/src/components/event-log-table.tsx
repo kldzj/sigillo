@@ -177,6 +177,11 @@ export function EventLogTable() {
                     </TableCell>
                     <TableCell>
                       <span className="text-sm text-muted-foreground truncate">{evt.userName}</span>
+                      {evt.unsigned && (
+                        <span className="ml-1.5 text-xs text-destructive" title="Not part of the signed history: added to the database around it">
+                          unsigned
+                        </span>
+                      )}
                     </TableCell>
                   </TableRow>
                 );

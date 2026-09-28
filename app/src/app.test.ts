@@ -15,12 +15,12 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import worker, { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, setOrgMemberRole, getSession, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
-import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled } from './step-up.js'
+import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode } from './lib/utils.js'
 
@@ -53,6 +53,10 @@ async function insertApiToken({
 }) {
   const { key, hashedKey, prefix } = await generateApiToken()
   const db = getDb()
+  // Its creator is a member of the org, as the Tokens tab requires: a token
+  // acts with its creator's access
+  const project = await db.query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } })
+  if (project) await db.insert(schema.orgMember).values({ orgId: project.orgId, userId: createdBy, role: 'member' }).onConflictDoNothing()
   const [token] = await db.insert(schema.apiToken).values({
     name,
     projectId,
@@ -615,6 +619,25 @@ describe('secrets — download formats', () => {
 // ── API tokens ──────────────────────────────────────────────────────
 
 describe('api tokens', () => {
+  test('a token acts with its creator\'s current access to its project', async () => {
+    const admin = await createTestUser({ name: 'Scope Admin' })
+    const member = await createTestUser({ name: 'Scope Member' })
+    const af = authedFetch(admin.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Scope Org' } })).id
+    const payments = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Payments', orgId } })).id
+    const website = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Website', orgId } })).id
+    const dev = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId: payments, id: 'dev' } })).id
+    await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    const { key } = await insertApiToken({ name: 'Payments CI', projectId: payments, createdBy: member.user.id })
+    const read = async () => (await app.handle(new Request(`http://e.ly/api/v0/projects/${payments}/environments/${dev}/secrets`, { headers: { authorization: `Bearer ${key}` } }))).status
+    const before = await read()
+    // An admin limits the member to the website
+    const [row] = await getDb().update(schema.orgMember).set({ projectAccess: 'selected' })
+      .where(orm.and(orm.eq(schema.orgMember.orgId, orgId), orm.eq(schema.orgMember.userId, member.user.id))).returning({ id: schema.orgMember.id })
+    await getDb().insert(schema.memberAccess).values({ orgMemberId: row!.id, projectId: website })
+    expect({ before, after: await read() }).toEqual({ before: 200, after: 403 })
+  })
+
   let userToken: string
   let projectId: string
   let devEnvId: string
@@ -1188,8 +1211,8 @@ describe('secrets derivation — batching & multi-author', () => {
       ]
     `)
     // both authors are represented across the derived secrets
-    const authorIds = new Set(secrets.map((s) => s.userId))
-    expect(authorIds).toEqual(new Set([authorAId, authorBId]))
+    const authorIds = new Set(secrets.map((s) => s.actor))
+    expect(authorIds).toEqual(new Set([`user:${authorAId}`, `user:${authorBId}`]))
   })
 
   test('event sourcing: delete removes a name from both secrets and union', async () => {
@@ -1234,6 +1257,32 @@ describe('secrets derivation — batching & multi-author', () => {
 // ── Removing a member ───────────────────────────────────────────────
 
 describe('removing a member', () => {
+  test('sticks in an org that auto-joins their domain', async () => {
+    const domain = `rejoin-${Date.now()}.com`
+    const admin = await createTestUser({ email: `admin@${domain}`, name: 'Rejoin Admin' })
+    const leaver = await createTestUser({ email: `leaver@${domain}`, name: 'Leaver' })
+    await getDb().update(schema.user).set({ emailVerified: true }).where(orm.inArray(schema.user.id, [admin.user.id, leaver.user.id]))
+    const orgId = assertOk(await authedFetch(admin.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Rejoin Org', enableAutoJoin: true } })).id
+    const session = (await getSession(new Request('http://e.ly/dash', { headers: { authorization: `Bearer ${leaver.token}` } })))!
+    const isMember = async () => !!await getDb().query.orgMember.findFirst({ where: { orgId, userId: leaver.user.id } })
+    await autoJoinOrgsByDomain(session)
+    const joined = await isMember()
+    await deleteOrgMember((await getDb().query.orgMember.findFirst({ where: { orgId, userId: leaver.user.id } }))!)
+    // Their next page load, with the session they still have
+    await autoJoinOrgsByDomain(session)
+    expect({ joined, afterRemoval: await isMember() }).toEqual({ joined: true, afterRemoval: false })
+  })
+
+  test('a demoted admin\'s invite links stop working, as a removed member\'s do', async () => {
+    const admin = await createTestUser({ name: 'Staying Admin' })
+    const demoted = await createTestUser({ name: 'Demoted Admin' })
+    const orgId = assertOk(await authedFetch(admin.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Demote Org' } })).id
+    const [member] = await getDb().insert(schema.orgMember).values({ orgId, userId: demoted.user.id, role: 'admin' }).returning()
+    await getDb().insert(schema.orgInvitation).values({ orgId, createdBy: demoted.user.id, expiresAt: Date.now() + 60_000 })
+    await setOrgMemberRole({ member: member!, role: 'member' })
+    expect(await getDb().query.orgInvitation.findMany({ where: { orgId } })).toEqual([])
+  })
+
   test('revokes the tokens and invite links they created and keeps their secrets', async () => {
     const admin = await createTestUser({ name: 'RemovalAdmin' })
     const leaver = await createTestUser({ name: 'RemovalLeaver' })
@@ -2055,6 +2104,18 @@ describe('sign-in allowlist (ALLOWED_USERS)', () => {
   }
   const me = (token: string) => app.handle(new Request('http://e.ly/api/v0/me', { headers: { authorization: `Bearer ${token}` } }))
 
+  test('an API token stops working once its creator is off the list', async () => {
+    const creator = await createTestUser({ name: 'Leaver' })
+    const af = authedFetch(creator.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Leaver Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Leaver Project', orgId } })).id
+    const { key } = await insertApiToken({ name: 'CI', projectId, createdBy: creator.user.id })
+    const listed = (await me(key)).status
+    await withAllowed('someone-else@example.com', async () => {
+      expect({ listed, unlisted: (await me(key)).status }).toEqual({ listed: 200, unlisted: 401 })
+    })
+  })
+
   test('only verified emails match: an address itself, a domain exactly', () => {
     const list = 'Ops@Partner.io, acme.com'
     expect({
@@ -2213,6 +2274,68 @@ describe('instance', () => {
       llms: 404,
       login: { status: 200, location: null, robots: 'noindex, nofollow' },
     })
+  })
+})
+
+describe('log pages', () => {
+  test('send someone who can\'t open the project away before naming its environments', async () => {
+    const owner = await createTestUser({ name: 'Log Owner' })
+    const outsider = await createTestUser({ name: 'Log Outsider' })
+    const af = authedFetch(owner.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Log Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Log Project', orgId } })).id
+    const open = async (path: string, token?: string) => {
+      const res = await app.handle(new Request(`http://e.ly/dash/projects/${projectId}/${path}`, { headers: token ? { authorization: `Bearer ${token}` } : {}, redirect: 'manual' }))
+      return new URL(res.headers.get('location') ?? '', 'http://e.ly').pathname
+    }
+    expect({
+      signedOut: [await open('event-log'), await open('read-log')],
+      outsider: [await open('event-log', outsider.token), await open('read-log', outsider.token)],
+    }).toEqual({ signedOut: ['/login', '/login'], outsider: ['/dash', '/dash'] })
+  })
+})
+
+describe('instance headers', () => {
+  test('no page can be framed or cached, and the API refuses cookie writes from another origin', async () => {
+    const user = await createTestUser({ name: 'Header User' })
+    const af = authedFetch(user.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Header Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Header Project', orgId } })).id
+    const dev = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'dev' } })).id
+    // A browser's cookie on the http test host
+    const cookie = `better-auth.session_token=${encodeURIComponent(user.token)}`
+    const headersOf = async (path: string) => {
+      const res = await worker.fetch(new Request(`http://e.ly${path}`, { headers: { cookie } }))
+      return [res.headers.get('x-frame-options'), res.headers.get('content-security-policy'), res.headers.get('cache-control')]
+    }
+    // What a form on another page sends: the cookie rides along, the body parses as JSON
+    const write = (origin: string, name: string) => worker.fetch(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${dev}/secrets`, {
+      method: 'POST', headers: { cookie, origin, 'content-type': 'text/plain' }, body: JSON.stringify({ name, value: 'v' }),
+    }))
+    expect({
+      device: await headersOf('/device'),
+      secrets: await headersOf(`/api/v0/projects/${projectId}/environments/${dev}/secrets`),
+      crossOrigin: (await write('http://evil.e.ly', 'PLANTED')).status,
+      sameOrigin: (await write('http://e.ly', 'MINE')).status,
+    }).toEqual({
+      device: ['DENY', "frame-ancestors 'none'", 'no-store'],
+      secrets: ['DENY', "frame-ancestors 'none'", 'no-store'],
+      crossOrigin: 403,
+      sameOrigin: 200,
+    })
+  })
+})
+
+describe('better-auth endpoints', () => {
+  test('the ones the app never uses are off, so nobody renames themselves', async () => {
+    const user = await createTestUser({ name: 'Real Name' })
+    const post = (path: string, body: unknown) => app.handle(new Request(`http://e.ly/api/auth${path}`, {
+      method: 'POST', headers: { authorization: `Bearer ${user.token}`, origin: 'http://e.ly', 'content-type': 'application/json' }, body: JSON.stringify(body),
+    }))
+    const renamed = await post('/update-user', { name: 'The Admin', image: 'https://attacker.example/pixel.png' })
+    const listed = await app.handle(new Request('http://e.ly/api/auth/list-sessions', { headers: { authorization: `Bearer ${user.token}` } }))
+    const me = await (await app.handle(new Request('http://e.ly/api/v0/me', { headers: { authorization: `Bearer ${user.token}` } }))).json() as { user: { name: string } }
+    expect({ renamed: renamed.status, listed: listed.status, name: me.user.name }).toEqual({ renamed: 404, listed: 404, name: 'Real Name' })
   })
 })
 
@@ -2379,9 +2502,28 @@ describe('tamper-evident history', () => {
     const result = await verify(envId)
     const derived = await deriveSecrets(envId)
     expect({
-      events: result.events.ok, rows: result.chains.events.rows.length, outside: result.outside,
+      events: result.events.ok, rows: result.chains.events.rows.length, outside: result.outside, adopted: result.chains.events.adopted,
       old: await decrypt(derived.find((d) => d.name === 'OLD')!.valueEncrypted, derived.find((d) => d.name === 'OLD')!.iv),
-    }).toEqual({ events: true, rows: 3, outside: 0, old: '2' })
+    }).toEqual({ events: true, rows: 3, outside: 0, adopted: 2, old: '2' })
+  })
+
+  test('a chain taken apart in the database and adopted again no longer matches the head verify saved', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'WEBHOOK_URL', 'https://hooks.example/real')
+    const before = await verify(envId)
+    if (!before.events.ok || !before.events.head) throw new Error('expected an intact chain')
+    const witness = before.events.head
+    // Someone with the database drops every seq, and adds a row in the admin's name
+    const planted = await encrypt('https://attacker.example/hook')
+    await getDb().update(schema.secretEvent).set({ seq: null }).where(orm.eq(schema.secretEvent.environmentId, envId))
+    await getDb().insert(schema.secretEvent).values({
+      environmentId: envId, name: 'WEBHOOK_URL', operation: 'set', valueEncrypted: planted.encrypted, iv: planted.iv, userId: admin.user.id, createdAt: Date.now() + 1000,
+    })
+    const after = await verify(envId)
+    const rows = after.chains.events.rows
+    // What `sigillo audit verify` compares with the head it saved
+    const witnessHolds = rows.length >= witness.seq && rows[witness.seq - 1]!.hash === witness.hash
+    expect({ witnessHolds, adopted: after.chains.events.adopted }).toEqual({ witnessHolds: false, adopted: 2 })
   })
 
   test('racing writes take turns instead of forking the chain', async () => {
@@ -2494,6 +2636,28 @@ describe('tamper-evident history', () => {
       admin: (await get(admin.token, `${envId}/audit`)).status,
     }).toEqual({ member: 403, token: 403, admin: 200 })
   })
+  test('a value starting with a byte order mark keeps it, and keeps its history intact', async () => {
+    const envId = await newEnv()
+    expect((await setSecret(admin.token, envId, 'CERT', '\uFEFF-----BEGIN CERTIFICATE-----')).status).toBe(200)
+    const { value } = await (await get(admin.token, `${envId}/secrets/CERT`)).json() as { value: string }
+    expect({ value, intact: (await verify(envId)).events.ok }).toEqual({ value: '\uFEFF-----BEGIN CERTIFICATE-----', intact: true })
+  })
+
+  test('text that isn\'t valid is refused, so it can\'t break the history', async () => {
+    const envId = await newEnv()
+    const res = await setSecret(admin.token, envId, 'X', 'a\uD800b')
+    expect({ status: res.status, body: await res.json() }).toEqual({ status: 400, body: { error: 'Secret names and values must be valid text' } })
+  })
+
+  test('the pages name a change\'s author as its chain row does', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'v')
+    // Someone with the database pins the change on a member
+    await getDb().update(schema.secretEvent).set({ userId: member.user.id }).where(orm.eq(schema.secretEvent.environmentId, envId))
+    const [secret] = await deriveSecrets(envId)
+    expect({ intact: (await verify(envId)).events.ok, author: secret!.actor }).toEqual({ intact: true, author: `user:${admin.user.id}` })
+  })
+
 })
 
 describe('remembered environment', () => {
@@ -2954,7 +3118,7 @@ describe('protected writes and admin actions', () => {
       .toEqual({ withoutSession: 'step-up:access', withoutGrant: 'step-up:access', granted: 'ok' })
   })
 
-  test('deleting a protected environment or its project takes an approval', async () => {
+  test('deleting a protected environment or its project takes an admin approval', async () => {
     const af = authedFetch(admin.token)
     const token = await freshLogin()
     const slug = `doomed-${Date.now()}`
@@ -2971,14 +3135,17 @@ describe('protected writes and admin actions', () => {
     const deleteProject = () => call(token, `/api/v0/projects/${other}`, 'DELETE')
     const without = { env: (await deleteEnv()).status, project: (await deleteProject()).status }
     const kept = await exists()
+    // Approving access to the environments isn't enough
     await grantRead(token, [doomed, otherProd])
+    const accessOnly = { env: (await deleteEnv()).status, project: (await deleteProject()).status }
+    await grantAdmin(token)
     const granted = { env: (await deleteEnv()).status, project: (await deleteProject()).status }
-    expect({ without, kept, granted, gone: await exists() }).toEqual({
-      without: { env: 403, project: 403 }, kept: { env: true, project: true }, granted: { env: 200, project: 200 }, gone: { env: false, project: false },
+    expect({ without, kept, accessOnly, granted, gone: await exists() }).toEqual({
+      without: { env: 403, project: 403 }, kept: { env: true, project: true }, accessOnly: { env: 403, project: 403 }, granted: { env: 200, project: 200 }, gone: { env: false, project: false },
     })
   })
 
-  test('renaming a protected environment, or a project with one, takes an approval', async () => {
+  test('renaming a protected environment, or a project with one, takes an admin approval', async () => {
     const token = await freshLogin()
     const af = authedFetch(admin.token)
     const slug = `renamed-${Date.now()}`
@@ -2994,10 +3161,13 @@ describe('protected writes and admin actions', () => {
     })
     const kept = await names()
     await grantRead(token, [guarded, prod])
+    const accessOnly = { env: (await renameEnv()).status, project: (await renameProject()).status }
+    await grantAdmin(token)
     const granted = { env: (await renameEnv()).status, project: (await renameProject()).status }
-    expect({ without, kept, granted, after: await names() }).toEqual({
+    expect({ without, kept, accessOnly, granted, after: await names() }).toEqual({
       without: { env: 403, project: 403, unprotected: 200 },
       kept: { slug, project: 'Writes Project' },
+      accessOnly: { env: 403, project: 403 },
       granted: { env: 200, project: 200 },
       after: { slug: `${slug}-old`, project: 'Writes Project renamed' },
     })
@@ -3048,6 +3218,84 @@ describe('protected writes and admin actions', () => {
       .map(nameOf)
     // And admin checks only through requireOrgAdmin
     expect({ unwrapped, ownAdminChecks: source.match(/\{ role \} = await requireOrgMember/g) ?? [] }).toEqual({ unwrapped: [], ownAdminChecks: [] })
+  })
+})
+
+describe('API errors', () => {
+  const call = (token: string, path: string, method: string, body: unknown) => app.handle(new Request(`http://e.ly${path}`, {
+    method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }))
+
+  test('answer with a status and a message, never a stack trace or a query', async () => {
+    const user = await createTestUser({ name: 'Error User' })
+    const stranger = await createTestUser({ name: 'Error Stranger' })
+    const af = authedFetch(user.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Error Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Error Project', orgId } })).id
+    const prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+    // A slug that is taken, and an approval for another org's environment
+    const taken = await call(user.token, `/api/v0/projects/${projectId}/environments`, 'POST', { name: 'Dev again', slug: 'dev' })
+    const foreign = await call(stranger.token, '/api/v0/step-up', 'POST', { environmentIds: [prod] })
+    expect([
+      { status: taken.status, body: await taken.json() },
+      { status: foreign.status, body: await foreign.json() },
+    ]).toEqual([
+      { status: 409, body: { error: 'already exists' } },
+      { status: 403, body: { error: 'forbidden' } },
+    ])
+  })
+})
+
+describe('moving a protected environment aside', () => {
+  const origin = 'http://e.ly'
+  const call = (token: string, path: string, method = 'GET', body?: unknown) => app.handle(new Request(`${origin}${path}`, {
+    method,
+    headers: { authorization: `Bearer ${token}`, origin, 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }))
+  const setup = async (name: string) => {
+    const admin = await createTestUser({ name: `${name} Admin` })
+    const member = await createTestUser({ name: `${name} Member` })
+    const af = authedFetch(admin.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: `${name} Org` } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: `${name} Project`, orgId } })).id
+    const prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+    await setEnvironmentProtection({ request: new Request(origin), environmentId: prod, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    return { admin, member, orgId, projectId, prod }
+  }
+
+  test('only an admin with a passkey approval deletes or renames it, or its project', async () => {
+    const { admin, member, projectId, prod } = await setup('Aside')
+    // The member may read and change prod with their own approval
+    await grantRead(member.token, [prod])
+    const env = `/api/v0/projects/${projectId}/environments/${prod}`
+    const byMember = {
+      renameEnv: (await call(member.token, env, 'PATCH', { slug: 'prod-old' })).status,
+      deleteEnv: (await call(member.token, env, 'DELETE')).status,
+      renameProject: (await call(member.token, `/api/v0/projects/${projectId}`, 'PATCH', { name: 'Old' })).status,
+      deleteProject: (await call(member.token, `/api/v0/projects/${projectId}`, 'DELETE')).status,
+    }
+    const adminWithoutApproval = await (await call(admin.token, env, 'PATCH', { slug: 'prod-old' })).json() as { code?: string; purpose?: string }
+    await grantAdmin(admin.token)
+    const adminApproved = (await call(admin.token, env, 'PATCH', { name: 'Production' })).status
+    expect({ byMember, adminWithoutApproval: [adminWithoutApproval.code, adminWithoutApproval.purpose], adminApproved }).toEqual({
+      byMember: { renameEnv: 403, deleteEnv: 403, renameProject: 403, deleteProject: 403 },
+      adminWithoutApproval: ['STEP_UP_REQUIRED', 'admin'],
+      adminApproved: 200,
+    })
+  })
+
+  test('a member can\'t rename a project with an admin-only environment, as they can\'t delete it', async () => {
+    const admin = await createTestUser({ name: 'Name Admin' })
+    const member = await createTestUser({ name: 'Name Member' })
+    const af = authedFetch(admin.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Name Org' } })).id
+    const payments = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Payments', orgId } })).id
+    await getDb().update(schema.environment).set({ accessRole: 'admin' }).where(orm.and(orm.eq(schema.environment.projectId, payments), orm.eq(schema.environment.slug, 'prod')))
+    await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    const rename = await call(member.token, `/api/v0/projects/${payments}`, 'PATCH', { name: 'Payments (old)' })
+    expect({ status: rename.status, body: await rename.json() }).toEqual({ status: 403, body: { error: 'admin access required for this environment' } })
   })
 })
 
@@ -3216,6 +3464,44 @@ describe('passkey enrollment', () => {
       afterApproval: 200,
       usedUp: 403,
     })
+  })
+
+  test('only asking to add a passkey opens an enrollment request, and nobody approves one that needs no admin', async () => {
+    const victim = await createTestUser({ name: 'Only Passkey Admin' })
+    const stranger = await createTestUser({ name: 'Stranger' })
+    const af = authedFetch(victim.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Small Team' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Small', orgId } })).id
+    const prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+    await setEnvironmentProtection({ request: new Request(origin), environmentId: prod, protect: true, author: { userId: victim.user.id, apiTokenId: null } })
+    expect(await register(victim.token)).toBe(200)
+    // An hour later, someone has the login
+    const login = await loginOf(victim.token)
+    await getDb().update(schema.session).set({ createdAt: Date.now() - 60 * 60 * 1000 }).where(orm.eq(schema.session.id, login.sessionId))
+    // What the browser's step-up action passes on, with a purpose it picked
+    const asked = await outcomeOf(() => createStepUpRequest({ request: new Request(origin), userId: login.userId, sessionId: login.sessionId, environmentIds: [], withCode: false, purpose: 'enroll' as never }))
+    // A request like an admin's, from before: nobody else in the org has a passkey
+    const [older] = await getDb().insert(schema.stepUpRequest).values({
+      userId: login.userId, sessionId: login.sessionId, environmentIds: [], purpose: 'enroll', expiresAt: Date.now() + 60_000,
+    }).returning({ id: schema.stepUpRequest.id })
+    const byStranger = await outcomeOf(async () => approveEnrollment({ requestId: older!.id, approver: { userId: stranger.user.id, sessionId: await sessionIdOf(stranger.token) } }))
+    expect({ asked, byStranger, anotherPasskey: await register(victim.token) }).toEqual({
+      asked: 'Unknown approval',
+      byStranger: 'This request needs no admin approval',
+      anotherPasskey: 403,
+    })
+  })
+
+  test('one approval to add a passkey is used up as the passkey is added, so two registrations can\'t share it', async () => {
+    const user = await createTestUser({ name: 'Racing Enroller' })
+    const login = await loginOf(user.token)
+    // An old login with an approval to add a passkey, as an admin or another device gives it
+    await getDb().update(schema.session).set({ createdAt: Date.now() - 60 * 60 * 1000 }).where(orm.eq(schema.session.id, login.sessionId))
+    await getDb().insert(schema.stepUpGrant).values({ userId: user.user.id, sessionId: login.sessionId, purpose: 'enroll', environmentIds: [], createdAt: Date.now(), expiresAt: Date.now() + 60_000 })
+    const aged = { ...login, sessionCreatedAt: Date.now() - 60 * 60 * 1000 }
+    expect(await canAddPasskey(aged)).toBe(true)
+    // Two registrations reach the check at once
+    expect((await Promise.all([claimPasskeyAddition(aged), claimPasskeyAddition(aged)])).sort()).toEqual([false, true])
   })
 
   test('a passkey on another device is approved on /approve with a code, from a fresh sign-in only', async () => {

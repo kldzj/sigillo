@@ -143,7 +143,7 @@ fn printAvailableProjects(
         if (index == 0) {
             try stderr.writeAll("available projects:\n");
         }
-        try stderr.print("  - {s} / {s} ({s})\n", .{ project.orgName, project.name, project.id });
+        try stderr.print("  - {s} / {s} ({s})\n", .{ try color.plain(allocator, project.orgName), try color.plain(allocator, project.name), project.id });
     }
 }
 
@@ -156,7 +156,11 @@ fn printAvailableEnvs(
     if (envs.len == 0) return;
     try stderr.writeAll("available envs:\n");
     for (envs) |env| {
-        try stderr.print("  - {s} ({s})\n", .{ env.name, env.slug });
+        try stderr.writeAll("  - ");
+        try color.writePlain(stderr, env.name);
+        try stderr.writeAll(" (");
+        try color.writePlain(stderr, env.slug);
+        try stderr.writeAll(")\n");
     }
 }
 
@@ -231,7 +235,7 @@ fn requireProjectId(allocator: std.mem.Allocator, stderr: Writer, api: ApiContex
     try color.err(stderr, "error");
     try stderr.print(": {d} projects are named {s}, use the project ID instead\n", .{ matches.len, ref });
     for (matches) |project| {
-        try stderr.print("  - {s} / {s} ({s})\n", .{ project.orgName, project.name, project.id });
+        try stderr.print("  - {s} / {s} ({s})\n", .{ try color.plain(allocator, project.orgName), try color.plain(allocator, project.name), project.id });
     }
     std.process.exit(1);
 }
@@ -317,6 +321,7 @@ const Run = zeke.cmd("run <...cmd>", "Run a command with secrets injected")
     .option("--mount [path]", "Write secrets to a new owner-only file (must not exist), deleted when the command exits")
     .option("--mount-format [fmt]", "Format for mounted file: env, env-no-quotes, json, yaml, docker, dotnet-json (default: env)")
     .option("--disable-redaction", "Print child output without secret redaction")
+    .optionMany("--allow-env <name>", "Let a secret set a variable that controls how programs run, like NODE_OPTIONS or PATH (repeatable)")
     .option("-p, --project [id]", "Project ID or name override")
     .option("--env [slug]", "Env slug override (e.g. dev, prod)")
     .option("-c, --config [slug]", "Env slug override")
@@ -432,6 +437,11 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
     });
 
     const api_url = resolved.api_url orelse exitNoApiUrl(stderr);
+    if (config.loginReplacesServer(try config.getScope(allocator, scope), api_url, global.api_url != null)) |saved_url| {
+        try color.err(stderr, "error");
+        try stderr.print(": {s} is saved for the scope {s}. Signing in to {s}, which came from SIGILLO_API_URL or another directory, would replace it: pass --api-url {s} to do that.\n", .{ saved_url, scope, api_url, api_url });
+        std.process.exit(1);
+    }
 
     // Only a token given with --token or SIGILLO_TOKEN is saved as is. The
     // saved one is not: when it stops working, login must sign in again.
@@ -665,17 +675,17 @@ fn meAction(_: Me.Args, opts: Me.Options, global: Global.Options) !void {
         return;
     };
     try color.blue(stdout, "User:  ");
-    try color.bold(stdout, if (me.user.name.len > 0) me.user.name else "—");
+    try color.bold(stdout, if (me.user.name.len > 0) try color.plain(allocator, me.user.name) else "—");
     try stdout.writeAll("\n");
     try color.blue(stdout, "Email: ");
-    try stdout.print("{s}\n", .{if (me.user.email.len > 0) me.user.email else "—"});
+    try stdout.print("{s}\n", .{if (me.user.email.len > 0) try color.plain(allocator, me.user.email) else "—"});
 
     if (me.orgs.len > 0) {
         try stdout.writeAll("\n");
         try color.blue(stdout, "Organizations:\n");
         for (me.orgs) |org| {
             try stdout.writeAll("  ");
-            try color.bold(stdout, org.name);
+            try color.bold(stdout, try color.plain(allocator, org.name));
             try stdout.print("  {s}  ", .{org.id});
             try color.dim(stdout, org.role);
             try stdout.writeAll("\n");
@@ -799,9 +809,9 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
         const proj_options = try allocator.alloc([]const u8, projects.projects.len);
         for (projects.projects, 0..) |p, i| {
             proj_options[i] = if (multi_org)
-                try std.fmt.allocPrint(allocator, "{s} / {s} ({s})", .{ p.orgName, p.name, p.id })
+                try std.fmt.allocPrint(allocator, "{s} / {s} ({s})", .{ try color.plain(allocator, p.orgName), try color.plain(allocator, p.name), p.id })
             else
-                try std.fmt.allocPrint(allocator, "{s} ({s})", .{ p.name, p.id });
+                try std.fmt.allocPrint(allocator, "{s} ({s})", .{ try color.plain(allocator, p.name), p.id });
         }
         const proj_choice = try prompt.select("Select project", proj_options, 0) orelse {
             try color.err(stderr, "error");
@@ -873,7 +883,7 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
     } else if (is_tty) env_sel: {
         const env_options = try allocator.alloc([]const u8, all_envs.len);
         for (all_envs, 0..) |e, i| {
-            env_options[i] = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ e.name, e.slug });
+            env_options[i] = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ try color.plain(allocator, e.name), try color.plain(allocator, e.slug) });
         }
         const env_choice = try prompt.select("Select env", env_options, 0) orelse {
             try color.err(stderr, "error");
@@ -996,7 +1006,11 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
 
     var env_map = try std.process.getEnvMap(gpa.allocator());
     defer env_map.deinit();
-    try mergeSecretsIntoEnvMap(&env_map, secrets);
+    const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, secrets, opts.allow_env);
+    for (skipped) |name| {
+        try color.yellow(stderr, "warning");
+        try stderr.print(": skipped the secret {s}: it controls how programs run. Pass --allow-env {s} to use it.\n", .{ name, name });
+    }
 
     // Marker so child processes can detect they're running inside sigillo.
     // Tools like tuistory use this to skip their own session management.
@@ -1556,7 +1570,7 @@ fn flushRedactedPending(
 
     if (write_len == 0) return;
 
-    redactInPlace(pending.items, redaction_plan.sorted_values);
+    redactStartingBefore(pending.items, redaction_plan.sorted_values, write_len);
     try writer.writeAll(pending.items[0..write_len]);
 
     const tail_len = pending.items.len - write_len;
@@ -1581,9 +1595,19 @@ fn overlapTailLen(output: []const u8, redact_values: []const []const u8) usize {
     return best;
 }
 
-fn redactInPlace(output: []u8, redact_values: []const []const u8) void {
+// Masks the secrets that start before limit: they end within output, since a
+// secret still arriving would have been held back. One that starts after it
+// waits for the rest: masking a shorter secret inside it now would keep a
+// longer one that contains it from matching once it's complete.
+fn redactStartingBefore(output: []u8, redact_values: []const []const u8, limit: usize) void {
     for (redact_values) |value| {
-        redactSecretInPlace(output, value);
+        if (value.len == 0 or value.len > output.len) continue;
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, output, start, value)) |index| {
+            if (index >= limit) break;
+            @memset(output[index .. index + value.len], '*');
+            start = index + value.len;
+        }
     }
 }
 
@@ -1941,8 +1965,9 @@ fn auditVerifyAction(_: AuditVerify.Args, opts: AuditVerify.Options, global: Glo
         std.process.exit(1);
     };
 
-    const key = try audit.witnessKey(allocator, ctx.api.api_url, chains.environmentId);
-    const witness = try audit.readWitness(allocator, key);
+    const key = try audit.witnessKey(allocator, ctx.api.api_url, ctx.project_id, ctx.environment_id);
+    const witness = try audit.readWitness(allocator, key) orelse
+        try audit.readWitness(allocator, try audit.legacyWitnessKey(allocator, ctx.api.api_url, chains.environmentId));
     if (witness) |seen| {
         if (!std.mem.eql(u8, seen.public_key, chains.publicKey)) {
             try color.err(stderr, "✘");
@@ -1975,6 +2000,14 @@ fn auditVerifyAction(_: AuditVerify.Args, opts: AuditVerify.Options, global: Glo
             try color.green(stdout, "✔");
             try stdout.print(" {s}: {d} {s}, intact\n", .{ chain.label, chain.rows.len, if (chain.rows.len == 1) "row" else "rows" });
         }
+    }
+    if (chains.events.adopted > 0) {
+        try color.dim(stdout, try std.fmt.allocPrint(allocator, "  {d} of the changes {s} from before the history was signed: the server signed {s} as it found {s} in the database\n", .{
+            chains.events.adopted,
+            if (chains.events.adopted == 1) "is" else "are",
+            if (chains.events.adopted == 1) "it" else "them",
+            if (chains.events.adopted == 1) "it" else "them",
+        }));
     }
     if (chains.events.outside > 0) {
         intact = false;
@@ -2600,12 +2633,47 @@ fn environmentsDeleteAction(args: EnvironmentsDelete.Args, _: EnvironmentsDelete
     try stdout.print("ok: true\nid: {s}\n", .{try quoteString(allocator, res.value.?.id)});
 }
 
-fn mergeSecretsIntoEnvMap(env_map: *std.process.EnvMap, secrets: std.json.ObjectMap) !void {
-    var iter = secrets.iterator();
-    while (iter.next()) |entry| {
-        if (entry.value_ptr.* != .string) continue;
-        try env_map.put(entry.key_ptr.*, entry.value_ptr.*.string);
+// Variables that decide which programs run and what they load. Anyone who can
+// write the environment chooses its secrets, so these only come from a secret
+// when the user passes --allow-env for them.
+const execution_variables = [_][]const u8{
+    "PATH",              "IFS",             "ENV",           "BASH_ENV",         "ZDOTDIR",       "PROMPT_COMMAND",
+    "SHELLOPTS",         "BASHOPTS",        "NODE_OPTIONS",  "NODE_PATH",        "PYTHONPATH",    "PYTHONSTARTUP",
+    "PYTHONHOME",        "PERL5OPT",        "PERL5LIB",      "PERLLIB",          "RUBYOPT",       "RUBYLIB",
+    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",   "JDK_JAVA_OPTIONS", "GIT_SSH",       "GIT_SSH_COMMAND", "GIT_EXEC_PATH",
+    "GIT_ASKPASS",       "SSH_ASKPASS",
+};
+const execution_prefixes = [_][]const u8{ "LD_", "DYLD_", "GIT_CONFIG" };
+
+fn controlsExecution(name: []const u8) bool {
+    for (execution_variables) |variable| {
+        if (std.mem.eql(u8, name, variable)) return true;
     }
+    for (execution_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return true;
+    }
+    return false;
+}
+
+// Puts the secrets into the child's environment, and returns the names it
+// skipped because they control how programs run
+fn mergeSecretsIntoEnvMap(allocator: std.mem.Allocator, env_map: *std.process.EnvMap, secrets: std.json.ObjectMap, allowed: []const []const u8) ![]const []const u8 {
+    var skipped = std.ArrayListUnmanaged([]const u8).empty;
+    var iter = secrets.iterator();
+    next: while (iter.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const name = entry.key_ptr.*;
+        if (controlsExecution(name)) {
+            for (allowed) |allow| {
+                if (std.mem.eql(u8, allow, name)) break;
+            } else {
+                try skipped.append(allocator, name);
+                continue :next;
+            }
+        }
+        try env_map.put(name, entry.value_ptr.*.string);
+    }
+    return skipped.items;
 }
 
 fn selfHostAction(_: SelfHost.Args, _: SelfHost.Options, _: Global.Options) !void {
@@ -2740,6 +2808,52 @@ fn isSupportedShell(shell_path: []const u8) bool {
         if (std.mem.endsWith(u8, shell_path, suffix)) return true;
     }
     return false;
+}
+
+test "run: a secret doesn't set a variable that controls how programs run, unless allowed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    // Anyone who can write the environment chooses these names and values
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"API_KEY":"k","PATH":"/tmp/elsewhere","LD_PRELOAD":"/tmp/lib.so","NODE_OPTIONS":"--require /tmp/x.js","BASH_ENV":"/tmp/x.sh"}
+    , .{});
+    var env_map = std.process.EnvMap.init(allocator);
+    try env_map.put("PATH", "/usr/bin:/bin");
+    const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, parsed.object, &.{"NODE_OPTIONS"});
+    try std.testing.expectEqualStrings("k", env_map.get("API_KEY").?);
+    try std.testing.expectEqualStrings("/usr/bin:/bin", env_map.get("PATH").?);
+    try std.testing.expect(env_map.get("LD_PRELOAD") == null);
+    try std.testing.expect(env_map.get("BASH_ENV") == null);
+    try std.testing.expectEqualStrings("--require /tmp/x.js", env_map.get("NODE_OPTIONS").?);
+    try std.testing.expectEqual(@as(usize, 3), skipped.len);
+}
+
+test "the browser opens only a plain web address from the server" {
+    try std.testing.expect(isSafeToOpen("https://secrets.acme.com/device"));
+    try std.testing.expect(isSafeToOpen("http://localhost:5188/device"));
+    try std.testing.expect(!isSafeToOpen("https://sigillo.example/device&calc"));
+    try std.testing.expect(!isSafeToOpen("https://sigillo.example/device|calc"));
+    try std.testing.expect(!isSafeToOpen("file:///etc/passwd"));
+    try std.testing.expect(!isSafeToOpen("https://sigillo.example/device a"));
+}
+
+test "redaction masks a secret that contains another one, when a write ends between them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const password = "Xk9pQ2mL7vR4tY8wZ3";
+    const url = "postgres://app:Xk9pQ2mL7vR4tY8wZ3@db.internal:5432/app";
+    const plan = try createRedactionPlan(allocator, &.{ password, url });
+    var pending = std.ArrayListUnmanaged(u8).empty;
+    var output = std.ArrayListUnmanaged(u8).empty;
+    // The child's write happens to end right after the password
+    try pending.appendSlice(allocator, "DATABASE_URL=postgres://app:Xk9pQ2mL7vR4tY8wZ3");
+    try flushRedactedPending(&pending, plan, false, output.writer(allocator));
+    try pending.appendSlice(allocator, "@db.internal:5432/app\n");
+    try flushRedactedPending(&pending, plan, true, output.writer(allocator));
+    const whole = try redactOutputAlloc(allocator, "DATABASE_URL=" ++ url ++ "\n", &.{ password, url });
+    try std.testing.expectEqualStrings(whole, output.items);
 }
 
 test "formatUserCode writes a login code as XXXX-XXXX" {
@@ -3999,13 +4113,22 @@ test "login leaves scope unset when flag is omitted" {
     try std.testing.expect(State.scope == null);
 }
 
+// The URL comes from the server: open only a plain web address, and never
+// through a shell, where characters like & would run commands
+fn isSafeToOpen(url: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://")) return false;
+    for (url) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        if (std.mem.indexOfScalar(u8, "-._~:/?#[]@=+,;!*'()", c) == null) return false;
+    }
+    return true;
+}
+
 fn openBrowser(allocator: std.mem.Allocator, url: []const u8) void {
+    if (!isSafeToOpen(url)) return;
     const argv: []const []const u8 = switch (builtin.os.tag) {
         .macos => &.{ "open", url },
-        .windows => blk: {
-            const shell_path = getWindowsShellPath(allocator) catch return;
-            break :blk &.{ shell_path, "/C", "start", "", url };
-        },
+        .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", url },
         else => &.{ "xdg-open", url },
     };
 

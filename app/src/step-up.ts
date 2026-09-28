@@ -15,7 +15,7 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
 } from '@simplewebauthn/server'
 import { getDb, schema } from 'db'
-import { getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
+import { ForbiddenError, getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
 import { MACHINE_TOKEN_MAX_DAYS, formatUserCode } from './lib/utils.ts'
 
 // How long an approval lasts for the session, and how long a request waits
@@ -95,7 +95,7 @@ export async function verifyPasskey({ userId, response, expectedChallenge, origi
 // ── The gate ────────────────────────────────────────────────────────
 
 export class StepUpRequiredError extends Error {
-  constructor(readonly purpose: Purpose, readonly environmentIds: string[] = [], readonly machineTokenRequired = false) {
+  constructor(readonly purpose: 'access' | 'admin', readonly environmentIds: string[] = [], readonly machineTokenRequired = false) {
     super(machineTokenRequired
       ? 'this environment is protected: only a machine token can use it'
       : purpose === 'access'
@@ -167,7 +167,7 @@ async function hasAdminGrant({ userId, sessionId }: { userId: string; sessionId:
 // change roles or access, or delete. Orgs without protection keep today's rules.
 export async function requireOrgAdmin({ userId, sessionId, orgId }: { userId: string; sessionId: string; orgId: string }) {
   const { role } = await requireOrgMember(userId, orgId)
-  if (role !== 'admin') throw new Error('Only admins can do this')
+  if (role !== 'admin') throw new ForbiddenError('Only admins can do this')
   const [protectedEnv] = await getDb()
     .select({ id: schema.environment.id })
     .from(schema.environment)
@@ -175,6 +175,20 @@ export async function requireOrgAdmin({ userId, sessionId, orgId }: { userId: st
     .where(orm.and(orm.eq(schema.project.orgId, orgId), orm.eq(schema.environment.protected, true)))
     .limit(1)
   if (protectedEnv && !await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+}
+
+// Deleting or renaming a protected environment, or the project it is in, is
+// an admin action: someone who may only change its secrets could otherwise
+// delete it along with its read log, or move it aside so that an
+// unprotected one takes over its slug or name
+export async function requireAdminForProtected({ userId, sessionId, environmentIds }: { userId: string; sessionId: string; environmentIds: string[] }) {
+  if (environmentIds.length === 0) return
+  const rows = await getDb()
+    .select({ orgId: schema.project.orgId })
+    .from(schema.environment)
+    .innerJoin(schema.project, orm.eq(schema.project.id, schema.environment.projectId))
+    .where(orm.and(orm.inArray(schema.environment.id, environmentIds), orm.eq(schema.environment.protected, true)))
+  for (const orgId of new Set(rows.map((row) => row.orgId))) await requireOrgAdmin({ userId, sessionId, orgId })
 }
 
 // A machine token reads and changes protected environments without a
@@ -212,26 +226,39 @@ export class NoPasskeyError extends Error {
 
 // Opens a request for the session: access to the environments, or admin
 // actions. The CLI gets a code that its user types on /approve; the browser
-// approves its own.
-export async function createStepUpRequest({ request, userId, sessionId, environmentIds, withCode, purpose = 'access', lifetimeMs = REQUEST_MS }: {
+// approves its own. Only requestEnrollment asks to add a passkey, after its
+// own checks: the purpose comes from the caller here.
+export async function createStepUpRequest({ request, userId, sessionId, environmentIds, withCode, purpose = 'access' }: {
   request: Request
   userId: string
   sessionId: string
   environmentIds: string[]
   withCode: boolean
-  purpose?: Purpose
-  lifetimeMs?: number
+  purpose?: 'access' | 'admin'
 }) {
+  if (purpose !== 'access' && purpose !== 'admin') throw new Error('Unknown approval')
   const ids = [...new Set(environmentIds)]
   if (purpose === 'access' && ids.length === 0) throw new Error('No environments to approve')
   // Only environments the user may read at all
   for (const id of ids) {
-    if (!await getUserEnvironmentAccess({ userId, environmentRef: id })) throw new Error('Environment not found')
+    if (!await getUserEnvironmentAccess({ userId, environmentRef: id })) throw new ForbiddenError('Environment not found')
   }
+  return insertRequest({ request, userId, sessionId, environmentIds: ids, withCode, purpose, lifetimeMs: REQUEST_MS })
+}
+
+async function insertRequest({ request, userId, sessionId, environmentIds, withCode, purpose, lifetimeMs }: {
+  request: Request
+  userId: string
+  sessionId: string
+  environmentIds: string[]
+  withCode: boolean
+  purpose: Purpose
+  lifetimeMs: number
+}) {
   const [row] = await getDb().insert(schema.stepUpRequest).values({
     userId,
     sessionId,
-    environmentIds: ids,
+    environmentIds,
     purpose,
     userCode: withCode ? newUserCode() : null,
     ipAddress: request.headers.get('cf-connecting-ip'),
@@ -344,8 +371,23 @@ export async function passkeyApproverOrgs(userId: string): Promise<string[]> {
 // device, or by an admin, and used up by the passkey it adds); a further one
 // with an admin approval with an existing passkey; the first one with a fresh
 // Google sign-in, unless an admin has to approve it.
-export async function canAddPasskey({ userId, sessionId, signedIn, sessionCreatedAt }: { userId: string; sessionId: string; signedIn: boolean; sessionCreatedAt: number }) {
-  if (await hasGrant({ userId, sessionId, purpose: 'enroll' })) return true
+export async function canAddPasskey(login: { userId: string; sessionId: string; signedIn: boolean; sessionCreatedAt: number }) {
+  if (await hasGrant({ userId: login.userId, sessionId: login.sessionId, purpose: 'enroll' })) return true
+  return canAddWithoutApproval(login)
+}
+
+// The same, as a passkey is being added: an approval to add one is used up
+// right here, before the passkey is stored, so two registrations racing on
+// one approval add one passkey
+export async function claimPasskeyAddition(login: { userId: string; sessionId: string; signedIn: boolean; sessionCreatedAt: number }) {
+  const [claimed] = await getDb().delete(schema.stepUpGrant).where(orm.and(
+    orm.eq(schema.stepUpGrant.userId, login.userId), orm.eq(schema.stepUpGrant.sessionId, login.sessionId),
+    orm.eq(schema.stepUpGrant.purpose, 'enroll'), orm.gt(schema.stepUpGrant.expiresAt, Date.now()),
+  )).returning({ id: schema.stepUpGrant.id })
+  return !!claimed || canAddWithoutApproval(login)
+}
+
+async function canAddWithoutApproval({ userId, sessionId, signedIn, sessionCreatedAt }: { userId: string; sessionId: string; signedIn: boolean; sessionCreatedAt: number }) {
   const existing = await getDb().query.passkey.findFirst({ where: { userId }, columns: { id: true } })
   if (existing) return hasAdminGrant({ userId, sessionId })
   return isFreshSignIn({ signedIn, sessionCreatedAt }) && (await passkeyApproverOrgs(userId)).length === 0
@@ -367,7 +409,7 @@ export async function requestEnrollment({ request, userId, sessionId, signedIn, 
   const hasPasskey = !!await getDb().query.passkey.findFirst({ where: { userId }, columns: { id: true } })
   if (viaCode && !hasPasskey) throw new Error('Approving on another device takes a passkey there: you have none yet')
   if (!viaCode && (hasPasskey || (await passkeyApproverOrgs(userId)).length === 0)) throw new Error('Your passkey needs no admin approval')
-  return createStepUpRequest({ request, userId, sessionId, environmentIds: [], withCode: viaCode, purpose: 'enroll', lifetimeMs: viaCode ? REQUEST_MS : ADMIN_REQUEST_MS })
+  return insertRequest({ request, userId, sessionId, environmentIds: [], withCode: viaCode, purpose: 'enroll', lifetimeMs: viaCode ? REQUEST_MS : ADMIN_REQUEST_MS })
 }
 
 // A member's request for a first passkey, for an admin of every organization
@@ -380,6 +422,10 @@ async function enrollmentForAdmin({ requestId, approver }: { requestId: string; 
   if (!row) throw new Error('This request expired or was already answered')
   if (row.userId === approver.userId) throw new Error('Another admin approves your own first passkey')
   const orgIds = await passkeyApproverOrgs(row.userId)
+  // Only a first passkey that an admin has to approve: otherwise anyone
+  // would pass the checks below
+  const hasPasskey = !!await getDb().query.passkey.findFirst({ where: { userId: row.userId }, columns: { id: true } })
+  if (orgIds.length === 0 || hasPasskey) throw new Error('This request needs no admin approval')
   for (const orgId of orgIds) {
     const admin = await getDb().query.orgMember.findFirst({ where: { orgId, userId: approver.userId }, columns: { role: true } })
     if (admin?.role !== 'admin') throw new Error('An admin of each of their organizations with protected environments approves it')
@@ -433,13 +479,6 @@ export async function pendingEnrollments(userIds: string[]) {
     columns: { id: true, userId: true, ipAddress: true, country: true, userAgent: true, createdAt: true },
     orderBy: { createdAt: 'desc' },
   })
-}
-
-// The passkey an enroll grant was for is added: the grant is used up
-export async function useUpEnrollment({ userId, sessionId }: { userId: string; sessionId: string }) {
-  await getDb().delete(schema.stepUpGrant).where(orm.and(
-    orm.eq(schema.stepUpGrant.userId, userId), orm.eq(schema.stepUpGrant.sessionId, sessionId), orm.eq(schema.stepUpGrant.purpose, 'enroll'),
-  ))
 }
 
 // What gives lasting access to your account: approving a CLI login, making an

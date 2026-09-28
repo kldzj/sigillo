@@ -13,7 +13,7 @@ import { getDb, schema } from 'db'
 import { betterAuth } from 'better-auth/minimal'
 import { genericOAuth, deviceAuthorization, bearer } from 'better-auth/plugins'
 import { passkey } from '@better-auth/passkey'
-import { canAddPasskey, logPasskeyEvent, useUpEnrollment } from './step-up.ts'
+import { claimPasskeyAddition, logPasskeyEvent } from './step-up.ts'
 import { APIError, createAuthMiddleware } from 'better-auth/api'
 import { makeSignature } from 'better-auth/crypto'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
@@ -281,9 +281,6 @@ export async function getAuth(request: Request) {
               request: ctx.request ?? null, userId: added.userId, actor: `user:${added.userId}`, action: 'added',
               passkeyName: typeof added.name === 'string' ? added.name : null,
             })
-            // An approval to add a passkey adds one
-            const sessionId = ctx.context.session?.session.id
-            if (sessionId) await useUpEnrollment({ userId: added.userId, sessionId })
           }
           return
         }
@@ -358,7 +355,7 @@ export async function getAuth(request: Request) {
         registration: {
           afterVerification: async ({ ctx }) => {
             const current = ctx.context.session
-            if (!current || !await canAddPasskey({
+            if (!current || !await claimPasskeyAddition({
               userId: current.user.id, sessionId: current.session.id, signedIn: !!current.session.signedIn,
               sessionCreatedAt: new Date(current.session.createdAt).getTime(),
             })) {
@@ -374,6 +371,12 @@ export async function getAuth(request: Request) {
     disabledPaths: [
       '/passkey/generate-authenticate-options', '/passkey/verify-authentication',
       '/passkey/list-user-passkeys', '/passkey/update-passkey', '/passkey/delete-passkey',
+      // Names and pictures come from Google through the provider: a member
+      // renaming themselves would show up under an admin's name in the logs.
+      // The pages call the session endpoints server-side, never these.
+      '/update-user', '/change-email', '/delete-user', '/set-password', '/change-password',
+      '/list-sessions', '/revoke-session', '/revoke-sessions', '/revoke-other-sessions', '/update-session',
+      '/link-social', '/unlink-account', '/list-accounts', '/account-info', '/refresh-token', '/get-access-token',
     ],
   })
 }
@@ -523,12 +526,16 @@ export async function autoJoinOrgsByDomain(session: Pick<Session, 'userId' | 'us
     where: { autoJoinDomain: domain },
     columns: { id: true },
   })
-  if (matchingOrgs.length === 0) return
+  // Not an org that removed them: it takes an invite to come back
+  const removed = new Set((await db.select({ orgId: schema.orgRemoval.orgId }).from(schema.orgRemoval)
+    .where(orm.eq(schema.orgRemoval.userId, session.userId))).map((row) => row.orgId))
+  const joinable = matchingOrgs.filter((o) => !removed.has(o.id))
+  if (joinable.length === 0) return
 
   // Insert memberships with onConflictDoNothing — the unique index on
   // (org_id, user_id) prevents duplicates, so we skip already-joined orgs
   // without needing a separate membership read.
-  const [firstQuery, ...restQueries] = matchingOrgs.map((o) =>
+  const [firstQuery, ...restQueries] = joinable.map((o) =>
     db.insert(schema.orgMember)
       .values({ orgId: o.id, userId: session.userId, role: 'member' })
       .onConflictDoNothing({ target: [schema.orgMember.orgId, schema.orgMember.userId] }),
@@ -622,7 +629,30 @@ export async function deleteOrgMember(member: { id: string; orgId: string; userI
       orm.eq(schema.orgInvitation.createdBy, member.userId),
     )),
     db.delete(schema.orgMember).where(orm.eq(schema.orgMember.id, member.id)),
+    db.insert(schema.orgRemoval).values({ orgId: member.orgId, userId: member.userId }).onConflictDoNothing(),
   ])
+}
+
+// Inviting is up to admins: a demoted admin's invite links stop working, as
+// a removed member's do
+export async function setOrgMemberRole({ member, role }: { member: { id: string; orgId: string; userId: string }; role: 'admin' | 'member' }) {
+  const db = getDb()
+  await db.batch([
+    db.update(schema.orgMember).set({ role }).where(orm.eq(schema.orgMember.id, member.id)),
+    ...(role === 'admin' ? [] : [db.delete(schema.orgInvitation).where(orm.and(
+      orm.eq(schema.orgInvitation.orgId, member.orgId),
+      orm.eq(schema.orgInvitation.createdBy, member.userId),
+    ))]),
+  ])
+}
+
+// Input the API answers with 400 and its message
+export class InvalidInputError extends Error {
+  readonly status = 400
+  constructor(message: string) {
+    super(message)
+    this.name = 'InvalidInputError'
+  }
 }
 
 // Distinct class instead of `new Error('FORBIDDEN')` so the API/page wrappers
@@ -762,7 +792,15 @@ export type DerivedSecret = {
   iv: string
   createdAt: number
   updatedAt: number
-  userId: string | null
+  // Who set it, as the history chain records it: 'user:<id>' or 'token:<id>'
+  actor: string
+}
+
+// The author of a change or a read as the history chain records it
+export function actorOf(author: { userId: string | null; apiTokenId: string | null }): string {
+  if (author.userId) return `user:${author.userId}`
+  if (author.apiTokenId) return `token:${author.apiTokenId}`
+  return 'deleted'
 }
 
 // Minimal shape of a secret event row needed to replay current state.
@@ -773,6 +811,8 @@ type SecretEventRow = {
   valueEncrypted: string | null
   iv: string | null
   userId: string | null
+  apiTokenId: string | null
+  actor: string | null
   createdAt: number
   seq: number | null
 }
@@ -791,7 +831,7 @@ function replaySecretEvents(allEvents: SecretEventRow[]): DerivedSecret[] {
     name: string
     valueEncrypted: string | null
     iv: string | null
-    userId: string | null
+    actor: string
     createdAt: number
     firstCreatedAt: number
   }>()
@@ -806,7 +846,8 @@ function replaySecretEvents(allEvents: SecretEventRow[]): DerivedSecret[] {
         name: evt.name,
         valueEncrypted: evt.valueEncrypted,
         iv: evt.iv,
-        userId: evt.userId,
+        // Rows from before the chain have no actor yet
+        actor: evt.actor ?? actorOf(evt),
         createdAt: evt.createdAt,
         firstCreatedAt: existing?.firstCreatedAt ?? evt.createdAt,
       })
@@ -822,7 +863,7 @@ function replaySecretEvents(allEvents: SecretEventRow[]): DerivedSecret[] {
       iv: s.iv!,
       createdAt: s.firstCreatedAt,
       updatedAt: s.createdAt,
-      userId: s.userId,
+      actor: s.actor,
     }))
 }
 
@@ -1044,6 +1085,14 @@ export async function getRequestApiToken(request: Request): Promise<{
   if (!bearer?.startsWith('sig_')) return null
   const token = await verifyApiToken(bearer, request.headers.get('cf-connecting-ip'))
   if (!token) throw unauthorizedResponse('invalid or revoked API token')
+  // A token acts for its creator: it stops working with their sign-in (the
+  // allowlist) and with their access to its project
+  const creator = await getDb().query.user.findFirst({ where: { id: token.createdBy }, columns: { email: true, emailVerified: true } })
+  if (!creator || !isAllowed(creator)) throw unauthorizedResponse('the creator of this API token may no longer sign in')
+  const access = await getProjectMemberAccess(token.createdBy, token.projectId)
+  if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(token.projectId))) {
+    throw forbiddenResponse('the creator of this API token can no longer open its project')
+  }
   return token
 }
 
@@ -1079,5 +1128,6 @@ export async function decrypt(encrypted: string, iv: string): Promise<string> {
   const ivBytes = Uint8Array.from(atob(iv), (c) => c.charCodeAt(0))
   const ciphertext = Uint8Array.from(atob(encrypted), (c) => c.charCodeAt(0))
   const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, key, ciphertext)
-  return new TextDecoder().decode(plaintext)
+  // Keeps a leading byte order mark: the history's digest covers it
+  return new TextDecoder('utf-8', { ignoreBOM: true }).decode(plaintext)
 }

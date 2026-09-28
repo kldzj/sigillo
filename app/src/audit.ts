@@ -2,9 +2,12 @@
 // environment form two hash chains, like git. Rows are numbered 1, 2, 3...
 // by seq. A row's hash covers the previous row's hash and the row itself
 // (its preimage), and the Worker signs the hash with an Ed25519 key only it
-// holds. Someone who can write to D1 can't edit, remove or add a row without
-// breaking a chain, and `sigillo audit verify` remembers the last head it
-// saw, so a shortened chain shows up there.
+// holds. `sigillo audit verify` remembers the last head it saw, so editing,
+// removing or reordering a row it has seen shows up there. Rows after that
+// head are only as good as the database: someone who can write to D1 can give
+// themselves access, have the Worker write rows, and remove the newest ones
+// before the next check. Rows from before the chain join it on their
+// environment's next write, marked as adopted.
 //
 // Preimages are built from the rows as they are in D1 now, so the audit API
 // can hand them out and a verifier only needs SHA-256 and Ed25519. A set
@@ -17,7 +20,7 @@ import * as orm from 'drizzle-orm'
 import type { BatchItem } from 'drizzle-orm/batch'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
-import { encrypt, decrypt, deriveSecrets, getUserEnvironmentAccess } from './db.ts'
+import { actorOf, encrypt, decrypt, deriveSecrets, getUserEnvironmentAccess, InvalidInputError } from './db.ts'
 import { requireStepUp, requireProtectedAccess, requireAdminApproval, StepUpRequiredError, type Reader } from './step-up.ts'
 
 const ZERO_HASH = '0'.repeat(64)
@@ -107,14 +110,11 @@ async function storedValueDigest(row: { environmentId: string; name: string; val
   }
 }
 
-export function actorOf(author: { userId: string | null; apiTokenId: string | null }): string {
-  if (author.userId) return `user:${author.userId}`
-  if (author.apiTokenId) return `token:${author.apiTokenId}`
-  return 'deleted'
-}
-
-function eventPreimage(row: { environmentId: string; seq: number; id: string; name: string; operation: string; actor: string; createdAt: number }, digest: string | null): string {
-  return JSON.stringify(['event', row.environmentId, row.seq, row.id, row.name, row.operation, digest, row.actor, row.createdAt])
+// An adopted row is one the Worker found in the database from before the
+// chain, not a change it made: its preimage says so, so adopting a chain's
+// rows a second time changes every hash
+function eventPreimage(row: { environmentId: string; seq: number; id: string; name: string; operation: string; actor: string; createdAt: number; adopted: boolean }, digest: string | null): string {
+  return JSON.stringify([row.adopted ? 'adopted' : 'event', row.environmentId, row.seq, row.id, row.name, row.operation, digest, row.actor, row.createdAt])
 }
 
 function readPreimage(row: { environmentId: string; seq: number; id: string; actor: string; kind: string; names: string[]; ipAddress: string | null; createdAt: number }): string {
@@ -177,9 +177,9 @@ async function adoptPriorEvents(environmentId: string): Promise<{ queries: Batch
     const seq = (current?.seq ?? 0) + 1
     const actor = actorOf(row)
     const digest = row.operation === 'set' ? await storedValueDigest(row) : null
-    const hash = await chainHash(current?.hash ?? ZERO_HASH, eventPreimage({ ...row, seq, actor }, digest))
+    const hash = await chainHash(current?.hash ?? ZERO_HASH, eventPreimage({ ...row, seq, actor, adopted: true }, digest))
     queries.push(db.update(schema.secretEvent)
-      .set({ seq, actor, hash, signature: await signHash(hash) })
+      .set({ seq, actor, hash, signature: await signHash(hash), adopted: true })
       .where(orm.and(orm.eq(schema.secretEvent.id, row.id), orm.isNull(schema.secretEvent.seq))))
     current = { seq, hash }
   }
@@ -197,6 +197,11 @@ export type NewSecretEvent = {
 // The only way secret_event rows are written. Changing a protected
 // environment takes the same passkey approval or machine token as reading it.
 export async function appendSecretEvents({ author, events }: { author: Reader; events: NewSecretEvent[] }): Promise<{ id: string; name: string }[]> {
+  // Text with a lone surrogate half doesn't survive encoding unchanged, so
+  // its digest would never match again and break the history for good
+  for (const event of events) {
+    if (!event.name.isWellFormed() || !(event.value ?? '').isWellFormed()) throw new InvalidInputError('Secret names and values must be valid text')
+  }
   await requireProtectedAccess({ environmentIds: events.map((event) => event.environmentId), reader: author })
   // Encrypt and digest once, outside the retry loop
   const prepared = await Promise.all(events.map(async (event) => {
@@ -223,7 +228,7 @@ export async function appendSecretEvents({ author, events }: { author: Reader; e
       let head = adopted.head
       for (const event of prepared.filter((row) => row.environmentId === environmentId)) {
         const seq = (head?.seq ?? 0) + 1
-        const hash = await chainHash(head?.hash ?? ZERO_HASH, eventPreimage({ ...event, seq }, event.digest))
+        const hash = await chainHash(head?.hash ?? ZERO_HASH, eventPreimage({ ...event, seq, adopted: false }, event.digest))
         queries.push(db.insert(schema.secretEvent).values({
           id: event.id,
           environmentId,
@@ -382,6 +387,8 @@ export async function getAuditChains(environmentId: string) {
       }))),
       // Added around the chain, so not covered by it
       outside: events.length - chained.length,
+      // From before the chain: signed as found in the database
+      adopted: chained.filter((row) => row.adopted).length,
     },
     reads: {
       rows: reads.map((row): ChainRow => ({ seq: row.seq, hash: row.hash, signature: row.signature, preimage: readPreimage(row) })),

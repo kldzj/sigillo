@@ -134,7 +134,7 @@ export function AccessTable() {
                   <TableCell className="max-w-[260px]">
                     <div className="flex items-center gap-2.5 min-w-0">
                       {member.user?.image ? (
-                        <img src={member.user.image} alt="" className="size-7 shrink-0 rounded-full object-cover" />
+                        <img src={member.user.image} alt="" referrerPolicy="no-referrer" className="size-7 shrink-0 rounded-full object-cover" />
                       ) : (
                         <div className="size-7 shrink-0 rounded-full bg-muted flex items-center justify-center text-xs font-medium text-muted-foreground">
                           {(member.user?.name || member.user?.email || "?").charAt(0).toUpperCase()}
