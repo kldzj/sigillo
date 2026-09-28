@@ -150,7 +150,7 @@ fn printAvailableProjects(
         if (index == 0) {
             try stderr.writeAll("available projects:\n");
         }
-        try stderr.print("  - {s} / {s} ({s})\n", .{ try color.plain(allocator, project.orgName), try color.plain(allocator, project.name), project.id });
+        try stderr.print("  - {s} / {s} ({s})\n", .{ try color.plain(allocator, project.orgName), try color.plain(allocator, project.name), try color.plain(allocator, project.id) });
     }
 }
 
@@ -242,7 +242,7 @@ fn requireProjectId(allocator: std.mem.Allocator, stderr: Writer, api: ApiContex
     try color.err(stderr, "error");
     try stderr.print(": {d} projects are named {s}, use the project ID instead\n", .{ matches.len, ref });
     for (matches) |project| {
-        try stderr.print("  - {s} / {s} ({s})\n", .{ try color.plain(allocator, project.orgName), try color.plain(allocator, project.name), project.id });
+        try stderr.print("  - {s} / {s} ({s})\n", .{ try color.plain(allocator, project.orgName), try color.plain(allocator, project.name), try color.plain(allocator, project.id) });
     }
     std.process.exit(1);
 }
@@ -330,7 +330,7 @@ const Run = zeke.cmd("run <...cmd>", "Run a command with secrets injected")
     .option("--mount [path]", "Write secrets to a new owner-only file (must not exist), deleted when the command exits")
     .option("--mount-format [fmt]", "Format for mounted file: env, env-no-quotes, json, yaml, docker, dotnet-json (default: env)")
     .option("--disable-redaction", "Print child output without secret redaction")
-    .optionMany("--allow-env <name>", "Let a secret set a variable that controls how programs run, like NODE_OPTIONS or PATH (repeatable)")
+    .optionMany("--allow-env <name>", "Let a secret set a variable that controls how programs run, like NODE_OPTIONS or PATH (repeatable). Only known names are skipped, on a best effort basis")
     .option("-p, --project [id]", "Project ID or name override")
     .option("--env [slug]", "Env slug override (e.g. dev, prod)")
     .option("-c, --config [slug]", "Env slug override")
@@ -510,10 +510,10 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
     try stdout.writeAll("\n");
     try color.bold(stdout, "Open this URL in your browser and enter the code:\n");
     try stdout.writeAll("  ");
-    try color.cyan(stdout, verification_uri);
+    try color.cyan(stdout, try color.plain(allocator, verification_uri));
     try stdout.writeAll("\n\n");
     try color.blue(stdout, "Code: ");
-    try color.bold(stdout, try formatUserCode(allocator, user_code));
+    try color.bold(stdout, try formatUserCode(allocator, try color.plain(allocator, user_code)));
     try stdout.writeAll("\n\n");
     try color.dim(stdout, "Waiting for approval...");
 
@@ -548,9 +548,24 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
                 .api_url = api_url,
             });
 
+            // The first one to enter the code approves it, and that can be
+            // someone else who saw it: say whose account this is
+            const me = client.getMe(.{ .allocator = allocator, .api_url = api_url, .token = access_token }) catch null;
+            const email = if (me) |res| if (res.value) |value| value.user.email else "" else "";
+
             try stdout.writeAll("\n");
             try color.green(stdout, "✔");
-            try stdout.writeAll(" Logged in successfully\n");
+            if (email.len == 0) {
+                try stdout.writeAll(" Logged in successfully\n");
+                return;
+            }
+            try stdout.writeAll(" Logged in as ");
+            try color.bold(stdout, try color.plain(allocator, email));
+            try stdout.writeAll("\n");
+            try color.dim(stdout, if (std.mem.eql(u8, scope, "/"))
+                "Not you? Run sigillo logout.\n"
+            else
+                try std.fmt.allocPrint(allocator, "Not you? Run sigillo logout --scope {s}.\n", .{scope}));
             return;
         }
 
@@ -697,8 +712,8 @@ fn meAction(_: Me.Args, opts: Me.Options, global: Global.Options) !void {
         for (me.orgs) |org| {
             try stdout.writeAll("  ");
             try color.bold(stdout, try color.plain(allocator, org.name));
-            try stdout.print("  {s}  ", .{org.id});
-            try color.dim(stdout, org.role);
+            try stdout.print("  {s}  ", .{try color.plain(allocator, org.id)});
+            try color.dim(stdout, try color.plain(allocator, org.role));
             try stdout.writeAll("\n");
         }
     }
@@ -778,6 +793,8 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
         std.posix.isatty(File.stdout().handle);
 
     // ── Resolve project ────────────────────────────────────────────
+    // The server's name, id and slug are saved and printed again later (me,
+    // the setup hints), so they are cleaned for the terminal before that
     const SelectedProject = struct { id: []const u8, name: ?[]const u8, envs: ?[]const EnvOption };
     const selected_project: SelectedProject = if (opts.project) |p| .{
         .id = try requireProjectId(allocator, stderr, .{ .api_url = api_url, .token = token }, p),
@@ -825,9 +842,9 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
         const proj_options = try allocator.alloc([]const u8, projects.projects.len);
         for (projects.projects, 0..) |p, i| {
             proj_options[i] = if (multi_org)
-                try std.fmt.allocPrint(allocator, "{s} / {s} ({s})", .{ try color.plain(allocator, p.orgName), try color.plain(allocator, p.name), p.id })
+                try std.fmt.allocPrint(allocator, "{s} / {s} ({s})", .{ try color.plain(allocator, p.orgName), try color.plain(allocator, p.name), try color.plain(allocator, p.id) })
             else
-                try std.fmt.allocPrint(allocator, "{s} ({s})", .{ try color.plain(allocator, p.name), p.id });
+                try std.fmt.allocPrint(allocator, "{s} ({s})", .{ try color.plain(allocator, p.name), try color.plain(allocator, p.id) });
         }
         const proj_choice = try prompt.select("Select project", proj_options, 0) orelse {
             try color.err(stderr, "error");
@@ -835,14 +852,14 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
             std.process.exit(1);
         };
         const project = projects.projects[proj_choice];
-        break :proj .{ .id = project.id, .name = project.name, .envs = try envOptionsFrom(allocator, project.environments) };
+        break :proj .{ .id = project.id, .name = try color.plain(allocator, project.name), .envs = try envOptionsFrom(allocator, project.environments) };
     } else {
         try color.err(stderr, "error");
         try stderr.print(": --project is required\n", .{});
         try stderr.writeAll("  sigillo setup --project <PROJECT_ID> --env <SLUG>\n");
         std.process.exit(1);
     };
-    const project = selected_project.id;
+    const project = try color.plain(allocator, selected_project.id);
 
     // ── Fetch project details only when they were not included by the picker ──
     const project_details = if (selected_project.envs == null) details: {
@@ -870,7 +887,7 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
             try stderr.print(": invalid project response\n", .{});
             std.process.exit(1);
         };
-        break :details .{ .name = value.name, .envs = try envOptionsFrom(allocator, value.environments) };
+        break :details .{ .name = try color.plain(allocator, value.name), .envs = try envOptionsFrom(allocator, value.environments) };
     } else null;
 
     const project_name = selected_project.name orelse if (project_details) |details| details.name else null;
@@ -906,7 +923,7 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
             try stderr.print(": setup cancelled\n", .{});
             std.process.exit(1);
         };
-        break :env_sel all_envs[env_choice].slug;
+        break :env_sel try color.plain(allocator, all_envs[env_choice].slug);
     } else {
         try color.err(stderr, "error");
         try stderr.print(": --env/--config is required\n", .{});
@@ -1051,7 +1068,8 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
     var env_map = try std.process.getEnvMap(gpa.allocator());
     defer env_map.deinit();
     const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, secrets, opts.allow_env);
-    for (skipped) |name| {
+    for (skipped) |skipped_name| {
+        const name = try color.plain(allocator, skipped_name);
         try color.yellow(stderr, "warning");
         try stderr.print(": skipped the secret {s}: it controls how programs run. Pass --allow-env {s} to use it.\n", .{ name, name });
     }
@@ -2722,22 +2740,36 @@ fn deletionConfirmed(typed: []const u8, name: []const u8) bool {
 
 // Variables that decide which programs run and what they load. Anyone who can
 // write the environment chooses its secrets, so these only come from a secret
-// when the user passes --allow-env for them.
-const execution_variables = [_][]const u8{
-    "PATH",              "IFS",             "ENV",           "BASH_ENV",         "ZDOTDIR",       "PROMPT_COMMAND",
-    "SHELLOPTS",         "BASHOPTS",        "NODE_OPTIONS",  "NODE_PATH",        "PYTHONPATH",    "PYTHONSTARTUP",
-    "PYTHONHOME",        "PERL5OPT",        "PERL5LIB",      "PERLLIB",          "RUBYOPT",       "RUBYLIB",
-    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",   "JDK_JAVA_OPTIONS", "GIT_SSH",       "GIT_SSH_COMMAND", "GIT_EXEC_PATH",
-    "GIT_ASKPASS",       "SSH_ASKPASS",
-};
-const execution_prefixes = [_][]const u8{ "LD_", "DYLD_", "GIT_CONFIG" };
+// when the user passes --allow-env for them. No list like this is complete:
+// it catches the names known to do this.
+const execution_variables =
+    // Shells: where commands are looked up, and code a shell runs by itself
+    [_][]const u8{ "PATH", "IFS", "ENV", "BASH_ENV", "ZDOTDIR", "PROMPT_COMMAND", "PS4", "SHELLOPTS", "BASHOPTS", "CDPATH", "FPATH" } ++
+    // Language runtimes: options and modules they load before the program
+    [_][]const u8{ "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONWARNINGS", "PERL5OPT", "PERL5LIB", "PERLLIB" } ++
+    [_][]const u8{ "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS" } ++
+    // Commands that git, ssh, less and other tools start: helpers, pagers, editors
+    [_][]const u8{ "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF" } ++
+    [_][]const u8{ "GIT_PAGER", "PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "LESSOPEN", "LESSCLOSE", "BROWSER" } ++
+    // Where packages come from and how they are checked: the next install runs their code
+    [_][]const u8{ "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_TRUSTED_HOST", "YARN_REGISTRY", "YARN_NPM_REGISTRY_SERVER" } ++
+    [_][]const u8{ "COREPACK_NPM_REGISTRY", "COREPACK_INTEGRITY_KEYS", "GOPROXY", "GOSUMDB", "GONOSUMDB", "GONOSUMCHECK", "GOINSECURE", "GOFLAGS", "GOTOOLCHAIN" } ++
+    // TLS checks switched off, so anyone on the way can change what is downloaded
+    [_][]const u8{ "NODE_TLS_REJECT_UNAUTHORIZED", "GIT_SSL_NO_VERIFY" };
+const execution_prefixes =
+    // The dynamic loader, and git config given in the environment
+    [_][]const u8{ "LD_", "DYLD_", "GIT_CONFIG" } ++
+    // Any npm setting (node_options, script_shell, registry) and Bundler's mirrors
+    [_][]const u8{ "NPM_CONFIG_", "BUNDLE_MIRROR__" };
 
+// Ignoring case: Windows looks names up that way, so node_options there is
+// NODE_OPTIONS, and npm reads npm_config_* in any case too
 fn controlsExecution(name: []const u8) bool {
     for (execution_variables) |variable| {
-        if (std.mem.eql(u8, name, variable)) return true;
+        if (std.ascii.eqlIgnoreCase(name, variable)) return true;
     }
     for (execution_prefixes) |prefix| {
-        if (std.mem.startsWith(u8, name, prefix)) return true;
+        if (std.ascii.startsWithIgnoreCase(name, prefix)) return true;
     }
     return false;
 }
@@ -2752,7 +2784,7 @@ fn mergeSecretsIntoEnvMap(allocator: std.mem.Allocator, env_map: *std.process.En
         const name = entry.key_ptr.*;
         if (controlsExecution(name)) {
             for (allowed) |allow| {
-                if (std.mem.eql(u8, allow, name)) break;
+                if (std.ascii.eqlIgnoreCase(allow, name)) break;
             } else {
                 try skipped.append(allocator, name);
                 continue :next;
@@ -2901,19 +2933,41 @@ test "run: a secret doesn't set a variable that controls how programs run, unles
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    // Anyone who can write the environment chooses these names and values
+    // Anyone who can write the environment chooses these names and values.
+    // Windows reads names in any case, so node_options and Path count there.
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
-        \\{"API_KEY":"k","PATH":"/tmp/elsewhere","LD_PRELOAD":"/tmp/lib.so","NODE_OPTIONS":"--require /tmp/x.js","BASH_ENV":"/tmp/x.sh"}
+        \\{"API_KEY":"k","PATH":"/tmp/elsewhere","LD_PRELOAD":"/tmp/lib.so","NODE_OPTIONS":"--require /tmp/x.js","BASH_ENV":"/tmp/x.sh",
+        \\ "node_options":"--import=data:text/javascript,x","Path":"C:/tmp","PS4":"$(sh /tmp/x.sh)","GIT_PAGER":"sh /tmp/x.sh",
+        \\ "npm_config_registry":"https://registry.example","NPM_CONFIG_SCRIPT_SHELL":"/tmp/x.sh","BUNDLE_MIRROR__RUBYGEMS__ORG":"https://gems.example",
+        \\ "YARN_NPM_AUTH_TOKEN":"y","BUNDLE_GEMS__CONTRIBSYS__COM":"u:p","GIT_TOKEN":"g","DATABASE_URL":"postgres://db","GITHUB_TOKEN":"gh"}
     , .{});
     var env_map = std.process.EnvMap.init(allocator);
     try env_map.put("PATH", "/usr/bin:/bin");
-    const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, parsed.object, &.{"NODE_OPTIONS"});
-    try std.testing.expectEqualStrings("k", env_map.get("API_KEY").?);
+    const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, parsed.object, &.{"GIT_PAGER"});
     try std.testing.expectEqualStrings("/usr/bin:/bin", env_map.get("PATH").?);
-    try std.testing.expect(env_map.get("LD_PRELOAD") == null);
-    try std.testing.expect(env_map.get("BASH_ENV") == null);
-    try std.testing.expectEqualStrings("--require /tmp/x.js", env_map.get("NODE_OPTIONS").?);
-    try std.testing.expectEqual(@as(usize, 3), skipped.len);
+    try std.testing.expectEqualStrings("sh /tmp/x.sh", env_map.get("GIT_PAGER").?);
+    const blocked = [_][]const u8{ "PATH", "LD_PRELOAD", "NODE_OPTIONS", "BASH_ENV", "node_options", "Path", "PS4", "npm_config_registry", "NPM_CONFIG_SCRIPT_SHELL", "BUNDLE_MIRROR__RUBYGEMS__ORG" };
+    try std.testing.expectEqual(blocked.len, skipped.len);
+    for (blocked, skipped) |name, skipped_name| try std.testing.expectEqualStrings(name, skipped_name);
+    // Credentials that only look like those still pass
+    for ([_][]const u8{ "API_KEY", "YARN_NPM_AUTH_TOKEN", "BUNDLE_GEMS__CONTRIBSYS__COM", "GIT_TOKEN", "DATABASE_URL", "GITHUB_TOKEN" }) |name| {
+        try std.testing.expect(env_map.get(name) != null);
+    }
+}
+
+test "run: --allow-env matches a name in any case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"NODE_OPTIONS":"--max-old-space-size=4096","Path":"C:/tools","PS4":"+ "}
+    , .{});
+    var env_map = std.process.EnvMap.init(allocator);
+    const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, parsed.object, &.{ "node_options", "PATH" });
+    try std.testing.expectEqualStrings("--max-old-space-size=4096", env_map.get("NODE_OPTIONS").?);
+    try std.testing.expectEqualStrings("C:/tools", env_map.get("Path").?);
+    try std.testing.expectEqual(@as(usize, 1), skipped.len);
+    try std.testing.expectEqualStrings("PS4", skipped[0]);
 }
 
 test "the browser opens only a plain web address from the server" {
@@ -2923,6 +2977,14 @@ test "the browser opens only a plain web address from the server" {
     try std.testing.expect(!isSafeToOpen("https://sigillo.example/device|calc"));
     try std.testing.expect(!isSafeToOpen("file:///etc/passwd"));
     try std.testing.expect(!isSafeToOpen("https://sigillo.example/device a"));
+}
+
+test "an error message from the server comes without control characters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectEqualStrings("forbidden?]52;c;eA==?", client.parseError(allocator, "{\"error_description\":\"forbidden\\u001b]52;c;eA==\\u0007\"}").?);
+    try std.testing.expectEqualStrings("no access?2K", client.parseError(allocator, "{\"error\":\"no access\\u009b2K\"}").?);
 }
 
 test "redaction masks a secret that contains another one, when a write ends between them" {

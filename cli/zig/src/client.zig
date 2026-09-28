@@ -122,6 +122,7 @@ fn jsonBody(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{ .emit_null_optional_fields = false })});
 }
 
+// The server's message, cleaned for the terminal, since every caller prints it
 pub fn parseError(allocator: std.mem.Allocator, body: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{}) catch return null;
 
@@ -131,10 +132,10 @@ pub fn parseError(allocator: std.mem.Allocator, body: []const u8) ?[]const u8 {
     };
 
     if (object.get("error_description")) |value| {
-        if (value == .string) return value.string;
+        if (value == .string) return color.plain(allocator, value.string) catch null;
     }
     if (object.get("error")) |value| {
-        if (value == .string) return value.string;
+        if (value == .string) return color.plain(allocator, value.string) catch null;
     }
     return null;
 }

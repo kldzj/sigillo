@@ -21,7 +21,7 @@ sigillo run <...cmd>
 | `--mount [path]` | Write secrets to a new owner-only file (must not exist), deleted when the command exits |
 | `--mount-format [fmt]` | Format for mounted file: env, env-no-quotes, json, yaml, docker, dotnet-json (default: env) |
 | `--disable-redaction` | Print child output without secret redaction |
-| `--allow-env <name>` | Let a secret set a variable that controls how programs run, like NODE_OPTIONS or PATH (repeatable) |
+| `--allow-env <name>` | Let a secret set a variable that controls how programs run, like NODE_OPTIONS or PATH (repeatable). Only known names are skipped, on a best effort basis |
 | `-p, --project [id]` | Project ID or name override |
 | `--env [slug]` | Env slug override (e.g. dev, prod) |
 | `-c, --config [slug]` | Env slug override |

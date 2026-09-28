@@ -309,7 +309,7 @@ sigillo run --allow-env NODE_OPTIONS -- next build               # let a secret 
 
 Use **`--command`** when you need shell features like `&&`, pipes, redirects, or `$VARIABLE` expansion. Wrap the command in single quotes so your parent shell does not expand secret variables before Sigillo injects them.
 
-A secret named like a variable that decides which programs run and what they load, such as `PATH`, `NODE_OPTIONS`, `LD_PRELOAD` or `BASH_ENV`, is skipped with a warning: anyone who can change the environment's secrets would otherwise run code on your machine. Pass **`--allow-env NAME`** to use one.
+A secret named like a variable that decides which programs run and what they load, such as `PATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `GIT_PAGER` or `npm_config_registry`, is skipped with a warning: anyone who can change the environment's secrets would otherwise run code on your machine. Pass **`--allow-env NAME`** to use one. Names match in any case, as they do on Windows. The list is best effort: no list of such names is complete, so a secret can still change how a program runs through a variable it doesn't know.
 
 ```bash
 # Wrong: your shell expands $DATABASE_URL before sigillo starts

@@ -82,19 +82,37 @@ pub fn err(w: Writer, text: []const u8) !void {
 // could otherwise hold escape sequences that rewrite lines, set the clipboard
 // or hide a link: control characters print as '?'.
 pub fn plain(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    for (text) |c| {
-        if (c < 0x20 or c == 0x7f) break;
+    for (0..text.len) |i| {
+        if (controlLen(text, i) > 0) break;
     } else return text;
-    const out = try allocator.dupe(u8, text);
-    for (out) |*c| {
-        if (c.* < 0x20 or c.* == 0x7f) c.* = '?';
+    var out = try std.ArrayList(u8).initCapacity(allocator, text.len);
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = controlLen(text, i);
+        out.appendAssumeCapacity(if (len > 0) '?' else text[i]);
+        i += @max(len, 1);
     }
-    return out;
+    return out.toOwnedSlice(allocator);
 }
 
 // The same, written straight to the terminal
 pub fn writePlain(w: Writer, text: []const u8) !void {
-    for (text) |c| try w.writeByte(if (c < 0x20 or c == 0x7f) '?' else c);
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = controlLen(text, i);
+        try w.writeByte(if (len > 0) '?' else text[i]);
+        i += @max(len, 1);
+    }
+}
+
+// How many bytes the control character at text[i] takes, 0 when there is
+// none. UTF-8 writes the C1 controls as 0xC2 0x80..0x9F, and some terminals
+// read 0xC2 0x9B like ESC [.
+fn controlLen(text: []const u8, i: usize) usize {
+    const c = text[i];
+    if (c < 0x20 or c == 0x7f) return 1;
+    if (c == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f) return 2;
+    return 0;
 }
 
 test "plain turns control characters into question marks" {
@@ -102,4 +120,6 @@ test "plain turns control characters into question marks" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("website?]52;c;ZWNobyBoaQ==?", try plain(arena.allocator(), "website\x1b]52;c;ZWNobyBoaQ==\x07"));
     try std.testing.expectEqualStrings("Café / prod", try plain(arena.allocator(), "Café / prod"));
+    try std.testing.expectEqualStrings("api?2K?1A?52;c;eA==?", try plain(arena.allocator(), "api\xc2\x9b2K\xc2\x9b1A\xc2\x9d52;c;eA==\xc2\x9c"));
+    try std.testing.expectEqualStrings("no\xc2\xa0break", try plain(arena.allocator(), "no\xc2\xa0break"));
 }
