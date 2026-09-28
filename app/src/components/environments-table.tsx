@@ -11,7 +11,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { PencilIcon, TrashIcon } from "lucide-react";
-import { useState, useRef } from "react";
+import { useState, useRef, useTransition } from "react";
 import { z } from "zod";
 import { parseFormData } from "spiceflow";
 import { ErrorBoundary, useLoaderData } from "spiceflow/react";
@@ -24,6 +24,7 @@ import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
 import { createEnvAction, deleteEnvAction, renameEnvAction, updateEnvironmentAccessRoleAction, updateEnvironmentProtectionAction } from "../actions.ts";
 import { withStepUp } from "./step-up.ts";
 import { NativeSelect } from "sigillo-app/src/components/ui/native-select";
+import { Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogPopup, DialogTitle } from "sigillo-app/src/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -160,9 +161,64 @@ export function EnvironmentsPage() {
   );
 }
 
+// Deleting an environment can't be undone: one with secrets takes its slug,
+// typed out, and the server checks it too
+function DeleteEnvironmentDialog({ env, secretCount, onClose }: { env: Environment | null; secretCount: number; onClose: () => void }) {
+  const [typed, setTyped] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+  const needsSlug = secretCount > 0;
+  const close = () => {
+    setTyped("");
+    setError(null);
+    onClose();
+  };
+  const remove = () => {
+    if (!env) return;
+    setError(null);
+    startTransition(async () => {
+      try {
+        if (await withStepUp(() => deleteEnvAction({ id: env.id, typedSlug: typed }))) close();
+      } catch (e: any) {
+        setError(e?.message || "Failed to delete environment");
+      }
+    });
+  };
+  return (
+    <Dialog open={!!env} onOpenChange={(open) => { if (!open) close(); }}>
+      <DialogPopup>
+        <DialogHeader>
+          <DialogTitle>Delete the environment {env?.name}?</DialogTitle>
+          <DialogDescription>
+            {needsSlug
+              ? `Its ${secretCount} ${secretCount === 1 ? "secret" : "secrets"} and their history go with it. This can't be undone.`
+              : "It has no secrets. This can't be undone."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="px-6 pb-4 flex flex-col gap-2">
+          {needsSlug && (
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span>Type <strong className="mono-sm">{env?.slug}</strong> to confirm</span>
+              <Input value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" spellCheck={false} />
+            </label>
+          )}
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+          <Button variant="destructive" onClick={remove} disabled={pending || (needsSlug && typed !== env?.slug)}>
+            {pending ? "Deleting..." : "Delete environment"}
+          </Button>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
+  );
+}
+
 export function EnvironmentsTable() {
-  const { environments, projectId } = useLoaderData('/dash/projects/:projectId/environments');
+  const { environments, projectId, secretCounts } = useLoaderData('/dash/projects/:projectId/environments');
   const [showNewRow, setShowNewRow] = useState(false);
+  const [deleting, setDeleting] = useState<Environment | null>(null);
 
   const columns: ColumnDef<Environment>[] = [
     {
@@ -264,15 +320,9 @@ export function EnvironmentsTable() {
       size: 50,
       cell: ({ row }) => (
         <button
-          onClick={async (e) => {
+          onClick={(e) => {
             e.stopPropagation();
-            if (confirm(`Delete environment "${row.original.name}"? All secrets in this environment will be lost.`)) {
-              try {
-                await withStepUp(() => deleteEnvAction({ id: row.original.id }));
-              } catch (e: any) {
-                alert(e?.message || "Failed to delete environment");
-              }
-            }
+            setDeleting(row.original);
           }}
           className="text-muted-foreground hover:text-destructive cursor-pointer"
           title="Delete environment"
@@ -290,99 +340,102 @@ export function EnvironmentsTable() {
   });
 
   return (
-    <Frame className="w-full">
-      <Table className="table-fixed">
-        <TableHeader>
-          {table.getHeaderGroups().map((headerGroup) => (
-            <TableRow className="hover:bg-transparent" key={headerGroup.id}>
-              {headerGroup.headers.map((header) => {
-                const columnSize = header.column.getSize();
-                return (
-                  <TableHead
-                    key={header.id}
-                    style={columnSize ? { width: `${columnSize}px` } : undefined}
-                  >
-                    {header.isPlaceholder
-                      ? null
-                      : flexRender(header.column.columnDef.header, header.getContext())}
-                  </TableHead>
-                );
-              })}
-            </TableRow>
-          ))}
-        </TableHeader>
-        <TableBody>
-          {table.getRowModel().rows.length === 0 ? (
-            <TableRow>
-              <TableCell colSpan={columns.length} className="text-center text-muted-foreground py-8">
-                No environments yet. Add one below.
-              </TableCell>
-            </TableRow>
-          ) : (
-            table.getRowModel().rows.map((row) => (
-              <TableRow key={row.id}>
-                {row.getVisibleCells().map((cell) => (
-                  <TableCell key={cell.id}>
-                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                  </TableCell>
-                ))}
+    <>
+      <Frame className="w-full">
+        <Table className="table-fixed">
+          <TableHeader>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <TableRow className="hover:bg-transparent" key={headerGroup.id}>
+                {headerGroup.headers.map((header) => {
+                  const columnSize = header.column.getSize();
+                  return (
+                    <TableHead
+                      key={header.id}
+                      style={columnSize ? { width: `${columnSize}px` } : undefined}
+                    >
+                      {header.isPlaceholder
+                        ? null
+                        : flexRender(header.column.columnDef.header, header.getContext())}
+                    </TableHead>
+                  );
+                })}
               </TableRow>
-            ))
-          )}
-        </TableBody>
-      </Table>
+            ))}
+          </TableHeader>
+          <TableBody>
+            {table.getRowModel().rows.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={columns.length} className="text-center text-muted-foreground py-8">
+                  No environments yet. Add one below.
+                </TableCell>
+              </TableRow>
+            ) : (
+              table.getRowModel().rows.map((row) => (
+                <TableRow key={row.id}>
+                  {row.getVisibleCells().map((cell) => (
+                    <TableCell key={cell.id}>
+                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
 
-      <div className="p-2 border-t border-border">
-        {showNewRow ? (
-          <ErrorBoundary
-            fallback={
-              <div className="flex items-center gap-2 px-2 py-1">
-                <ErrorBoundary.ErrorMessage className="text-xs text-destructive" />
-                <ErrorBoundary.ResetButton className="text-xs text-destructive underline cursor-pointer">
-                  Try again
-                </ErrorBoundary.ResetButton>
-              </div>
-            }
-          >
-            <form
-              className="flex items-center gap-2"
-              action={async (formData: FormData) => {
-                const { name, slug } = parseFormData(envSchema, formData);
-                await createEnvAction({ name, slug, projectId });
-                setShowNewRow(false);
-              }}
+        <div className="p-2 border-t border-border">
+          {showNewRow ? (
+            <ErrorBoundary
+              fallback={
+                <div className="flex items-center gap-2 px-2 py-1">
+                  <ErrorBoundary.ErrorMessage className="text-xs text-destructive" />
+                  <ErrorBoundary.ResetButton className="text-xs text-destructive underline cursor-pointer">
+                    Try again
+                  </ErrorBoundary.ResetButton>
+                </div>
+              }
             >
-              <Input
-                name={envFields.name}
-                inputSize="sm"
-                placeholder="Environment name"
-                required
-                className="flex-1"
-              />
-              <Input
-                name={envFields.slug}
-                inputSize="sm"
-                placeholder="slug"
-                required
-                className="flex-1 mono-sm"
-              />
-              <Button size="xs" type="submit">
-                Add
-              </Button>
-              <Button size="xs" variant="ghost" onClick={() => setShowNewRow(false)}>
-                Cancel
-              </Button>
-            </form>
-          </ErrorBoundary>
-        ) : (
-          <button
-            onClick={() => setShowNewRow(true)}
-            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground cursor-pointer px-2 py-1"
-          >
-            + Add Environment
-          </button>
-        )}
-      </div>
-    </Frame>
+              <form
+                className="flex items-center gap-2"
+                action={async (formData: FormData) => {
+                  const { name, slug } = parseFormData(envSchema, formData);
+                  await createEnvAction({ name, slug, projectId });
+                  setShowNewRow(false);
+                }}
+              >
+                <Input
+                  name={envFields.name}
+                  inputSize="sm"
+                  placeholder="Environment name"
+                  required
+                  className="flex-1"
+                />
+                <Input
+                  name={envFields.slug}
+                  inputSize="sm"
+                  placeholder="slug"
+                  required
+                  className="flex-1 mono-sm"
+                />
+                <Button size="xs" type="submit">
+                  Add
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => setShowNewRow(false)}>
+                  Cancel
+                </Button>
+              </form>
+            </ErrorBoundary>
+          ) : (
+            <button
+              onClick={() => setShowNewRow(true)}
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground cursor-pointer px-2 py-1"
+            >
+              + Add Environment
+            </button>
+          )}
+        </div>
+      </Frame>
+      <DeleteEnvironmentDialog env={deleting} secretCount={deleting ? secretCounts[deleting.id] ?? 0 : 0} onClose={() => setDeleting(null)} />
+    </>
   );
 }

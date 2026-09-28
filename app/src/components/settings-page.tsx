@@ -9,6 +9,7 @@ import { useState, useTransition } from 'react'
 import { AlertTriangleIcon, UsersIcon } from 'lucide-react'
 import { useLoaderData } from 'spiceflow/react'
 import { Button } from 'sigillo-app/src/components/ui/button'
+import { Input } from 'sigillo-app/src/components/ui/input'
 import {
   Dialog,
   DialogPopup,
@@ -89,13 +90,21 @@ function AutoJoinSection() {
 }
 
 export function SettingsPage() {
-  const { orgId, orgName, projectNames } = useLoaderData('/dash/projects/:projectId/settings')
+  const { orgId, orgName, projectNames, environmentCount, secretCount } = useLoaderData('/dash/projects/:projectId/settings')
   const [open, setOpen] = useState(false)
+  // Deleting takes the organization's name, typed out: it can't be undone
+  const [typedName, setTypedName] = useState('')
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
 
   function handleDelete() {
+    setDeleteError(null)
     startTransition(async () => {
-      await withStepUp(() => deleteOrgAction({ orgId }))
+      try {
+        await withStepUp(() => deleteOrgAction({ orgId, typedName }))
+      } catch (e) {
+        setDeleteError(e instanceof Error ? e.message : 'Deleting failed')
+      }
     })
   }
 
@@ -144,12 +153,12 @@ export function SettingsPage() {
         </div>
         <div className="border-t border-destructive/40 px-5 py-4 bg-destructive/5 rounded-b-lg flex items-center justify-between">
           <div>
-            <p className="text-sm font-medium">Delete organization</p>
+            <p className="text-sm font-medium">Delete this organization</p>
             <p className="text-xs text-muted-foreground">
-              This action cannot be undone.
+              Deletes {orgName} with all its projects, not only this one. It can't be undone.
             </p>
           </div>
-          <Dialog open={open} onOpenChange={setOpen}>
+          <Dialog open={open} onOpenChange={(next) => { setOpen(next); setTypedName(''); setDeleteError(null) }}>
             <Button
               variant="destructive"
               onClick={() => setOpen(true)}
@@ -158,9 +167,9 @@ export function SettingsPage() {
             </Button>
             <DialogPopup>
               <DialogHeader>
-                <DialogTitle>Delete {orgName}?</DialogTitle>
+                <DialogTitle>Delete the organization {orgName}?</DialogTitle>
                 <DialogDescription>
-                  This will permanently delete the organization and everything inside it.
+                  This deletes the whole organization, not only this project, and it can't be undone.
                 </DialogDescription>
               </DialogHeader>
               <div className="px-6 pb-4">
@@ -183,6 +192,16 @@ export function SettingsPage() {
                     This organization has no projects.
                   </p>
                 )}
+                <p className="text-sm text-muted-foreground mt-3">
+                  With them go {environmentCount} {environmentCount === 1 ? 'environment' : 'environments'} and{' '}
+                  <strong className="text-foreground">{secretCount} {secretCount === 1 ? 'secret' : 'secrets'}</strong>,
+                  their history, every member's access, invitations and API tokens.
+                </p>
+                <label className="flex flex-col gap-1.5 mt-4 text-sm">
+                  <span>Type <strong className="mono-sm">{orgName}</strong> to confirm</span>
+                  <Input value={typedName} onChange={(e) => setTypedName(e.target.value)} autoComplete="off" spellCheck={false} />
+                </label>
+                {deleteError && <p className="text-sm text-destructive mt-2">{deleteError}</p>}
               </div>
               <DialogFooter>
                 <DialogClose
@@ -193,7 +212,7 @@ export function SettingsPage() {
                 <Button
                   variant="destructive"
                   onClick={handleDelete}
-                  disabled={isPending}
+                  disabled={isPending || typedName !== orgName}
                 >
                   {isPending ? 'Deleting...' : 'Delete organization'}
                 </Button>

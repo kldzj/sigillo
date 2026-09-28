@@ -935,6 +935,29 @@ export async function deriveEnvironmentSecretsAndNames(
   }
 }
 
+// How many secrets each environment has now, in one batch
+export async function countSecrets(environmentIds: string[]): Promise<Record<string, number>> {
+  if (environmentIds.length === 0) return {}
+  const db = getDb()
+  const [first, ...rest] = environmentIds.map((environmentId) => db.query.secretEvent.findMany({ where: { environmentId }, orderBy: { createdAt: 'asc' } }))
+  const results = await db.batch([first!, ...rest])
+  return Object.fromEntries(environmentIds.map((id, i) => [id, replaySecretEvents(results[i]!).length]))
+}
+
+// Deleting can't be undone: an organization only when its name is typed, an
+// environment with secrets only when its slug is
+export async function requireOrgDeletionTyped({ orgId, typed }: { orgId: string; typed: string | undefined }) {
+  const org = await getDb().query.org.findFirst({ where: { id: orgId }, columns: { name: true } })
+  if (!org || typed !== org.name) throw new Error("Type the organization's name to delete it")
+}
+
+export async function requireEnvironmentDeletionTyped({ environmentId, typed }: { environmentId: string; typed: string | undefined }) {
+  const environment = await getDb().query.environment.findFirst({ where: { id: environmentId }, columns: { slug: true } })
+  if (!environment) return
+  const count = (await countSecrets([environmentId]))[environmentId] ?? 0
+  if (count > 0 && typed !== environment.slug) throw new Error(`Type the environment's slug to delete it and its ${count} ${count === 1 ? 'secret' : 'secrets'}`)
+}
+
 // ── Secrets API auth (session OR bearer token) ─────────────────────
 // Unified auth for secrets API routes. Accepts either:
 // 1. Session cookie → verifies org membership, returns { userId }

@@ -28,7 +28,7 @@ import {
   getUserEnvironmentAccess,
   getEnvironmentAccessError,
   getClaimableAutoJoinDomain,
-  deleteOrgMember, setOrgMemberRole,
+  deleteOrgMember, setOrgMemberRole, requireOrgDeletionTyped, requireEnvironmentDeletionTyped,
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
@@ -348,10 +348,11 @@ async function saveSecrets({ edits: requested, environmentIds }: {
   await appendSecretEvents({ author, events })
 }
 
-export async function deleteEnvAction({ id }: { id: string }) {
+export async function deleteEnvAction({ id, typedSlug }: { id: string; typedSlug?: string }) {
   return stepUpOr(async () => {
     const session = await requireSession()
     await requireEnvironmentAccess(session.userId, id)
+    await requireEnvironmentDeletionTyped({ environmentId: id, typed: typedSlug })
     await requireAdminForProtected({ ...session, environmentIds: [id] })
     const db = getDb()
     await db.delete(schema.environment).where(orm.eq(schema.environment.id, id))
@@ -816,11 +817,12 @@ export async function leaveOrgAction({ orgId }: { orgId: string }) {
   throw redirect(router.href('/dash'))
 }
 
-export async function deleteOrgAction({ orgId }: { orgId: string }) {
+export async function deleteOrgAction({ orgId, typedName }: { orgId: string; typedName: string }) {
   return stepUpOr(async () => {
     if (!orgId) throw new Error('Org ID is required')
     const session = await requireSession()
     await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: orgId })
+    await requireOrgDeletionTyped({ orgId, typed: typedName })
     const db = getDb()
     // Cascade deletes handle orgMembers, invitations, projects, environments,
     // secretEvents, and apiTokens automatically via foreign key constraints.

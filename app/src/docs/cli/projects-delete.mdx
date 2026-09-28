@@ -1,17 +1,23 @@
 ---
 $schema: https://holocron.so/frontmatter.json
 title: "projects delete"
-description: "Delete a project"
+description: "Delete a project with its environments and secrets"
 icon: lucide:folder-x
 ---
 
-Delete a project
+Delete a project with its environments and secrets
 
 ## Usage
 
 ```sh
 sigillo projects delete <id>
 ```
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `-y, --yes` | Delete without typing its name (needed without a terminal) |
 
 ## Global Options
 

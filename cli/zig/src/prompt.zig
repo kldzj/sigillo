@@ -278,6 +278,31 @@ fn passwordFallback(allocator: std.mem.Allocator, prompt_text: []const u8) !?[]c
     return try buffer.toOwnedSlice(allocator);
 }
 
+/// Reads one visible line from the terminal, for typing something out to
+/// confirm it. Returns null at the end of input with nothing typed.
+/// Requires a TTY on stdin.
+pub fn line(allocator: std.mem.Allocator, prompt_text: []const u8) !?[]const u8 {
+    const stdin = std.fs.File.stdin();
+    const out = std.fs.File.stderr().deprecatedWriter();
+    try color.blue(out, "? ");
+    try color.bold(out, prompt_text);
+    try out.writeAll(" ");
+
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    errdefer buffer.deinit(allocator);
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = stdin.read(&byte) catch break;
+        if (n == 0) {
+            if (buffer.items.len == 0) return null;
+            break;
+        }
+        if (byte[0] == '\n' or byte[0] == '\r') break;
+        try buffer.append(allocator, byte[0]);
+    }
+    return try buffer.toOwnedSlice(allocator);
+}
+
 /// Non-interactive fallback: print numbered list, read a number.
 fn selectFallback(prompt_text: []const u8, options: []const []const u8, default: ?usize) !?usize {
     const stdout = std.fs.File.stdout();

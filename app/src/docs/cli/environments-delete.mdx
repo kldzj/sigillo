@@ -1,17 +1,23 @@
 ---
 $schema: https://holocron.so/frontmatter.json
 title: "environments delete"
-description: "Delete an env by id or slug"
+description: "Delete an env by id or slug, with its secrets"
 icon: lucide:trash-2
 ---
 
-Delete an env by id or slug
+Delete an env by id or slug, with its secrets
 
 ## Usage
 
 ```sh
 sigillo environments delete <id>
 ```
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `-y, --yes` | Delete without typing its slug (needed without a terminal) |
 
 ## Global Options
 

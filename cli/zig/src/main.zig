@@ -381,7 +381,8 @@ const ProjectsGet = zeke.cmd("projects get <id>", "Get project details");
 const ProjectsUpdate = zeke.cmd("projects update <id>", "Update a project")
     .option("--name <name>", "Project name");
 
-const ProjectsDelete = zeke.cmd("projects delete <id>", "Delete a project");
+const ProjectsDelete = zeke.cmd("projects delete <id>", "Delete a project with its environments and secrets")
+    .option("-y, --yes", "Delete without typing its name (needed without a terminal)");
 
 const Environments = zeke.cmd("environments", "List envs for the configured project")
     .option("-p, --project [id]", "Project ID or name override");
@@ -397,7 +398,8 @@ const EnvironmentsRename = zeke.cmd("environments rename <id>", "Rename an env b
     .option("--name [name]", "Updated env name")
     .option("--slug [slug]", "Updated env slug");
 
-const EnvironmentsDelete = zeke.cmd("environments delete <id>", "Delete an env by id or slug");
+const EnvironmentsDelete = zeke.cmd("environments delete <id>", "Delete an env by id or slug, with its secrets")
+    .option("-y, --yes", "Delete without typing its slug (needed without a terminal)");
 
 const AuditVerify = zeke.cmd("audit verify", "Check an env's secret changes and reads against their hash chains (org admins)")
     .option("-p, --project [id]", "Project ID or name override")
@@ -2455,7 +2457,7 @@ fn projectsUpdateAction(args: ProjectsUpdate.Args, opts: ProjectsUpdate.Options,
     });
 }
 
-fn projectsDeleteAction(args: ProjectsDelete.Args, _: ProjectsDelete.Options, global: Global.Options) !void {
+fn projectsDeleteAction(args: ProjectsDelete.Args, opts: ProjectsDelete.Options, global: Global.Options) !void {
     const stderr = getStderr();
     const stdout = getStdout();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -2465,6 +2467,17 @@ fn projectsDeleteAction(args: ProjectsDelete.Args, _: ProjectsDelete.Options, gl
     const allocator = arena.allocator();
     const cwd = try config.getCwd(allocator);
     const api_ctx = try requireApiContext(allocator, stderr, cwd, .{ .token = global.token, .api_url = global.api_url });
+    if (!opts.yes) {
+        const found = try client.getProject(.{ .allocator = allocator, .api_url = api_ctx.api_url, .token = api_ctx.token, .project_id = args.id });
+        const project = found.value orelse {
+            const message = client.parseError(allocator, found.body) orelse try allocator.dupe(u8, "unknown error");
+            try color.err(stderr, "error");
+            try stderr.print(": failed to get project ({d}): {s}\n", .{ found.status, message });
+            std.process.exit(1);
+        };
+        const name = try color.plain(allocator, project.name);
+        try confirmDeletion(allocator, stderr, try std.fmt.allocPrint(allocator, "the project {s} with all its environments and secrets", .{name}), name);
+    }
     const res = try client.deleteProject(.{ .allocator = allocator, .api_url = api_ctx.api_url, .token = api_ctx.token, .project_id = args.id });
     if (res.status != 200 or res.value == null) {
         const message = client.parseError(allocator, res.body) orelse try allocator.dupe(u8, "unknown error");
@@ -2612,7 +2625,7 @@ fn environmentsRenameAction(args: EnvironmentsRename.Args, opts: EnvironmentsRen
     });
 }
 
-fn environmentsDeleteAction(args: EnvironmentsDelete.Args, _: EnvironmentsDelete.Options, global: Global.Options) !void {
+fn environmentsDeleteAction(args: EnvironmentsDelete.Args, opts: EnvironmentsDelete.Options, global: Global.Options) !void {
     const stderr = getStderr();
     const stdout = getStdout();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -2623,6 +2636,17 @@ fn environmentsDeleteAction(args: EnvironmentsDelete.Args, _: EnvironmentsDelete
     const cwd = try config.getCwd(allocator);
     const api_ctx = try requireApiContext(allocator, stderr, cwd, .{ .token = global.token, .api_url = global.api_url });
     const project_ctx = try requireProjectContext(allocator, stderr, cwd, .{ .token = global.token, .api_url = global.api_url });
+    if (!opts.yes) {
+        const found = try client.getEnvironment(.{ .allocator = allocator, .api_url = api_ctx.api_url, .token = api_ctx.token, .project_id = project_ctx.project_id, .environment_id = args.id });
+        const environment = found.value orelse {
+            const message = client.parseError(allocator, found.body) orelse try allocator.dupe(u8, "unknown error");
+            try color.err(stderr, "error");
+            try stderr.print(": failed to get environment ({d}): {s}\n", .{ found.status, message });
+            std.process.exit(1);
+        };
+        const slug = try color.plain(allocator, environment.slug);
+        try confirmDeletion(allocator, stderr, try std.fmt.allocPrint(allocator, "the environment {s} with all its secrets", .{slug}), slug);
+    }
     const res = try client.deleteEnvironment(.{ .allocator = allocator, .api_url = api_ctx.api_url, .token = api_ctx.token, .project_id = project_ctx.project_id, .environment_id = args.id });
     if (res.status != 200 or res.value == null) {
         const message = client.parseError(allocator, res.body) orelse try allocator.dupe(u8, "unknown error");
@@ -2631,6 +2655,27 @@ fn environmentsDeleteAction(args: EnvironmentsDelete.Args, _: EnvironmentsDelete
         std.process.exit(1);
     }
     try stdout.print("ok: true\nid: {s}\n", .{try quoteString(allocator, res.value.?.id)});
+}
+
+// Deleting can't be undone: in a terminal, the user types out the name of
+// what goes; without one it takes --yes. Exits unless confirmed.
+fn confirmDeletion(allocator: std.mem.Allocator, stderr: Writer, what: []const u8, name: []const u8) !void {
+    if (!std.posix.isatty(File.stdin().handle)) {
+        try color.err(stderr, "error");
+        try stderr.print(": this deletes {s}, and can't be undone: pass --yes to delete it without a terminal\n", .{what});
+        std.process.exit(1);
+    }
+    try stderr.print("This deletes {s}, and can't be undone.\n", .{what});
+    const typed = try prompt.line(allocator, try std.fmt.allocPrint(allocator, "Type {s} to confirm:", .{name})) orelse "";
+    if (!deletionConfirmed(typed, name)) {
+        try color.err(stderr, "error");
+        try stderr.print(": that isn't {s}, so nothing was deleted\n", .{name});
+        std.process.exit(1);
+    }
+}
+
+fn deletionConfirmed(typed: []const u8, name: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, typed, " \t\r\n"), name);
 }
 
 // Variables that decide which programs run and what they load. Anyone who can
@@ -2854,6 +2899,14 @@ test "redaction masks a secret that contains another one, when a write ends betw
     try flushRedactedPending(&pending, plan, true, output.writer(allocator));
     const whole = try redactOutputAlloc(allocator, "DATABASE_URL=" ++ url ++ "\n", &.{ password, url });
     try std.testing.expectEqualStrings(whole, output.items);
+}
+
+test "a deletion is confirmed only by the exact name, around spaces" {
+    try std.testing.expect(deletionConfirmed("prod", "prod"));
+    try std.testing.expect(deletionConfirmed("  prod\n", "prod"));
+    try std.testing.expect(!deletionConfirmed("Prod", "prod"));
+    try std.testing.expect(!deletionConfirmed("", "prod"));
+    try std.testing.expect(!deletionConfirmed("y", "prod"));
 }
 
 test "formatUserCode writes a login code as XXXX-XXXX" {

@@ -17,7 +17,7 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import worker, { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, setOrgMemberRole, getSession, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
@@ -3312,6 +3312,36 @@ describe('API errors', () => {
       { status: 409, body: { error: 'already exists' } },
       { status: 403, body: { error: 'forbidden' } },
     ])
+  })
+})
+
+describe('deleting', () => {
+  test('an organization takes its name typed out, and an environment with secrets its slug', async () => {
+    const user = await createTestUser({ name: 'Delete User' })
+    const af = authedFetch(user.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Acme Corp' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Website', orgId } })).id
+    const env = async (slug: string) => assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: slug } })).id
+    const [dev, prod] = [await env('dev'), await env('prod')]
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', { method: 'PUT', params: { pid: projectId, eid: prod }, body: { secrets: { A: '1', B: '2' } } }))
+    const outcome = async (run: () => Promise<unknown>) => run().then(() => 'ok', (error: Error) => error.message)
+    expect({
+      counts: await countSecrets([dev, prod]),
+      orgUntyped: await outcome(() => requireOrgDeletionTyped({ orgId, typed: '' })),
+      orgWrongCase: await outcome(() => requireOrgDeletionTyped({ orgId, typed: 'acme corp' })),
+      orgTyped: await outcome(() => requireOrgDeletionTyped({ orgId, typed: 'Acme Corp' })),
+      emptyEnv: await outcome(() => requireEnvironmentDeletionTyped({ environmentId: dev, typed: undefined })),
+      prodUntyped: await outcome(() => requireEnvironmentDeletionTyped({ environmentId: prod, typed: undefined })),
+      prodTyped: await outcome(() => requireEnvironmentDeletionTyped({ environmentId: prod, typed: 'prod' })),
+    }).toEqual({
+      counts: { [dev]: 0, [prod]: 2 },
+      orgUntyped: "Type the organization's name to delete it",
+      orgWrongCase: "Type the organization's name to delete it",
+      orgTyped: 'ok',
+      emptyEnv: 'ok',
+      prodUntyped: "Type the environment's slug to delete it and its 2 secrets",
+      prodTyped: 'ok',
+    })
   })
 })
 

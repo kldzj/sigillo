@@ -28,6 +28,7 @@ import {
   listUserSessions,
   isSessionFresh,
   actorOf,
+  countSecrets,
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
@@ -468,8 +469,14 @@ export const app = new Spiceflow({ tracer })
     return <ProjectPage key={loaderData.selectedEnvId ?? 'none'} />
   })
 
-  .loader('/dash/projects/:projectId/environments', async ({ params }) => {
-    return { projectId: params.projectId }
+  .loader('/dash/projects/:projectId/environments', async ({ params, request }) => {
+    // How many secrets each environment has, so deleting one with secrets
+    // asks for its slug
+    const session = await requirePageSession(request)
+    const access = await getProjectMemberAccess(session.userId, params.projectId)
+    const environments = await getDb().query.environment.findMany({ where: { projectId: params.projectId }, columns: { id: true, projectId: true, accessRole: true } })
+    const visible = environments.filter((env) => !getEnvironmentAccessError(access, env)).map((env) => env.id)
+    return { projectId: params.projectId, secretCounts: await countSecrets(visible) }
   })
 
   .page('/dash/projects/:projectId/environments', async () => {
@@ -801,18 +808,25 @@ export const app = new Spiceflow({ tracer })
     const session = await requirePageSession(request)
     const orgId = await getOrgIdForProject(params.projectId)
     if (!orgId) throw redirect('/')
-    await requirePageOrgMember(session.userId, orgId)
+    const { role } = await requirePageOrgMember(session.userId, orgId)
 
     const [orgRow, projects] = await Promise.all([
       db.query.org.findFirst({ where: { id: orgId }, columns: { name: true, autoJoinDomain: true } }),
-      db.query.project.findMany({ where: { orgId }, columns: { name: true }, orderBy: { createdAt: 'asc' } }),
+      db.query.project.findMany({ where: { orgId }, columns: { id: true, name: true }, orderBy: { createdAt: 'asc' } }),
     ])
+    // What deleting the organization takes with it, for the admins who can
+    const environments = role === 'admin' && projects.length > 0
+      ? await db.query.environment.findMany({ where: { projectId: { in: projects.map((p) => p.id) } }, columns: { id: true } })
+      : []
+    const secretCounts = await countSecrets(environments.map((env) => env.id))
 
     return {
       orgId,
       orgName: orgRow?.name ?? 'Organization',
       autoJoinDomain: orgRow?.autoJoinDomain ?? null,
       projectNames: projects.map((p) => p.name),
+      environmentCount: environments.length,
+      secretCount: Object.values(secretCounts).reduce((sum, count) => sum + count, 0),
     }
   })
 
