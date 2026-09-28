@@ -180,7 +180,7 @@ describe('sigillo cli e2e', () => {
     expect(rename.stdout).toContain(`id: "${environment.id}"`)
     expect(rename.stdout).toContain(`slug: "${renamedSlug}"`)
 
-    const deleted = await runCli({ args: ['environments', 'delete', renamedSlug], context: cliContext })
+    const deleted = await runCli({ args: ['environments', 'delete', renamedSlug, '--yes'], context: cliContext })
     expect(deleted.status).toBe(0)
     expect(deleted.stdout).toContain(`id: "${environment.id}"`)
   }, 60_000)
@@ -199,7 +199,7 @@ describe('sigillo cli e2e', () => {
       context: cliContext,
     })
     expect(created.status, created.stderr).toBe(0)
-    const deleted = await runCli({ args: ['environments', 'delete', slug], context: cliContext })
+    const deleted = await runCli({ args: ['environments', 'delete', slug, '--yes'], context: cliContext })
     expect(deleted.status, deleted.stderr).toBe(0)
   }, 60_000)
 
@@ -479,7 +479,7 @@ describe('sigillo cli e2e', () => {
     const witness = JSON.parse(readFileSync(join(home, '.sigillo', 'audit.json'), 'utf8'))
     rmSync(home, { recursive: true, force: true })
     expect({ first: first.status, second: second.status, keys: Object.keys(witness) }).toEqual({
-      first: 0, second: 0, keys: [`${cliContext.apiUrl} ${cliContext.environmentId}`],
+      first: 0, second: 0, keys: [`${cliContext.apiUrl} ${cliContext.projectId} ${cliContext.environmentSlug}`],
     })
     expect(first.stdout).toContain('First check of this env')
     expect(second.stdout).toMatch(/^✔ changes: \d+ rows, intact\n✔ reads: 0 rows, intact\n$/)
@@ -509,7 +509,7 @@ describe('sigillo login', () => {
     await new Promise<void>((resolveDone) => {
       const onData = (chunk: Buffer) => {
         output += chunk.toString('utf8')
-        if (output.includes('/device?user_code=') || output.includes('Saved bearer token')) resolveDone()
+        if (output.includes('Code: ') || output.includes('Saved bearer token')) resolveDone()
       }
       child.stdout.on('data', onData)
       child.stderr.on('data', onData)
@@ -518,7 +518,8 @@ describe('sigillo login', () => {
     child.kill('SIGKILL')
     rmSync(home, { recursive: true, force: true })
     expect(output).not.toContain('Saved bearer token')
-    expect(output).toContain('/device?user_code=')
+    expect(output).toContain(`${apiUrl}/device\n`)
+    expect(output).toMatch(/Code: [A-Z0-9]{4}-[A-Z0-9]{4}/)
   }, 60_000)
 })
 

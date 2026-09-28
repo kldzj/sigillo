@@ -610,7 +610,7 @@ export const app = new Spiceflow({ tracer })
     const locked = !!matchedEnv && !!getEnvironmentAccessError(access, matchedEnv)
 
     // Load events for selected env, sorted by createdAt DESC
-    let events: { id: string; name: string; operation: string; valueEncrypted: string | null; iv: string | null; createdAt: number; environmentName: string; userName: string }[] = []
+    let events: { id: string; name: string; operation: string; valueEncrypted: string | null; iv: string | null; createdAt: number; environmentName: string; userName: string; unsigned: boolean }[] = []
     if (selectedEnvId && !locked) {
       const envMap = new Map(environments.map((e) => [e.id, e.name]))
       const rows = await db.query.secretEvent.findMany({

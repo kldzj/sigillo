@@ -259,7 +259,8 @@ function PasskeyRequests() {
   const answer = async (requestId: string, approve: boolean) => {
     setError(null)
     try {
-      await withStepUp(() => (approve ? approveEnrollmentAction : declineEnrollmentAction)({ requestId }))
+      if (approve) await withStepUp(() => approveEnrollmentAction({ requestId }))
+      else await withStepUp(() => declineEnrollmentAction({ requestId }))
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to answer the request")
     }

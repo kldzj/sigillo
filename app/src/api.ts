@@ -680,7 +680,7 @@ export const apiApp = new Spiceflow()
     path: '/api/v0/projects/:projectId/environments',
     detail: { tags: ['Environments'], summary: 'Create environment' },
     request: environmentCreateRequestSchema,
-    response: { 200: environmentMutationResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
+    response: { 200: environmentMutationResponseSchema, 400: errorResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
     async handler({ request, params }) {
       const body = await request.json()
       const slugError = getEnvSlugError(body.slug)
