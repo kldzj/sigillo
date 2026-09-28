@@ -279,6 +279,12 @@ async function selfHost(options: SelfHostOptions) {
   const subdomain = await ensureWorkersDevSubdomain({ client, accountId, workerName, options })
   const workersDevUrl = `https://${workerName}.${subdomain}.workers.dev`
 
+  // ── Custom domain ─────────────────────────────────────────────────
+  // Chosen before any upload, since the provider is told the app's URL, and
+  // attached once the app worker exists
+  const domain = await chooseDomain({ client, accountId, options, saved })
+  const appUrl = domain ? `https://${domain.hostname}` : workersDevUrl
+
   // ── D1 + migrations ───────────────────────────────────────────────
   spinner.start('Provisioning D1 database')
   const firstMigrationName = Object.keys(bundle.app.migrations).sort()[0]
@@ -303,7 +309,7 @@ async function selfHost(options: SelfHostOptions) {
   const currentProviderUrl = plainTextBinding(appSettings, 'PROVIDER_URL')
   const provider = currentProviderUrl && currentProviderUrl !== ownProviderUrl
     ? undefined
-    : await deployProvider({ client, accountId, bundle, options, saved, spinner, workerName: providerWorkerName, url: ownProviderUrl, allowedUsers })
+    : await deployProvider({ client, accountId, bundle, options, saved, spinner, workerName: providerWorkerName, url: ownProviderUrl, appUrl, allowedUsers })
   if (!provider) {
     clack.log.warn(`This deployment signs in through ${currentProviderUrl} — keeping it, since a new provider would change every user's login`)
   }
@@ -369,23 +375,24 @@ async function selfHost(options: SelfHostOptions) {
   const healthy = await waitForHealth(workersDevUrl)
   spinner.stop(healthy ? 'Deployment is live' : 'Deployment uploaded (health check still propagating)')
 
-  // ── Custom domain ─────────────────────────────────────────────────
-  const customDomain = await maybeAttachDomain({ client, accountId, workerName, options, saved })
-  if (customDomain) {
-    deployment.customDomain = customDomain
+  if (domain?.zoneId) {
+    await client.attachCustomDomain(accountId, { zoneId: domain.zoneId, hostname: domain.hostname, service: workerName })
+    clack.log.success(`Custom domain attached: ${appUrl}`)
+  }
+  if (domain) {
+    deployment.customDomain = domain.hostname
     writeState({ ...readState(), deployments: { ...readState().deployments, [stateKey]: deployment } })
   }
 
-  const primaryUrl = customDomain ? `https://${customDomain}` : workersDevUrl
   clack.note(
     [
-      `${colors.bold('URL:')}        ${primaryUrl}`,
-      ...(customDomain ? [`${colors.bold('Fallback:')}   ${workersDevUrl}`] : []),
+      `${colors.bold('URL:')}        ${appUrl}`,
+      ...(domain ? [`${colors.bold('Fallback:')}   ${workersDevUrl}`] : []),
       `${colors.bold('Version:')}    v${bundle.version}`,
       '',
       `${colors.bold('Login:')}      ${providerUrl} (Google)`,
       `${colors.bold('Sign-in:')}    ${allowedUsers ? allowedUsers.split(',').join(', ') : 'anyone with a Google account'}`,
-      `Point the CLI at your instance:  sigillo login --api-url ${primaryUrl}`,
+      `Point the CLI at your instance:  sigillo login --api-url ${appUrl}`,
       '',
       'Re-run `npx @kldzj/sigillo self-host` anytime to deploy updates.',
     ].join('\n'),
@@ -487,7 +494,7 @@ async function askGoogleClient({ options, redirectUri }: {
 
 // Deploys (or updates) the deployment's own login provider: a second worker
 // with its own D1, reachable at `url`. Returns what the state file keeps.
-async function deployProvider({ client, accountId, bundle, options, saved, spinner, workerName, url, allowedUsers }: {
+async function deployProvider({ client, accountId, bundle, options, saved, spinner, workerName, url, appUrl, allowedUsers }: {
   client: CfClient
   accountId: string
   bundle: SelfhostBundle
@@ -496,6 +503,8 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
   spinner: ReturnType<typeof clack.spinner>
   workerName: string
   url: string
+  /** where the provider's error page sends people back to sign in */
+  appUrl: string
   /** the app's ALLOWED_USERS, applied by the provider too */
   allowedUsers: string
 }): Promise<Pick<DeploymentState, 'providerWorkerName' | 'providerDatabaseId' | 'providerAuthSecret' | 'googleClientId' | 'googleClientSecret'>> {
@@ -535,7 +544,7 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
     worker: bundle.provider,
     databaseId,
     assetsJwt,
-    vars: { BETTER_AUTH_URL: url },
+    vars: { BETTER_AUTH_URL: url, APP_URL: appUrl },
     secrets,
   })
   if (!secrets) {
@@ -555,19 +564,21 @@ async function deployProvider({ client, accountId, bundle, options, saved, spinn
   }
 }
 
-async function maybeAttachDomain(args: {
+// The app's custom domain: the flag, the saved one, or asked for when there
+// is none yet. zoneId is set when it still has to be attached.
+async function chooseDomain(args: {
   client: CfClient
   accountId: string
-  workerName: string
   options: SelfHostOptions
   saved?: DeploymentState
-}): Promise<string | undefined> {
-  const { client, accountId, workerName, options, saved } = args
-  if (options.skipDomain) return saved?.customDomain
-  let hostname = options.domain
+}): Promise<{ hostname: string; zoneId?: string } | undefined> {
+  const { client, accountId, options, saved } = args
+  const savedDomain = saved?.customDomain ? { hostname: saved.customDomain } : undefined
+  if (options.skipDomain) return savedDomain
+  const hostname = options.domain
 
   if (!hostname) {
-    if (saved?.customDomain || options.yes || !interactive()) return saved?.customDomain
+    if (saved?.customDomain || options.yes || !interactive()) return savedDomain
     const wants = await clack.confirm({
       message: 'Attach a custom domain? (the domain must already be on this Cloudflare account)',
       initialValue: false,
@@ -591,23 +602,18 @@ async function maybeAttachDomain(args: {
       defaultValue: `secrets.${zone.name}`,
     })
     if (clack.isCancel(input)) return undefined
-    hostname = String(input).trim()
-    await client.attachCustomDomain(accountId, { zoneId: zone.id, hostname, service: workerName })
-    clack.log.success(`Custom domain attached: https://${hostname}`)
-    return hostname
+    return { hostname: String(input).trim(), zoneId: zone.id }
   }
 
   // --domain flag: find the matching zone by suffix
   const zones = await client.listZones(accountId)
   const zone = zones
-    .filter((z) => hostname === z.name || hostname!.endsWith(`.${z.name}`))
+    .filter((z) => hostname === z.name || hostname.endsWith(`.${z.name}`))
     .sort((a, b) => b.name.length - a.name.length)[0]
   if (!zone) {
     throw new Error(`No zone on account matches ${hostname} — add the domain to Cloudflare first`)
   }
-  await client.attachCustomDomain(accountId, { zoneId: zone.id, hostname, service: workerName })
-  clack.log.success(`Custom domain attached: https://${hostname}`)
-  return hostname
+  return { hostname, zoneId: zone.id }
 }
 
 cli.command('version-info', 'Show the release this CLI deploys, and the latest one').action(async () => {

@@ -17,6 +17,7 @@
 import { gunzipSync } from 'node:zlib'
 import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { CfClient, CloudflareApiError, type DeploymentState } from './cloudflare.js'
 
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/kldzj/sigillo/releases'
@@ -53,12 +54,26 @@ export interface ExpectedBundle {
   sha256: string
 }
 
-export function readExpectedBundle(): ExpectedBundle | null {
+// Only a missing file means a local build. One that is there but unreadable
+// stops the run: deploying unchecked must never be how a damaged package fails.
+export function readExpectedBundle(file: URL = new URL('../selfhost-bundle.json', import.meta.url)): ExpectedBundle | null {
+  let text: string
   try {
-    return JSON.parse(readFileSync(new URL('../selfhost-bundle.json', import.meta.url), 'utf-8')) as ExpectedBundle
-  } catch {
-    return null
+    text = readFileSync(file, 'utf-8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
   }
+  let expected: Partial<ExpectedBundle> | null = null
+  try {
+    expected = JSON.parse(text)
+  } catch {
+    // Reported below, like a file without the fields
+  }
+  if (typeof expected?.version !== 'string' || !expected.version || typeof expected.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(expected.sha256)) {
+    throw new Error(`${fileURLToPath(file)} has no valid bundle version and SHA-256, so the bundle can't be checked: reinstall @kldzj/sigillo`)
+  }
+  return { version: expected.version, sha256: expected.sha256 }
 }
 
 type GithubRelease = { tag_name: string; assets: Array<{ name: string; browser_download_url: string }> }

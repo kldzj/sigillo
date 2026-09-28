@@ -8,11 +8,12 @@ import { gzipSync } from 'node:zlib'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { CloudflareApiError, parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
 import {
   appCompatibilityFlags, assertNoStoredSecrets, checkBundle, fetchReleaseInfo, isOlderVersion, isSigilloProviderWorker, normalizeAllowedUsers, parseBundle,
-  providerSecretsForDeploy, resolveDeploySecrets, updateAllowedUsersSecret, uploadWorker,
+  providerSecretsForDeploy, readExpectedBundle, resolveDeploySecrets, updateAllowedUsersSecret, uploadWorker,
   type SelfhostBundle, type WorkerBundle,
 } from '../src/selfhost/deploy.js'
 import { deriveStateKey, isSealed, openState, sealState, unlockStateFile } from '../src/selfhost/state-file.js'
@@ -124,6 +125,37 @@ describe('checkBundle', () => {
     expect(() => checkBundle(older, { version: '0.16.0', sha256: sha256(older) })).toThrow('The bundle is v0.15.0, but this CLI deploys v0.16.0')
     // A local build carries no digest
     expect(checkBundle(older, null).version).toBe('0.15.0')
+  })
+
+  test('a digest file that is there but unreadable stops the run; only a missing one means a local build', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'sigillo-digest-'))
+    let files = 0
+    const read = (content?: string) => {
+      const file = path.join(dir, `${++files}.json`)
+      if (content !== undefined) writeFileSync(file, content)
+      try {
+        return readExpectedBundle(pathToFileURL(file))
+      } catch (error) {
+        return (error as Error).message.replace(file, '<file>')
+      }
+    }
+    const sha = 'ab'.repeat(32)
+    const damaged = "<file> has no valid bundle version and SHA-256, so the bundle can't be checked: reinstall @kldzj/sigillo"
+    expect({
+      released: read(JSON.stringify({ version: '0.16.0', sha256: sha })),
+      missing: read(),
+      truncated: read('{"version":"0.16.0","sha'),
+      noDigest: read(JSON.stringify({ version: '0.16.0' })),
+      badDigest: read(JSON.stringify({ version: '0.16.0', sha256: 'not-a-digest' })),
+      noVersion: read(JSON.stringify({ sha256: sha })),
+    }).toEqual({
+      released: { version: '0.16.0', sha256: sha },
+      missing: null,
+      truncated: damaged,
+      noDigest: damaged,
+      badDigest: damaged,
+      noVersion: damaged,
+    })
   })
 
   test('isOlderVersion compares numerically', () => {

@@ -21,6 +21,8 @@
   ],
   "vars": {
     "BETTER_AUTH_URL": "https://auth.sigillo.dev",
+    // The app this provider signs in for: the error page links back to its login
+    "APP_URL": "https://sigillo.dev",
   },
   "secrets": {
     "required": ["BETTER_AUTH_SECRET", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
@@ -45,6 +47,7 @@
       ],
       "vars": {
         "BETTER_AUTH_URL": "https://auth.preview.sigillo.dev",
+        "APP_URL": "https://preview.sigillo.dev",
       },
       "secrets": {
         "required": ["BETTER_AUTH_SECRET", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],

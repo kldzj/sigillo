@@ -5,6 +5,7 @@ declare namespace Cloudflare {
 	interface PreviewEnv {
 		DB: D1Database;
 		BETTER_AUTH_URL: "https://auth.preview.sigillo.dev";
+		APP_URL: "https://preview.sigillo.dev";
 		BETTER_AUTH_SECRET: string;
 		GOOGLE_CLIENT_ID: string;
 		GOOGLE_CLIENT_SECRET: string;
@@ -12,6 +13,7 @@ declare namespace Cloudflare {
 	interface Env {
 		DB: D1Database;
 		BETTER_AUTH_URL: "https://auth.preview.sigillo.dev" | "https://auth.sigillo.dev";
+		APP_URL: "https://preview.sigillo.dev" | "https://sigillo.dev";
 		BETTER_AUTH_SECRET: string;
 		GOOGLE_CLIENT_ID: string;
 		GOOGLE_CLIENT_SECRET: string;
@@ -22,7 +24,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "BETTER_AUTH_URL" | "BETTER_AUTH_SECRET" | "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "BETTER_AUTH_URL" | "APP_URL" | "BETTER_AUTH_SECRET" | "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET">> {}
 }
 
 // Begin runtime types

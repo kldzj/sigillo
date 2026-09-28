@@ -9,8 +9,8 @@ Self-hostable secret manager (Doppler/Infisical alternative) running on Cloudfla
 This repo is a maintained fork of [remorses/sigillo](https://github.com/remorses/sigillo) with no hosted service. Where the rest of this file describes sigillo.dev, auth.sigillo.dev, Strada or the upstream release process, these rules win:
 
 - **No default server.** The CLI never falls back to sigillo.dev. Without `--api-url`, `SIGILLO_API_URL` or a saved login it stops with "no Sigillo server configured".
-- **Own login provider per instance.** `self-host` deploys the provider next to the app as `<name>-auth` and asks for a Google OAuth client. The release bundle (format 2) carries both workers.
-- **The bundle is pinned by the npm package.** CI writes the bundle's SHA-256 and version into `cli/dist/selfhost-bundle.json` before staging npm, and in that run checks that the GitHub release's bundle matches it. `self-host` downloads the release of its own version (`sigillo@<version>`), refuses a bundle with another digest or version, and refuses to deploy an older version over a newer one without `--allow-downgrade`. A CLI run from source has no digest file and warns that it can't check.
+- **Own login provider per instance.** `self-host` deploys the provider next to the app as `<name>-auth` and asks for a Google OAuth client. The release bundle (format 2) carries both workers. The provider's `APP_URL` is the app's URL (its custom domain when it has one), and the provider's error page links only there to sign in again, never to an origin from the query or a registered client.
+- **The bundle is pinned by the npm package.** CI writes the bundle's SHA-256 and version into `cli/dist/selfhost-bundle.json` before staging npm, and in that run checks that the GitHub release's bundle matches it. `self-host` downloads the release of its own version (`sigillo@<version>`), refuses a bundle with another digest or version, and refuses to deploy an older version over a newer one without `--allow-downgrade`. A CLI run from source has no digest file and warns that it can't check; a digest file that is there but can't be read stops the deploy.
 - **Package and releases.** The CLI is published as `@kldzj/sigillo` (bin `sigillo`) from this repo's CI through npm trusted publishing, stage only, so no npm token exists anywhere. Releases only run while the `RELEASE_ENABLED` repository variable is `true`. CI stages the npm version (`npm stage publish`) and creates the GitHub release as a draft; a maintainer then approves the staged version with 2FA (`npm stage approve <stage-id>` or npmjs.com → Staged Packages) and publishes the draft release. self-host reads releases from github.com/kldzj/sigillo, and never sees drafts. Changesets name `@kldzj/sigillo`, not `sigillo`.
 - **Upstream PRs** are branched from upstream `main` and must not contain fork-only changes; this repo's `main` merges them in.
 - **Docs are a static site, not part of an instance.** The app no longer mounts holocron: `/` redirects to `/dash`, and every response carries `X-Robots-Tag: noindex, nofollow`. The docs and landing page build from the same MDX through `src/docs-site.tsx` and `vite.docs.config.ts`. `pnpm --dir app docs:export` renders every page, with the RSC data client navigation loads, into `app/dist-docs/site`, and `pnpm --dir app docs:deploy` deploys that folder as static assets without a Worker (`wrangler.docs.jsonc`, sigillo.kldzj.dev). Rendering a page costs 20 to 200 ms of CPU, more than the free plan allows per request, which is why the site is files. The app still imports holocron's `globals.css` for Tailwind and its base styles. The docs site gets its own styles from `src/docs-site.css`.
@@ -83,7 +83,7 @@ Rules:
 ## Auth flow
 
 1. Self-hosted app calls `POST /api/setup` on first deploy → registers with provider via dynamic client registration
-2. User clicks login → redirected to provider → signs in with Google → consent → redirected back with auth code
+2. User clicks login → redirected to provider → signs in with Google → consent (the first time for this app) → redirected back with auth code
 3. App exchanges code for tokens via PKCE (no client_secret)
 4. CLI/agents use device flow: `POST /api/auth/device/code` → user enters code at `/device` → agent polls for token
 
@@ -198,7 +198,7 @@ Rules:
 
 ## Direct `auth.api.oauth2*` calls need `request` AND `asResponse: false`
 
-The provider auto-accepts consent server-side for our own app instead of rendering a consent screen, so `/consent` and `/select-account` call `auth.api.oauth2Consent` / `auth.api.oauth2Continue` directly rather than going through the browser `authClient`. Both endpoints finish by calling the plugin's internal `authorizeEndpoint`, which opens with:
+`/select-account` resumes the authorize flow server-side once Google's account picker is done, so it calls `auth.api.oauth2Continue` directly rather than going through the browser `authClient`. That endpoint, like `oauth2Consent`, finishes by calling the plugin's internal `authorizeEndpoint`, which opens with:
 
 ```js
 if (!ctx.request) throw new APIError('UNAUTHORIZED', {
@@ -206,11 +206,11 @@ if (!ctx.request) throw new APIError('UNAUTHORIZED', {
 })
 ```
 
-better-call sets `ctx.request` **only** from an explicit `request` option (`better-call/dist/context.mjs`); it never derives it from `headers`. Over HTTP the router fills it in, which is why every upstream example (`authClient.oauth2.consent()`) works and this one did not. The correct call is:
+better-call sets `ctx.request` **only** from an explicit `request` option (`better-call/dist/context.mjs`); it never derives it from `headers`. Over HTTP the router fills it in, which is why every upstream example (`authClient.oauth2.consent()`) works and a direct call does not. The correct call is:
 
 ```ts
-const result = await auth.api.oauth2Consent({
-  body: { accept: true, oauth_query: url.search.slice(1) },
+const result = await auth.api.oauth2Continue({
+  body: { selected: true, oauth_query: oauthQuery.toString() },
   headers: request.headers, // session lookup reads ctx.headers, not ctx.request
   request,                  // satisfies authorizeEndpoint's !ctx.request guard
   asResponse: false,        // see below — not optional
@@ -220,7 +220,7 @@ const result = await auth.api.oauth2Consent({
 | Field | Why it is required |
 |---|---|
 | `headers` | `sessionMiddleware` → `getSessionFromCtx` reads `ctx.headers`. Drop it and there is no session. |
-| `request` | `authorizeEndpoint`'s guard. Drop it and login dies with a raw JSON `APIError` blob on the consent page. |
+| `request` | `authorizeEndpoint`'s guard. Drop it and login dies with a raw `request not found` `APIError`. |
 | `asResponse: false` | `toAuthEndpoints` does `shouldReturnResponse = context?.asResponse ?? isRequestLike(context?.request)`. Adding `request` alone flips the return value from `{ redirect, url }` to a `Response`, so `result.url` becomes `""` and you redirect to nowhere. |
 
 Rules:
@@ -228,11 +228,11 @@ Rules:
 - Never add `request` to a direct `auth.api.*` call without also passing `asResponse: false`, unless you actually want the `Response`.
 - **TypeScript does not catch either mistake.** better-call's `StrictEndpoint` overloads pick the return type from the literal presence of `asResponse`, so the declared type stays `{ redirect: true; url: string }` either way. Typecheck, build, lint, and the app test suite all passed with the broken call.
 - The only thing that catches this is a real OAuth round trip. After touching `provider/src/app.tsx`, log in end to end against preview with cleared cookies.
-- The first-party check in `/consent` derives its host from `env.BETTER_AUTH_URL` (`auth.sigillo.dev` → `sigillo.dev`, `auth.preview.sigillo.dev` → `preview.sigillo.dev`). It used to be the hardcoded literal `'sigillo.dev'`, which made the auto-accept branch **unreachable on preview** — the bug above could only ever surface in production. Keep it derived so preview exercises the same path.
+- **`/consent` always renders the consent screen; the browser's `authClient.oauth2.consent()` answers it.** It used to accept on the user's behalf when the `redirect_uri` host matched a host derived from `BETTER_AUTH_URL`, but anyone can register a client with any redirect URIs, so a stranger's client could collect consent without a screen. The plugin stores consent per client and user (`oauth_consent`), so the screen shows once per app and user, and later sign-ins with the stored consent skip it. If skipping it is ever wanted, set `skip_consent` on the app's own client, never decide it from anything in the request.
 
 ## Sign-out is federated, and login always asks which Google account
 
-Two sessions exist per user: one on the app (`sigillo.dev`) and one on the provider (`auth.sigillo.dev`). Clearing only the app one made "Log out" a lie — the next click on **Sign in with Google** went `authorize → /consent` (auto-accepted for first-party) → back into the app as the same user, without ever reaching Google. Switching Google accounts was impossible, and on a shared machine the next person inherited the session.
+Two sessions exist per user: one on the app (`sigillo.dev`) and one on the provider (`auth.sigillo.dev`). Clearing only the app one made "Log out" a lie — the next click on **Sign in with Google** went `authorize` → consent already given → back into the app as the same user, without ever reaching Google. Switching Google accounts was impossible, and on a shared machine the next person inherited the session.
 
 The flow now spans both workers:
 
@@ -264,6 +264,8 @@ There are two distinct login paths and **both need a real browser round trip to 
 |---|---|---|
 | absent | `authorize → /sign-in → Google → /sign-in → authorize → app callback` | one picker |
 | alive | `authorize → /select-account → Google → /select-account?selected=1 → /oauth2/continue → app callback` | one picker |
+
+A user's first sign-in to an app also passes `/consent` once, before the app callback.
 
 `/select-account` had never run in production before this change (`shouldRedirect` returns false and no client sent the prompt), so treat it as the fragile path when touching this code.
 
@@ -333,7 +335,7 @@ First-time local setup:
 
 1. `pnpm install`
 2. Create `app/.dev.vars` with at least `BETTER_AUTH_SECRET` and optionally `ENCRYPTION_KEY`
-3. Create `provider/.dev.vars` with `BETTER_AUTH_SECRET`, `GOOGLE_CLIENT_ID`, and `GOOGLE_CLIENT_SECRET`
+3. Create `provider/.dev.vars` with `BETTER_AUTH_SECRET`, `GOOGLE_CLIENT_ID`, and `GOOGLE_CLIENT_SECRET` (and `APP_URL=http://localhost:5188` so the error page links to the local app)
 4. Run `pnpm --dir provider dev` once so local provider D1 is created and migrated
 5. Run `pnpm --dir app dev -- --port 5188` (or just `pnpm --dir app dev`) so local app D1 is created and migrated
 

@@ -139,20 +139,6 @@ function getRedirectDomain(redirectUri: string | null) {
   }
 }
 
-// The one app we own, derived from our own auth origin by dropping the `auth.`
-// label. Production auth.sigillo.dev → sigillo.dev, preview
-// auth.preview.sigillo.dev → preview.sigillo.dev.
-//
-// LESSON — this used to be the literal string 'sigillo.dev'. That made the
-// first-party auto-accept branch in /consent unreachable on preview, so a bug
-// living in that branch could only ever be discovered in production, which is
-// exactly what happened. Deriving the host keeps preview on the same code path
-// and makes "deploy preview, verify, then prod" actually mean something.
-function getFirstPartyAppHost() {
-  const authHost = new URL(env.BETTER_AUTH_URL).hostname
-  return authHost.startsWith('auth.') ? authHost.slice('auth.'.length) : authHost
-}
-
 // Resolves where /sign-out sends the browser once the provider session is
 // gone. The caller proposes a URL, but it is only honoured when it shares an
 // origin with one of the calling client's registered redirect_uris — otherwise
@@ -191,34 +177,14 @@ async function resolvePostLogoutRedirect(args: {
   return allowed ? requestedUrl.toString() : fallback
 }
 
-// The login page of the app a sign-in started from, for the error page's
-// button. Taken from the client's registered redirect URI, never from the
-// query, so the button can only lead back to that app.
-async function appLoginUrl(clientId: string | null): Promise<string | null> {
-  if (!clientId) return null
-  const client = await getDb().query.oauthClient.findFirst({
-    where: { clientId },
-    columns: { redirectUris: true },
-  })
-  const redirectUri = client?.redirectUris[0]
-  if (!redirectUri) return null
-  try {
-    return new URL('/login', redirectUri).toString()
-  } catch {
-    return null
-  }
-}
-
 // Starts the Google sign-in redirect. Uses returnHeaders so we get both the
 // redirect URL and the Set-Cookie headers (state cookie for CSRF). A bare
 // Response.redirect() drops those cookies → state_mismatch on the callback.
-// A refused or failed sign-in lands on /error with the app's client_id, so
-// the page can send the user back to that app instead of this worker's root.
+// A refused or failed sign-in lands on /error, whose button leads back to
+// the app's login page instead of this worker's root.
 async function startGoogleSignIn(request: Request, callbackUrl: URL) {
   const auth = getAuth()
   const errorUrl = new URL('/error', callbackUrl.origin)
-  const clientId = callbackUrl.searchParams.get('client_id')
-  if (clientId) errorUrl.searchParams.set('client_id', clientId)
   const { headers: responseHeaders, response } = await auth.api.signInSocial({
     body: { provider: 'google', callbackURL: callbackUrl.href, errorCallbackURL: errorUrl.href },
     headers: request.headers,
@@ -315,10 +281,10 @@ export const app = new Spiceflow()
   //
   // LESSON — without this route "log out" was a lie. Clearing only the app
   // cookie left the auth.sigillo.dev session alive, so the very next click on
-  // "Sign in with Google" went authorize → /consent (auto-accepted for
-  // first-party) → back into the app as the same user, without ever reaching
-  // Google. There was no way to switch Google accounts, and on a shared
-  // machine the next person inherited the previous session.
+  // "Sign in with Google" went authorize → consent already given → back into
+  // the app as the same user, without ever reaching Google. There was no way
+  // to switch Google accounts, and on a shared machine the next person
+  // inherited the previous session.
   //
   // This is deliberately NOT the plugin's RFC-compliant /oauth2/end-session:
   // that one requires an `id_token_hint`, a client with `enable_end_session`,
@@ -370,8 +336,37 @@ export const app = new Spiceflow()
   // handed back to BetterAuth as oauth_query; only `selected` is stripped,
   // so the signature still verifies.
   //
-  // LESSON — `request` and `asResponse: false` are BOTH mandatory here.
-  // See the comment on the /consent route below for the full explanation.
+  // LESSON — every direct `auth.api.oauth2*` call that resumes the authorize
+  // flow needs THREE fields, and omitting either of the last two fails in a
+  // way that typechecks, builds, and passes review:
+  //
+  //   headers        → session/cookie lookup. `sessionMiddleware` →
+  //                    `getSessionFromCtx` reads `ctx.headers`, never
+  //                    `ctx.request`, so this stays required.
+  //   request        → `oauth2Continue` (like `oauth2Consent`) ends by
+  //                    calling the plugin's internal `authorizeEndpoint`,
+  //                    which opens with `if (!ctx.request) throw APIError(
+  //                    'UNAUTHORIZED', { error_description: 'request not
+  //                    found' })`. better-call only sets `ctx.request` from
+  //                    an explicit `request` option; it never derives it from
+  //                    `headers`. Over HTTP the router fills it in, which is
+  //                    why upstream docs only ever show the browser
+  //                    `authClient.oauth2.*` path and never hit this.
+  //                    Resuming the flow server-side, as we do here, is off
+  //                    that happy path.
+  //   asResponse     → `toAuthEndpoints` does
+  //                    `shouldReturnResponse = context?.asResponse ?? isRequestLike(context?.request)`.
+  //                    So adding `request` alone silently flips the return
+  //                    value from `{ redirect, url }` to a `Response`, and
+  //                    `result.url` becomes an empty string — a redirect to
+  //                    nowhere. TypeScript does NOT catch this: the
+  //                    better-call overloads pick the return type from the
+  //                    literal presence of `asResponse`, so the declared type
+  //                    stays `{ redirect: true; url: string }` either way.
+  //
+  // Symptom when `request` is missing: login dies with a raw `request not
+  // found` APIError. It only reproduces against a real OAuth round trip, so
+  // always re-test login end to end after touching this file.
   .get('/select-account', async ({ request }) => {
     const url = new URL(request.url)
     const oauthQuery = new URLSearchParams(url.search)
@@ -397,56 +392,14 @@ export const app = new Spiceflow()
     return startGoogleSignIn(request, callbackUrl)
   })
 
-  // LESSON — every direct `auth.api.oauth2*` call that resumes the authorize
-  // flow needs THREE fields, and omitting either of the last two fails in a
-  // way that typechecks, builds, and passes review:
-  //
-  //   headers        → session/cookie lookup. `sessionMiddleware` →
-  //                    `getSessionFromCtx` reads `ctx.headers`, never
-  //                    `ctx.request`, so this stays required.
-  //   request        → `oauth2Consent` and `oauth2Continue` both end by
-  //                    calling the plugin's internal `authorizeEndpoint`,
-  //                    which opens with `if (!ctx.request) throw APIError(
-  //                    'UNAUTHORIZED', { error_description: 'request not
-  //                    found' })`. better-call only sets `ctx.request` from
-  //                    an explicit `request` option; it never derives it from
-  //                    `headers`. Over HTTP the router fills it in, which is
-  //                    why upstream docs only ever show the browser
-  //                    `authClient.oauth2.consent()` path and never hit this.
-  //                    Auto-accepting consent server-side for first-party
-  //                    clients (what we do below) is off that happy path.
-  //   asResponse     → `toAuthEndpoints` does
-  //                    `shouldReturnResponse = context?.asResponse ?? isRequestLike(context?.request)`.
-  //                    So adding `request` alone silently flips the return
-  //                    value from `{ redirect, url }` to a `Response`, and
-  //                    `result.url` becomes an empty string — a redirect to
-  //                    nowhere. TypeScript does NOT catch this: the
-  //                    better-call overloads pick the return type from the
-  //                    literal presence of `asResponse`, so the declared type
-  //                    stays `{ redirect: true; url: string }` either way.
-  //
-  // Symptom when `request` is missing: the consent page renders a raw JSON
-  // APIError blob and login is completely dead. It only reproduces against a
-  // real OAuth round trip, so always re-test login end to end after touching
-  // this file.
+  // ── Consent ────────────────────────────────────────────────────
+  // Always a screen, never accepted on the user's behalf: anyone can register
+  // a client with any redirect URI, so nothing in the request proves which
+  // app is asking. The plugin stores the answer per client and user, so each
+  // app asks once and later sign-ins go straight through.
   .page('/consent', async ({ request }) => {
     const url = new URL(request.url)
     const redirectDomain = getRedirectDomain(url.searchParams.get('redirect_uri'))
-
-    if (redirectDomain === getFirstPartyAppHost()) {
-      const auth = getAuth()
-      const result = await auth.api.oauth2Consent({
-        body: {
-          accept: true,
-          oauth_query: url.search.slice(1),
-        },
-        headers: request.headers,
-        request,
-        asResponse: false,
-      })
-
-      return Response.redirect(result.url, 302)
-    }
 
     // The consent URL carries the original authorize params, so /sign-in can
     // restart the flow with them and resume authorize after Google returns.
@@ -494,7 +447,9 @@ export const app = new Spiceflow()
     const error = url.searchParams.get('error')
     const errorDescription = url.searchParams.get('error_description')
     if (!error) return Response.redirect(new URL('/', url.origin).toString(), 302)
-    const backUrl = await appLoginUrl(url.searchParams.get('client_id'))
+    // The app this provider signs in for, never an origin from the query or
+    // a registered client: anyone can register one and link to this page
+    const backUrl = env.APP_URL ? new URL('/login', env.APP_URL).toString() : null
     return <ErrorScreen error={error} errorDescription={errorDescription} backUrl={backUrl} />
   })
 
@@ -520,12 +475,17 @@ export type App = typeof app
 export default {
   fetch: async (request: Request) => {
     const response = await app.handle(request)
+    const headers = new Headers(response.headers)
+    // Sign-in, consent and error pages have no business in search results
+    headers.set('X-Robots-Tag', 'noindex, nofollow')
     // The sign-in and consent pages are not meant to be embedded: another
     // page could frame them and have someone click through them unseen
-    const headers = new Headers(response.headers)
     headers.set('X-Frame-Options', 'DENY')
     headers.set('Content-Security-Policy', "frame-ancestors 'none'")
     headers.set('X-Content-Type-Options', 'nosniff')
+    // Tokens, codes and sessions stay out of the browser's and any proxy's
+    // cache; the static assets don't come through here
+    if (!headers.has('Cache-Control')) headers.set('Cache-Control', 'no-store')
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   },
 } satisfies ExportedHandler<Env>

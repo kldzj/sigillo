@@ -67,10 +67,16 @@ export function getAuth() {
     advanced: { ipAddress: { ipAddressHeaders: ['cf-connecting-ip'] } },
     // Per IP, counted in D1 so every isolate sees the same counts. Anyone may
     // register a client, as the app does when it first starts: a few an hour.
+    // Discovery is public and unlimited: the app fetches it whenever it
+    // builds its auth, from Cloudflare egress IPs other Workers share.
+    // Paths are relative to /api/auth, and false turns the limit off.
     rateLimit: {
       enabled: true,
       storage: 'database',
-      customRules: { '/oauth2/register': { window: 3600, max: 10 } },
+      customRules: {
+        '/oauth2/register': { window: 3600, max: 10 },
+        '/.well-known/*': false,
+      },
     },
     // Google's OAuth tokens are encrypted in D1. Rows written
     // before this stay readable: better-auth passes unencrypted values through.
