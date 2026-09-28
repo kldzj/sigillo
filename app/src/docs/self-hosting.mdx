@@ -12,7 +12,7 @@ Run Sigillo on **your own Cloudflare account** with a single command. No git clo
 npx @kldzj/sigillo self-host
 ```
 
-The command provisions **two Workers and their D1 databases** on your account: the Sigillo app and its own login provider. It applies the database migrations, uploads the latest release, and prints your instance URL. The whole thing runs on Cloudflare's **free plan**, and depends on no one else's servers.
+The command provisions **two Workers and their D1 databases** on your account: the Sigillo app and its own login provider. It applies the database migrations, uploads the release, and prints your instance URL. The whole thing runs on Cloudflare's **free plan**, and depends on no one else's servers.
 
 ## What it does
 
@@ -21,7 +21,7 @@ npx @kldzj/sigillo self-host
       │
       ├──> 1. Unlock ~/.sigillo/selfhost.json with your passphrase
       ├──> 2. Log in to Cloudflare (reuses wrangler login when present)
-      ├──> 3. Download the latest release bundle from github.com/kldzj/sigillo
+      ├──> 3. Download this version's release bundle from github.com/kldzj/sigillo, and check its SHA-256
       ├──> 4. Create the app's D1 database and apply its migrations
       ├──> 5. Deploy the login provider (<name>-auth): D1, migrations, Worker
       ├──> 6. Deploy the app (<name>): Worker, static assets
@@ -63,6 +63,8 @@ npx @kldzj/sigillo self-host
 ```
 
 Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and no secret is ever rotated, so your stored secrets stay decryptable and your users stay signed in.
+
+Each version of `@kldzj/sigillo` deploys its own release, which is why `npx @kldzj/sigillo` without a version updates to the latest one. The bundle holds the code that runs with your secrets, so the CLI checks it against the SHA-256 that CI recorded in the npm package when it built both, and deploys nothing that doesn't match. It also refuses to deploy a version older than the one your instance runs, unless you pass `--allow-downgrade`.
 
 A deployment that already signs in through another provider, such as one made with upstream Sigillo's `self-host` against `auth.sigillo.dev`, keeps that provider on update: switching would give every user a new login.
 
@@ -114,8 +116,9 @@ Updates keep the list saved in `~/.sigillo/selfhost.json`. Pass `--allowed-users
 | `--allowed-users <list>` | Email addresses and domains that may sign in, comma-separated; `''` lets anyone in |
 | `--domain <hostname>` | Attach a custom domain to the app (the zone must be on your account) |
 | `--skip-domain` | Skip the custom domain prompt |
-| `--bundle <path>` | Deploy a local bundle file instead of the latest release |
-| `--release-url <url>` | Download the bundle from a custom URL |
+| `--bundle <path>` | Deploy a local copy of this version's bundle, checked like a download |
+| `--release-url <url>` | Download this version's bundle from a custom URL, checked like a download |
+| `--allow-downgrade` | Deploy even if the instance runs a newer version |
 | `--change-passphrase` | Encrypt `~/.sigillo/selfhost.json` with a new passphrase, then stop |
 | `--reset-passkeys <email>` | Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop. See [Hardening](./hardening.mdx#5-require-a-passkey-for-production) |
 | `--yes` | Accept all defaults, non-interactive |

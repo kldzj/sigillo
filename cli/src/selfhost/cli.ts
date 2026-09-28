@@ -36,6 +36,8 @@ import {
   resolveDeploySecrets,
   updateAllowedUsersSecret,
   loadBundle,
+  readExpectedBundle,
+  isOlderVersion,
   syncAssets,
   uploadWorker,
   waitForHealth,
@@ -52,8 +54,9 @@ cli
   .option('--name [name]', z.string().optional().describe('Worker name (default: sigillo)'))
   .option('--account [id]', z.string().optional().describe('Cloudflare account id'))
   .option('--api-token [token]', z.string().optional().describe('Cloudflare API token (or CLOUDFLARE_API_TOKEN env)'))
-  .option('--bundle [path]', z.string().optional().describe('Deploy a local bundle file instead of the latest release'))
-  .option('--release-url [url]', z.string().optional().describe('Download the bundle from a custom URL'))
+  .option('--bundle [path]', z.string().optional().describe("Deploy a local copy of this version's bundle instead of downloading it"))
+  .option('--release-url [url]', z.string().optional().describe("Download this version's bundle from a custom URL"))
+  .option('--allow-downgrade', 'Deploy even if the instance runs a newer version')
   .option('--domain [hostname]', z.string().optional().describe('Attach this custom domain (zone must be on your account)'))
   .option('--skip-domain', 'Skip the custom domain prompt')
   .option('--google-client-id [id]', z.string().optional().describe('Google OAuth client ID for the login provider (asked for on a new deployment)'))
@@ -176,6 +179,7 @@ interface SelfHostOptions {
   apiToken?: string
   bundle?: string
   releaseUrl?: string
+  allowDowngrade?: boolean
   domain?: string
   skipDomain?: boolean
   googleClientId?: string
@@ -247,8 +251,16 @@ async function selfHost(options: SelfHostOptions) {
 
   // ── Bundle ────────────────────────────────────────────────────────
   const spinner = clack.spinner()
-  spinner.start(options.bundle ? 'Loading local bundle' : 'Downloading latest Sigillo release')
-  const bundle: SelfhostBundle = await loadBundle({ bundlePath: options.bundle, url: options.releaseUrl })
+  // A published CLI deploys the bundle of its own version, checked against
+  // the SHA-256 it was released with
+  const expected = readExpectedBundle()
+  if (!expected) clack.log.warn('This CLI is a local build with no recorded bundle digest: the bundle is not checked')
+  spinner.start(options.bundle ? 'Loading local bundle' : expected ? `Downloading Sigillo v${expected.version}` : 'Downloading latest Sigillo release')
+  const bundle: SelfhostBundle = await loadBundle({ bundlePath: options.bundle, url: options.releaseUrl, expected })
+  if (saved?.deployedVersion && isOlderVersion(bundle.version, saved.deployedVersion) && !options.allowDowngrade) {
+    spinner.stop(`Release v${bundle.version}`)
+    throw new Error(`This instance runs v${saved.deployedVersion}, newer than v${bundle.version}: update the CLI (npx @kldzj/sigillo@latest self-host), or pass --allow-downgrade`)
+  }
   spinner.stop(
     saved?.deployedVersion === bundle.version
       ? `Release v${bundle.version} (already deployed — re-syncing)`
@@ -598,8 +610,10 @@ async function maybeAttachDomain(args: {
   return hostname
 }
 
-cli.command('version-info', 'Show the latest available self-host release').action(async () => {
+cli.command('version-info', 'Show the release this CLI deploys, and the latest one').action(async () => {
+  const expected = readExpectedBundle()
   const info = await fetchReleaseInfo()
+  console.log(`deploys: ${expected ? `v${expected.version} (sha256 ${expected.sha256})` : 'the latest release, unchecked (a local build)'}`)
   console.log(`latest: v${info.version}`)
   console.log(`bundle: ${info.url}`)
 })

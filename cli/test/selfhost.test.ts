@@ -3,6 +3,7 @@
 // The full deploy path is exercised manually/e2e against a real Cloudflare
 // account (network + credentials required), not here.
 
+import { createHash } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -10,7 +11,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { CloudflareApiError, parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
 import {
-  appCompatibilityFlags, assertNoStoredSecrets, fetchReleaseInfo, isSigilloProviderWorker, normalizeAllowedUsers, parseBundle,
+  appCompatibilityFlags, assertNoStoredSecrets, checkBundle, fetchReleaseInfo, isOlderVersion, isSigilloProviderWorker, normalizeAllowedUsers, parseBundle,
   providerSecretsForDeploy, resolveDeploySecrets, updateAllowedUsersSecret, uploadWorker,
   type SelfhostBundle, type WorkerBundle,
 } from '../src/selfhost/deploy.js'
@@ -97,6 +98,37 @@ describe('parseBundle', () => {
     expect(() => parseBundle(bad)).toThrowErrorMatchingInlineSnapshot(
       `[Error: Unsupported bundle format 99 — update the sigillo CLI]`,
     )
+  })
+})
+
+describe('checkBundle', () => {
+  const worker: WorkerBundle = {
+    compatibilityDate: '2026-04-16',
+    compatibilityFlags: ['nodejs_compat'],
+    mainModule: 'index.js',
+    modules: { 'index.js': Buffer.from('export default {}').toString('base64') },
+    assets: {},
+    migrations: {},
+  }
+  const gzipped = (version: string) => gzipSync(Buffer.from(JSON.stringify({ formatVersion: 2, version, createdAt: '2026-01-01T00:00:00.000Z', app: worker, provider: worker })))
+  const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
+
+  test('deploys only the bundle this CLI was released with', () => {
+    const released = gzipped('0.16.0')
+    const expected = { version: '0.16.0', sha256: sha256(released) }
+    expect(checkBundle(released, expected).version).toBe('0.16.0')
+    // Anything else, even a well-formed bundle of another or the same version
+    const other = gzipped('0.16.0 ')
+    expect(() => checkBundle(other, expected)).toThrow(`This bundle isn't the one @kldzj/sigillo 0.16.0 was released with (SHA-256 ${sha256(other)}, expected ${expected.sha256}), so nothing was deployed`)
+    const older = gzipped('0.15.0')
+    expect(() => checkBundle(older, { version: '0.16.0', sha256: sha256(older) })).toThrow('The bundle is v0.15.0, but this CLI deploys v0.16.0')
+    // A local build carries no digest
+    expect(checkBundle(older, null).version).toBe('0.15.0')
+  })
+
+  test('isOlderVersion compares numerically', () => {
+    expect([isOlderVersion('0.15.0', '0.16.0'), isOlderVersion('0.9.0', '0.10.0'), isOlderVersion('0.16.0', '0.16.0'), isOlderVersion('1.0.0', '0.99.9')])
+      .toEqual([true, true, false, false])
   })
 })
 

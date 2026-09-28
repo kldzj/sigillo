@@ -124,6 +124,16 @@ jobs:
           name: dist
           path: cli/dist/
 
+      # self-host deploys only the bundle of its own version, and checks it
+      # against this SHA-256. It ships in the npm package, so it comes through
+      # npm's staged publishing that a maintainer approves with 2FA.
+      - name: Record the self-host bundle's digest
+        run: |
+          VERSION=$(node -p "require('./cli/package.json').version")
+          SHA256=$(sha256sum app/dist/sigillo-selfhost-bundle.json.gz | cut -d' ' -f1)
+          printf '{"version":"%s","sha256":"%s"}\n' "$VERSION" "$SHA256" > cli/dist/selfhost-bundle.json
+          cat cli/dist/selfhost-bundle.json
+
       - name: List dist contents
         run: ls -laR cli/dist/
 
@@ -146,18 +156,6 @@ jobs:
       - name: Releases are off
         if: env.RELEASE_ENABLED != 'true'
         run: echo "::notice::The RELEASE_ENABLED repository variable is not true, so nothing is published to npm or GitHub releases"
-
-      # Trusted publishing, stage only: npm authenticates with this workflow's
-      # OIDC token (no npm token is stored anywhere) and the version waits in
-      # npm's stage queue until a maintainer approves it with 2FA:
-      #   npm stage approve <stage-id>   (or npmjs.com → Staged Packages)
-      # npm stage needs npm 11.15.0 or later.
-      - name: Stage npm release
-        if: env.RELEASE_ENABLED == 'true' && steps.version-check.outputs.skip == 'false'
-        working-directory: cli
-        run: |
-          npm install -g npm@^11.15.0
-          npm stage publish --access public --provenance
 
       # The release starts as a draft, which self-host cannot see, so its
       # bundle only goes out once a maintainer publishes the draft after
@@ -212,3 +210,25 @@ jobs:
           upload_if_missing "sigillo-${TAG}-win32-x64.zip"
           upload_if_missing "sigillo-${TAG}-win32-arm64.zip"
           upload_if_missing "app/dist/sigillo-selfhost-bundle.json.gz"
+
+          # In a run that stages the npm package (the next step), the release's
+          # bundle must be the one whose digest that package carries, or
+          # self-host would refuse it. A bundle already there from elsewhere
+          # fails the run before anything is staged.
+          if [ "${{ steps.version-check.outputs.skip }}" = "false" ]; then
+            gh release download "$TAG" --pattern sigillo-selfhost-bundle.json.gz --dir "$RUNNER_TEMP/released" --clobber
+            echo "$(node -p "require('./cli/dist/selfhost-bundle.json').sha256")  $RUNNER_TEMP/released/sigillo-selfhost-bundle.json.gz" | sha256sum --check
+          fi
+
+      # After the release carries the bundle this package pins: trusted
+      # publishing, stage only: npm authenticates with this workflow's
+      # OIDC token (no npm token is stored anywhere) and the version waits in
+      # npm's stage queue until a maintainer approves it with 2FA:
+      #   npm stage approve <stage-id>   (or npmjs.com → Staged Packages)
+      # npm stage needs npm 11.15.0 or later.
+      - name: Stage npm release
+        if: env.RELEASE_ENABLED == 'true' && steps.version-check.outputs.skip == 'false'
+        working-directory: cli
+        run: |
+          npm install -g npm@^11.15.0
+          npm stage publish --access public --provenance

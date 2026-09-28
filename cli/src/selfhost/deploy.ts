@@ -15,11 +15,11 @@
 // would invalidate the derived AES encryption key and destroy stored secrets).
 
 import { gunzipSync } from 'node:zlib'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { CfClient, CloudflareApiError, type DeploymentState } from './cloudflare.js'
 
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/kldzj/sigillo/releases?per_page=30'
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/kldzj/sigillo/releases'
 export const BUNDLE_ASSET_NAME = 'sigillo-selfhost-bundle.json.gz'
 
 // Keep in sync with app/scripts/build-selfhost-bundle.ts
@@ -45,21 +45,39 @@ export interface ReleaseInfo {
   url: string
 }
 
+// The bundle this CLI deploys: its version, and the SHA-256 that CI recorded
+// in dist/selfhost-bundle.json when it built the bundle and staged this npm
+// package. Absent when the CLI runs from a local build.
+export interface ExpectedBundle {
+  version: string
+  sha256: string
+}
+
+export function readExpectedBundle(): ExpectedBundle | null {
+  try {
+    return JSON.parse(readFileSync(new URL('../selfhost-bundle.json', import.meta.url), 'utf-8')) as ExpectedBundle
+  } catch {
+    return null
+  }
+}
+
+type GithubRelease = { tag_name: string; assets: Array<{ name: string; browser_download_url: string }> }
+
 /**
- * Resolve the latest release bundle straight from the fork's GitHub releases,
- * so a deploy never depends on anyone's hosted service.
+ * Resolve a release bundle straight from the fork's GitHub releases, so a
+ * deploy never depends on anyone's hosted service: the release of this CLI's
+ * own version, or with none given, the latest one.
  */
-export async function fetchReleaseInfo(): Promise<ReleaseInfo> {
-  const res = await fetch(GITHUB_RELEASES_URL, {
+export async function fetchReleaseInfo(version?: string): Promise<ReleaseInfo> {
+  const res = await fetch(version ? `${GITHUB_RELEASES_URL}/tags/sigillo@${version}` : `${GITHUB_RELEASES_URL}?per_page=30`, {
     headers: { 'User-Agent': 'sigillo-cli', Accept: 'application/vnd.github+json' },
   })
   if (!res.ok) {
-    throw new Error(`Could not fetch releases from GitHub: ${res.status}`)
+    throw new Error(version && res.status === 404
+      ? `No published release sigillo@${version} on GitHub yet`
+      : `Could not fetch releases from GitHub: ${res.status}`)
   }
-  const releases = (await res.json()) as Array<{
-    tag_name: string
-    assets: Array<{ name: string; browser_download_url: string }>
-  }>
+  const releases = version ? [(await res.json()) as GithubRelease] : (await res.json()) as GithubRelease[]
   for (const release of releases) {
     const asset = release.assets.find((a) => a.name === BUNDLE_ASSET_NAME)
     if (asset && release.tag_name.startsWith('sigillo@')) {
@@ -77,16 +95,41 @@ export function parseBundle(gzipped: Buffer): SelfhostBundle {
   return bundle
 }
 
-export async function loadBundle(args: { bundlePath?: string; url?: string }): Promise<SelfhostBundle> {
-  if (args.bundlePath) {
-    return parseBundle(readFileSync(args.bundlePath))
+// The bundle holds the code that runs with the deployment's secrets, so a
+// published CLI deploys only the bundle it was released with: the one whose
+// SHA-256 it carries, from wherever it came.
+export function checkBundle(gzipped: Buffer, expected: ExpectedBundle | null): SelfhostBundle {
+  if (expected) {
+    const sha256 = createHash('sha256').update(gzipped).digest('hex')
+    if (sha256 !== expected.sha256) {
+      throw new Error(`This bundle isn't the one @kldzj/sigillo ${expected.version} was released with (SHA-256 ${sha256}, expected ${expected.sha256}), so nothing was deployed`)
+    }
   }
-  const url = args.url ?? (await fetchReleaseInfo()).url
+  const bundle = parseBundle(gzipped)
+  if (expected && bundle.version !== expected.version) {
+    throw new Error(`The bundle is v${bundle.version}, but this CLI deploys v${expected.version}`)
+  }
+  return bundle
+}
+
+export async function loadBundle(args: { bundlePath?: string; url?: string; expected: ExpectedBundle | null }): Promise<SelfhostBundle> {
+  if (args.bundlePath) return checkBundle(readFileSync(args.bundlePath), args.expected)
+  const url = args.url ?? (await fetchReleaseInfo(args.expected?.version)).url
   const res = await fetch(url)
   if (!res.ok) {
     throw new Error(`Bundle download failed: ${res.status} ${url}`)
   }
-  return parseBundle(Buffer.from(await res.arrayBuffer()))
+  return checkBundle(Buffer.from(await res.arrayBuffer()), args.expected)
+}
+
+// Whether a is an older version than b, both like 0.15.2
+export function isOlderVersion(a: string, b: string): boolean {
+  const parts = (v: string) => v.split('-')[0]!.split('.').map((n) => Number.parseInt(n, 10) || 0)
+  const [pa, pb] = [parts(a), parts(b)]
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) < (pb[i] ?? 0)
+  }
+  return false
 }
 
 // ── Conflict detection ──────────────────────────────────────────────
