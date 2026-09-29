@@ -91,7 +91,7 @@ If you are the only admin and lost every passkey, remove them from the machine t
 npx @kldzj/sigillo self-host --reset-passkeys you@acme.com
 ```
 
-**Machine tokens.** CI and servers can't use a passkey. For them, an org admin creates a token on the **Tokens** tab with **Machine token** checked. Making it is an admin action, so it takes the admin's passkey once the organization has a protected environment. It expires after 90 days at most, reads and changes protected environments without a passkey, and stops working when its creator is no longer an admin. The **Tokens** tab marks it **Machine**. Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
+**Machine tokens.** CI and servers can't use a passkey. For them, an org admin creates a token on the **Tokens** tab with **Machine token** checked. Making it takes the admin's passkey, also before the organization has a protected environment, so a stolen admin session can't leave one behind that reads environments protected later. It expires after 90 days at most, reads and changes protected environments without a passkey, and stops working when its creator is no longer an admin. The **Tokens** tab marks it **Machine**. Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
 
 ## 6. Check the history
 

@@ -17,12 +17,12 @@ import { describe, test, expect, beforeAll } from 'vitest'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import worker, { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions } from './db.js'
+import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions, internalErrorMessage } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
-import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
+import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode } from './lib/utils.js'
 
@@ -282,6 +282,28 @@ describe('names', () => {
       environment: status(await af('/api/v0/projects/:projectId/environments', { method: 'POST', params: { projectId }, body: { name: clipboard, slug: 'staging' } })),
       environmentRename: status(await af('/api/v0/projects/:projectId/environments/:id', { method: 'PATCH', params: { projectId, id: 'dev' }, body: { name: '\r' } })),
     }).toEqual({ org: 400, project: 400, rename: 400, environment: 400, environmentRename: 400 })
+  })
+})
+
+describe('errors the server doesn\'t mean to show', () => {
+  test('reach people without their query, while messages meant for them stay', async () => {
+    const user = await createTestUser({ name: 'Error User' })
+    const orgId = assertOk(await authedFetch(user.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Error Org' } })).id
+    const projectId = assertOk(await authedFetch(user.token)('/api/v0/projects', { method: 'POST', body: { name: 'Error Project', orgId } })).id
+    // Real failures from D1: a slug taken twice, and a project in no organization
+    const duplicate = await getDb().insert(schema.environment).values({ projectId, name: 'Again', slug: 'dev' }).catch((error: unknown) => error)
+    const orphan = await getDb().insert(schema.project).values({ name: 'Orphan', orgId: 'no-such-org' }).catch((error: unknown) => error)
+    expect({
+      duplicate: [String((duplicate as Error).message).startsWith('Failed query'), internalErrorMessage(duplicate)],
+      orphan: internalErrorMessage(orphan),
+      bug: internalErrorMessage(new TypeError("Cannot read properties of undefined (reading 'id')")),
+      meant: internalErrorMessage(new Error('Name is required')),
+    }).toEqual({
+      duplicate: [true, 'That already exists'],
+      orphan: 'Something went wrong on the server. Try again.',
+      bug: 'Something went wrong on the server. Try again.',
+      meant: null,
+    })
   })
 })
 
@@ -2426,7 +2448,7 @@ describe('instance headers', () => {
     const cookie = `better-auth.session_token=${encodeURIComponent(user.token)}`
     const headersOf = async (path: string) => {
       const res = await worker.fetch(new Request(`http://e.ly${path}`, { headers: { cookie } }))
-      return [res.headers.get('x-frame-options'), res.headers.get('content-security-policy'), res.headers.get('cache-control')]
+      return [res.headers.get('x-frame-options'), res.headers.get('content-security-policy'), res.headers.get('cache-control'), res.headers.get('strict-transport-security')]
     }
     // What a form on another page sends: the cookie rides along, the body parses as JSON
     const write = (origin: string, name: string) => worker.fetch(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${dev}/secrets`, {
@@ -2438,8 +2460,8 @@ describe('instance headers', () => {
       crossOrigin: (await write('http://evil.e.ly', 'PLANTED')).status,
       sameOrigin: (await write('http://e.ly', 'MINE')).status,
     }).toEqual({
-      device: ['DENY', "frame-ancestors 'none'", 'no-store'],
-      secrets: ['DENY', "frame-ancestors 'none'", 'no-store'],
+      device: ['DENY', "frame-ancestors 'none'", 'no-store', 'max-age=31536000'],
+      secrets: ['DENY', "frame-ancestors 'none'", 'no-store', 'max-age=31536000'],
       crossOrigin: 403,
       sameOrigin: 200,
     })
@@ -3072,6 +3094,20 @@ describe('step-up', () => {
     })
   })
 
+  test('making a machine token takes a passkey before the organization protects anything too', async () => {
+    // A stolen admin session could otherwise leave one behind for later
+    const owner = await createTestUser({ name: 'Unprotected Admin' })
+    const orgId = assertOk(await authedFetch(owner.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Unprotected Org' } })).id
+    const unprotectedProject = assertOk(await authedFetch(owner.token)('/api/v0/projects', { method: 'POST', body: { name: 'Unprotected', orgId } })).id
+    const sessionId = await sessionIdOf(owner.token)
+    const outcomeOf = (run: () => Promise<unknown>) => run().then(() => 'ok', (error) => error instanceof StepUpRequiredError ? `step-up:${error.purpose}` : (error as Error).message)
+    const attempt = () => outcomeOf(() => requireMachineTokenApproval({ userId: owner.user.id, sessionId, projectId: unprotectedProject, expiresInDays: 90 }))
+    const without = await attempt()
+    const deleting = await outcomeOf(() => requireMachineTokenDeletion({ userId: owner.user.id, sessionId, projectId: unprotectedProject }))
+    await grantAdmin(owner.token)
+    expect({ without, deleting, approved: await attempt() }).toEqual({ without: 'step-up:admin', deleting: 'ok', approved: 'ok' })
+  })
+
   test('a machine token stops working on protected environments when its creator is no longer an admin', async () => {
     const creator = await createTestUser({ name: 'Token Creator' })
     const { orgId } = (await getDb().query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } }))!
@@ -3341,7 +3377,7 @@ describe('protected writes and admin actions', () => {
 
   test('every action that can need a passkey answers { stepUp } instead of failing', () => {
     const source = (import.meta.glob('./actions.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>)['./actions.ts']!
-    const gate = /\b(requireOrgAdmin|requireProtectedAccess|requireAdminApproval|requireMachineTokenApproval|appendSecretEvents|recordSecretRead|readSecretValues|readEventValue|setEnvironmentProtection|resetMemberPasskeys|approveEnrollment|declineEnrollment|requirePasskeyOnceEnrolled)\(/
+    const gate = /\b(requireOrgAdmin|requireProtectedAccess|requireAdminApproval|requireMachineTokenApproval|requireMachineTokenDeletion|appendSecretEvents|recordSecretRead|readSecretValues|readEventValue|setEnvironmentProtection|resetMemberPasskeys|approveEnrollment|declineEnrollment|requirePasskeyOnceEnrolled)\(/
     const functions = source.split(/\n(?=(?:export )?async function )/)
     const nameOf = (fn: string) => fn.match(/async function (\w+)/)?.[1] ?? ''
     const gatedHelpers = functions.filter((fn) => fn.startsWith('async function') && gate.test(fn)).map(nameOf)

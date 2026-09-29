@@ -483,6 +483,8 @@ export default {
     headers.set('X-Frame-Options', 'DENY')
     headers.set('Content-Security-Policy', "frame-ancestors 'none'")
     headers.set('X-Content-Type-Options', 'nosniff')
+    // Browsers that saw the provider once never ask for it over plain http
+    headers.set('Strict-Transport-Security', 'max-age=31536000')
     // Tokens, codes and sessions stay out of the browser's and any proxy's
     // cache; the static assets don't come through here
     if (!headers.has('Cache-Control')) headers.set('Cache-Control', 'no-store')

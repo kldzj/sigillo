@@ -299,8 +299,7 @@ function CreateTokenDialog({
             setCreating(true)
             setError(null)
             try {
-              // A machine token asks for your passkey for the protected
-              // environments it will read
+              // A machine token asks for your passkey
               const result = await withStepUp(() => createTokenAction({
                 name: name.trim(),
                 projectId,
@@ -435,7 +434,7 @@ function CreateTokenDialog({
                 <span className="text-sm font-medium">Machine token</span>
                 <span className="text-xs text-muted-foreground">
                   Reads and changes protected environments without a passkey, for CI and servers. Takes your
-                  passkey once the organization has a protected environment, and expires after {MACHINE_TOKEN_MAX_DAYS} days at most.
+                  passkey, and expires after {MACHINE_TOKEN_MAX_DAYS} days at most.
                 </span>
               </span>
             </label>

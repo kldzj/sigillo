@@ -213,9 +213,11 @@ export async function requireTokenDeletion({ userId, sessionId, token }: { userI
 }
 
 // A machine token reads and changes protected environments without a
-// passkey, so making or deleting one is an admin action (with an admin
-// approval once the org has a protected environment), and it expires after
-// 90 days at most. It stops working when its creator is no longer an admin.
+// passkey. Making one is an org admin's, approved with their passkey even
+// while the organization has no protected environment: otherwise a stolen
+// admin session could leave one behind that reads environments once they are
+// protected. It expires after 90 days at most, and stops working when its
+// creator is no longer an admin.
 export async function requireMachineTokenApproval({ userId, sessionId, projectId, expiresInDays }: {
   userId: string
   sessionId: string
@@ -223,6 +225,12 @@ export async function requireMachineTokenApproval({ userId, sessionId, projectId
   expiresInDays: number
 }) {
   if (expiresInDays > MACHINE_TOKEN_MAX_DAYS) throw new Error(`A machine token expires after ${MACHINE_TOKEN_MAX_DAYS} days at most`)
+  await requireMachineTokenDeletion({ userId, sessionId, projectId })
+  if (!await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+}
+
+// Deleting one stops whatever uses it: an admin action like any other
+export async function requireMachineTokenDeletion({ userId, sessionId, projectId }: { userId: string; sessionId: string; projectId: string }) {
   const project = await getDb().query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } })
   if (!project) throw new Error('Project not found')
   await requireOrgAdmin({ userId, sessionId, orgId: project.orgId })

@@ -35,7 +35,7 @@ import {
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
-  requireMachineTokenApproval, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
+  requireMachineTokenApproval, requireMachineTokenDeletion, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
   requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
 } from './step-up.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
@@ -578,7 +578,7 @@ export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
       environmentIds: token.environments.map((row) => row.environmentId),
     })
     // Deleting a machine token stops CI: an admin action, like making one
-    if (token.protectedAccess) await requireMachineTokenApproval({ userId: session.userId, sessionId: session.sessionId, projectId: token.projectId, expiresInDays: 0 })
+    if (token.protectedAccess) await requireMachineTokenDeletion({ userId: session.userId, sessionId: session.sessionId, projectId: token.projectId })
     await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
     return { ok: true }
   })

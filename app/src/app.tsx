@@ -31,6 +31,8 @@ import {
   countSecrets,
   listFormerMembers,
   firstAccessibleProject,
+  requirePageProjectAccess,
+  internalErrorMessage,
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
@@ -114,6 +116,20 @@ function projectEnvSlug(request: Request, projectId: string, environments: { slu
 const tracer = trace.getTracer('sigillo-app')
 
 export const app = new Spiceflow({ tracer })
+
+  // What the server didn't mean to say stays in its logs. Without this, a
+  // page or server action that fails in a query sends the query's SQL and
+  // parameters to the browser, and pages a stack trace too. The REST API
+  // answers its errors itself (api.ts).
+  .onError(({ error, path }) => {
+    if (path.startsWith('/api/v0/')) return
+    const message = internalErrorMessage(error)
+    if (message === null) return
+    console.error(error)
+    // A server action sends the error's message to the browser
+    if (error instanceof Error) error.message = message
+    return Response.json({ error: message }, { status: 500 })
+  })
 
   // ── BetterAuth middleware ──────────────────────────────────────
   // BetterAuth runs in the worker, not the DO. Only SQL crosses the
@@ -487,7 +503,7 @@ export const app = new Spiceflow({ tracer })
     // How many secrets each environment has, so deleting one with secrets
     // asks for its slug
     const session = await requirePageSession(request)
-    const access = await getProjectMemberAccess(session.userId, params.projectId)
+    const access = await requirePageProjectAccess(session.userId, params.projectId)
     const environments = await getDb().query.environment.findMany({ where: { projectId: params.projectId }, columns: { id: true, projectId: true, accessRole: true } })
     const visible = environments.filter((env) => !getEnvironmentAccessError(access, env)).map((env) => env.id)
     return { projectId: params.projectId, secretCounts: await countSecrets(visible) }
@@ -784,7 +800,7 @@ export const app = new Spiceflow({ tracer })
     const db = getDb()
     const { projectId } = params
     const session = await requirePageSession(request)
-    const access = await getProjectMemberAccess(session.userId, projectId)
+    const access = await requirePageProjectAccess(session.userId, projectId)
 
     const tokens = await db.query.apiToken.findMany({
       where: { projectId },
@@ -828,12 +844,10 @@ export const app = new Spiceflow({ tracer })
   })
 
   // ── Settings page ────────────────────────────────────────────────
-  .loader('/dash/projects/:projectId/settings', async ({ params, request, redirect }) => {
+  .loader('/dash/projects/:projectId/settings', async ({ params, request }) => {
     const db = getDb()
     const session = await requirePageSession(request)
-    const orgId = await getOrgIdForProject(params.projectId)
-    if (!orgId) throw redirect('/dash')
-    await requirePageOrgMember(session.userId, orgId)
+    await requirePageProjectAccess(session.userId, params.projectId)
     // What deleting the project takes with it
     const environments = await db.query.environment.findMany({ where: { projectId: params.projectId }, columns: { id: true } })
     const secretCounts = await countSecrets(environments.map((env) => env.id))
@@ -1280,6 +1294,8 @@ export default {
     headers.set('Content-Security-Policy', "frame-ancestors 'none'")
     headers.set('X-Content-Type-Options', 'nosniff')
     headers.set('Referrer-Policy', 'same-origin')
+    // Browsers that saw the instance once never ask for it over plain http
+    headers.set('Strict-Transport-Security', 'max-age=31536000')
     // Secret values, names and logins stay out of the browser's and any
     // proxy's cache; the static assets don't come through here
     if (!headers.has('Cache-Control')) headers.set('Cache-Control', 'no-store')

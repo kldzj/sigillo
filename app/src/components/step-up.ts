@@ -22,7 +22,7 @@ export async function approveInBrowser({ purpose, environmentIds }: StepUp["step
   if ("noPasskey" in started) {
     const question = purpose === "access"
       ? "This environment is protected: it needs a passkey. Add one now?"
-      : "This organization has protected environments, so admin actions need a passkey. Add one now?";
+      : "This takes a passkey, and you have none yet. Add one now?";
     if (confirm(question)) router.push(router.href("/dash/passkeys"));
     return false;
   }

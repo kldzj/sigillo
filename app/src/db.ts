@@ -9,6 +9,7 @@
 
 import { env } from 'cloudflare:workers'
 import * as orm from 'drizzle-orm'
+import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import { betterAuth } from 'better-auth/minimal'
@@ -742,6 +743,20 @@ export async function setOrgMemberRole({ member, role }: { member: { id: string;
   ])
 }
 
+// What people see of an error the server didn't mean to show them, or null
+// when its message is meant for people. A failed query's message holds its
+// SQL and parameters, and a programming error's helps nobody.
+export function internalErrorMessage(error: unknown): string | null {
+  const text = `${(error as Error | undefined)?.message ?? ''} ${String((error as { cause?: unknown } | undefined)?.cause ?? '')}`
+  if (error instanceof DrizzleQueryError || /\bD1_|SQLITE_/.test(text)) {
+    return /UNIQUE constraint failed/.test(text) ? 'That already exists' : 'Something went wrong on the server. Try again.'
+  }
+  if (error instanceof TypeError || error instanceof ReferenceError || error instanceof RangeError || error instanceof SyntaxError) {
+    return 'Something went wrong on the server. Try again.'
+  }
+  return null
+}
+
 // Input the API answers with 400 and its message
 export class InvalidInputError extends Error {
   readonly status = 400
@@ -789,6 +804,14 @@ export async function requirePageOrgMember(userId: string, orgId: string) {
     if (!(error instanceof ForbiddenError)) throw error
     throw redirect('/')
   }
+}
+
+// A project page's own check, on top of its layout's: someone who can't open
+// the project goes to the dashboard. Returns their access in its organization.
+export async function requirePageProjectAccess(userId: string, projectId: string) {
+  const access = await getProjectMemberAccess(userId, projectId)
+  if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(projectId))) throw redirect('/dash')
+  return access
 }
 
 // ── Org ownership chain lookups ─────────────────────────────────────
