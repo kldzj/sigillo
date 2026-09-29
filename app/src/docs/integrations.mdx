@@ -1,0 +1,114 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Sync secrets to other platforms'
+sidebarTitle: 'Sync to other platforms'
+description: 'Send an environment’s secrets to Cloudflare Workers, Vercel, Fly.io, Docker or a .NET app straight from sigillo, without printing them or leaving a file behind.'
+icon: lucide:share-2
+---
+
+Platforms that keep their own copy of your secrets get them from `sigillo secrets download`, piped straight into their CLI. The values never appear in the terminal, and no `.env` file stays on disk. Each example sends the whole environment you pick, so keep `dev`, `preview` and `prod` apart in Sigillo and match them to the platform's environments.
+
+## Cloudflare Workers
+
+Upload secrets to a Worker with `wrangler secret bulk`:
+
+```bash
+sigillo secrets download -c prod --format env |
+  wrangler secret bulk --env=""
+```
+
+Use an explicit empty environment for the top-level production Worker; Wrangler warns when a configuration has named environments but the target is ambiguous.
+
+As `package.json` scripts, to sync before each deploy:
+
+```json
+{
+  "scripts": {
+    "secrets:preview": "sigillo secrets download -c preview --format env | wrangler secret bulk --env preview",
+    "secrets:production": "sigillo secrets download -c prod --format env | wrangler secret bulk --env=\"\""
+  }
+}
+```
+
+## Vercel
+
+`vercel env add` only accepts one variable at a time. Use the `xargs` format to pipe them:
+
+```bash
+sigillo secrets download -c prod --format xargs | \
+  xargs -0 -n2 sh -c 'printf %s "$2" | vercel env add "$1" production --force' sh
+```
+
+Add `--sensitive` to mark values as sensitive in Vercel:
+
+```bash
+sigillo secrets download -c prod --format xargs | \
+  xargs -0 -n2 sh -c 'printf %s "$2" | vercel env add "$1" production --sensitive --force' sh
+```
+
+As a `package.json` script:
+
+```json
+{
+  "scripts": {
+    "secrets:vercel": "sigillo secrets download -c prod --format xargs | xargs -0 -n2 sh -c 'printf %s \"$2\" | vercel env add \"$1\" production --sensitive --force' sh"
+  }
+}
+```
+
+## Fly.io
+
+`fly secrets import` reads `NAME=VALUE` pairs from stdin:
+
+```bash
+sigillo secrets download -c prod --format env | fly secrets import --app my-app
+```
+
+By default it restarts the app's machines once the secrets are staged. Use `--stage` to skip the restart and deploy separately:
+
+```bash
+# stage without restarting
+sigillo secrets download -c prod --format env | fly secrets import --app my-app --stage
+# then deploy when ready
+fly deploy --app my-app
+```
+
+As `package.json` scripts:
+
+```json
+{
+  "scripts": {
+    "secrets:fly:production": "sigillo secrets download -c prod --format env | fly secrets import --app my-app",
+    "secrets:fly:preview": "sigillo secrets download -c preview --format env | fly secrets import --app my-app-staging"
+  }
+}
+```
+
+## Docker
+
+Pass the secrets as an env file:
+
+```bash
+sigillo secrets download --format docker > .env.docker
+docker run --env-file .env.docker my-image
+```
+
+Or run Compose with them in its environment:
+
+```bash
+sigillo run -- docker compose up
+```
+
+## .NET
+
+Download secrets as a hierarchical JSON file, where keys with `__` become nested objects:
+
+```bash
+sigillo secrets download --format dotnet-json > appsettings.Secrets.json
+```
+
+`DB__HOST=localhost` becomes `{ "Db": { "Host": "localhost" } }`.
+
+## Kubernetes
+
+For clusters, [External Secrets Operator](./workload-identity.mdx#external-secrets-operator) copies an environment into a Kubernetes Secret and keeps it up to date, and pods can use [workload identity](./workload-identity.mdx#kubernetes) with `sigillo run` instead.

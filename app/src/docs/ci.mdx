@@ -1,0 +1,71 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Secrets in CI and on servers'
+sidebarTitle: 'CI and servers'
+description: 'Give CI jobs, servers and pods access to Sigillo: workload identity, API tokens and machine tokens, which one to use, and how to set them up.'
+icon: lucide:workflow
+---
+
+Machines can't sign in with Google or approve with a passkey. They get one of three credentials, all made on a project's **Tokens** tab:
+
+| Credential | For | Stored where the job runs |
+|---|---|---|
+| [Workload identity](./workload-identity.mdx) | GitHub Actions jobs, Kubernetes pods, External Secrets Operator | Nothing: the job's own identity gets a token of one hour |
+| Machine token | Anything else that reads or changes a protected environment | A `sig_` token, for 90 days at most |
+| API token | Anything else, for environments that aren't protected | A `sig_` token, for 7 to 365 days |
+
+Prefer workload identity where the platform offers it. Otherwise, make one token per machine or pipeline, scoped to the environments it needs.
+
+## API tokens
+
+On the project's **Tokens** tab, click **Create token**, name it, pick the environments it may use (or all of them), and how long it lasts: 7, 30, 90 or 365 days. The token is shown once; copy it then. Sigillo keeps only its SHA-256 hash.
+
+- A token belongs to one project, and optionally only some of its environments. It can't read or change a protected environment: that takes a machine token.
+- It acts for the person who made it. It stops working when they can no longer sign in or open its project, and for an admin-only environment when they are no longer an org admin.
+- Anyone who can open a project's environments can create tokens for them. Once you have a passkey, creating one takes it, since a token outlives the session that made it.
+- The **Tokens** tab shows when and from which IP each token was last used, to the hour. An expired token gets `401 API token expired`.
+- Only a token's creator or an org admin deletes it. Tokens made before expiry existed never expire and show **Never**: replace them.
+
+## Machine tokens
+
+CI and servers can't use a passkey. For them, an org admin creates a token on the **Tokens** tab with **Machine token** checked. Making it takes the admin's passkey, also before the organization has a protected environment, so a stolen admin session can't leave one behind that reads environments protected later. It expires after 90 days at most, reads and changes protected environments without a passkey, and stops working when its creator is no longer an admin. The **Tokens** tab marks it **Machine**.
+
+Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
+
+## Use a token
+
+Set it as `SIGILLO_TOKEN`, with your instance and the project and environment:
+
+```yaml
+- name: Run with secrets
+  env:
+    SIGILLO_API_URL: ${{ vars.SIGILLO_API_URL }}
+    SIGILLO_TOKEN: ${{ secrets.SIGILLO_TOKEN }}
+    SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}
+    SIGILLO_ENVIRONMENT: ${{ vars.SIGILLO_ENVIRONMENT }}
+  run: |
+    npx @kldzj/sigillo run -- next build
+```
+
+On a machine where the token should stay, save it for a directory instead:
+
+```bash
+sigillo login --api-url https://secrets.acme.com --token sig_xxx --scope .
+```
+
+## Without a stored token
+
+GitHub Actions jobs and Kubernetes pods can skip the token altogether. An org admin adds a trust rule for the repository and its GitHub environment, or for the pod's service account, and the job gets a token of one hour for its own identity:
+
+```yaml
+permissions:
+  id-token: write
+steps:
+  - run: npx @kldzj/sigillo run -- ./deploy.sh
+    env:
+      SIGILLO_API_URL: ${{ vars.SIGILLO_API_URL }}
+      SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}   # the project's ID
+      SIGILLO_ENVIRONMENT: prod
+```
+
+See [workload identity](./workload-identity.mdx) for the rules, Kubernetes and External Secrets Operator.

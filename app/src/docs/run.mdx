@@ -1,0 +1,99 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Run commands with secrets'
+sidebarTitle: 'Run commands with secrets'
+description: 'Start any command with an environment’s secrets as environment variables with sigillo run: choosing the environment, shell features, package scripts, output redaction and mounted files.'
+icon: lucide:square-terminal
+---
+
+`sigillo run` starts your command with the environment's secrets as environment variables. Nothing is written to disk, unless you ask for a file with `--mount`.
+
+## Choose the environment
+
+```bash
+sigillo run -- next dev                             # the directory's environment, from sigillo setup
+sigillo run -c prod -- next build                   # another environment of the same project
+sigillo run --project <PROJECT_ID> -c dev -- next dev   # without sigillo setup
+sigillo run -- printenv                             # what the command gets, values redacted
+```
+
+## Use shell features
+
+Everything after `--` is run as one command. For `&&`, pipes, redirects or `$VARIABLE`, pass a shell string with `--command` instead, in single quotes, so your own shell doesn't expand the secret variables before Sigillo sets them:
+
+```bash
+# Wrong: your shell expands $DATABASE_URL before sigillo starts
+sigillo run --command "psql $DATABASE_URL -c 'select 1'"
+
+# Right: $DATABASE_URL expands inside sigillo's child shell
+sigillo run --command 'psql $DATABASE_URL -c "select 1"'
+```
+
+## In package scripts
+
+Put non-secret variables before `sigillo run`, so regular build flags stay visible in the script while secrets come from Sigillo:
+
+```json
+{
+  "scripts": {
+    "deployment": "CLOUDFLARE_ENV=preview sigillo run -c preview --command 'vite build && wrangler deploy --env preview'"
+  }
+}
+```
+
+When a package manager runs the script (`pnpm run`, `bun run`, `npm run`), it adds `node_modules/.bin` to `PATH` before Sigillo starts. Sigillo passes that `PATH` on, so local binaries like `vite`, `tsc` or `wrangler` work without `pnpm exec` or `npx`:
+
+```bash
+sigillo run -- vite build          # vite found via node_modules/.bin
+sigillo run -- wrangler deploy     # wrangler found via node_modules/.bin
+sigillo run --command 'vite build && wrangler deploy'
+```
+
+This also works when you start `sigillo run` with `pnpm exec` or `bunx`:
+
+```bash
+pnpm exec sigillo run -- vite dev
+bunx @kldzj/sigillo run -- next build
+```
+
+A globally installed `sigillo` (with `curl` or `npm i -g`) run outside a package script doesn't have `node_modules/.bin` in `PATH`. Use the full path, prefix the command with `npx` or `pnpm exec`, or run Sigillo from a package script.
+
+## Variables Sigillo won't set
+
+A secret named like a variable that decides which programs run and what they load, such as `PATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `GIT_PAGER` or `npm_config_registry`, is skipped with a warning: anyone who can change the environment's secrets could otherwise run code on your machine. Pass `--allow-env NAME` to use one, once per name:
+
+```bash
+sigillo run --allow-env NODE_OPTIONS -- next build
+```
+
+Names match in any case, as they do on Windows. The list is best effort: no list of such names is complete, so a secret can still change how a program runs through a variable it doesn't know.
+
+## Output redaction
+
+`sigillo run` watches the command's output, and replaces secret values that look random with `*` in stdout and stderr: values with a run of at least 16 letters and digits of 3.5 Shannon bits per character or more, such as a key, a token, or a URL with a random password in it. That keeps them out of terminals, CI logs and AI agents' context windows, even after `printenv`. Shorter or more predictable values, like a port, a hostname or a word, print as they are.
+
+To see the output as it is:
+
+```bash
+sigillo run --disable-redaction -- ./my-script.sh
+```
+
+## Write the secrets to a file
+
+For a program that reads a file instead of its environment, `--mount` writes the secrets to a new file only you can read, and deletes it when the command exits. The file must not exist yet.
+
+```bash
+sigillo run --mount .env -- npm start
+sigillo run --mount config.json --mount-format json -- next dev
+```
+
+The formats are `env` (the default), `env-no-quotes`, `json`, `yaml`, `docker` and `dotnet-json`, as in [downloads](./secrets.mdx#download-all-secrets).
+
+## With AI agents
+
+Inside an AI agent's shell, `sigillo secrets get` and `sigillo secrets download` refuse to print values to a terminal unless you pass `--force`. Prefer `sigillo run`, or a pipe, so values go straight to the tool that needs them and not into the agent's context:
+
+```bash
+sigillo run --command 'psql "$DATABASE_URL" -c "select 1"'
+sigillo secrets download --format env | fly secrets import --app my-app
+```

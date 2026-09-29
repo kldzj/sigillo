@@ -39,7 +39,7 @@
           {
             "group": "Use Sigillo",
             "icon": "lucide:terminal",
-            "pages": ["docs/workload-identity"]
+            "pages": ["docs/secrets", "docs/run", "docs/access", "docs/ci", "docs/workload-identity", "docs/integrations"]
           },
           {
             "group": "Security",
