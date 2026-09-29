@@ -47,7 +47,7 @@ vi.mock('@clack/prompts', () => {
   }
 })
 
-const { restoreDeployment, rotateKey, selfHost } = await import('../src/selfhost/cli.js')
+const { backupDeployment, resetPasskeys, restoreDeployment, rotateKey, selfHost } = await import('../src/selfhost/cli.js')
 
 // A home of its own, for the files the commands read there
 const home = process.env.HOME
@@ -283,5 +283,61 @@ describe('restoring a backup', () => {
       'A restore discards every change made to sigillo since the backup of 2026-09-29T10:00:00.000Z. Without a terminal to confirm that, pass --yes.',
     )
     expect(fake.state).toEqual({ deployments: { 'acc/sigillo': saved } })
+  })
+
+  test('switches both workers to fresh databases, says what it checked, and keeps the backup key', async () => {
+    const { file, saved } = await backupOf()
+    fake.state = { deployments: { 'acc/sigillo': saved } }
+    const cloudflare = account({ 'app-before': new DatabaseSync(':memory:'), 'auth-before': new DatabaseSync(':memory:') })
+    fake.client = cloudflare.client
+    await restoreDeployment({ restore: file, yes: true, bundle: bundleFile() })
+    const restored = fake.state.deployments!['acc/sigillo']!
+    expect({
+      saved: restored,
+      bound: cloudflare.bound,
+      events: cloudflare.databases[restored.databaseId]!.prepare('SELECT count(*) AS n FROM secret_event').get(),
+      logs: fake.logs.filter((line) => /^(info|warn): (Checked|~|The databases)/.test(line)),
+    }).toEqual({
+      saved: { ...saved, databaseId: expect.stringMatching(/^sigillo-db-/), providerDatabaseId: expect.stringMatching(/^sigillo-auth-db-/) },
+      bound: { 'sigillo-auth': restored.providerDatabaseId, sigillo: restored.databaseId },
+      events: { n: 7 },
+      logs: [
+        "info: Checked the signed history: 8 rows match their hashes and the Worker's signatures. Everything else, such as members, tokens and trust rules, is as it was in the backup, unchecked.",
+        'info: ~/.sigillo/audit.json has no `sigillo audit verify` of this instance, so nothing shows whether rows were removed from the end of a chain before the backup.',
+        `info: The databases from before the restore stay (app-before, auth-before): delete them once you're happy with it.`,
+      ],
+    })
+  })
+
+  test('stays unfinished when the workers could not be switched, and the commands that act on the databases wait for self-host', async () => {
+    const { file, saved } = await backupOf()
+    fake.state = { deployments: { 'acc/sigillo': saved } }
+    const cloudflare = account({ 'app-before': new DatabaseSync(':memory:'), 'auth-before': new DatabaseSync(':memory:') })
+    const listAccounts = cloudflare.client.listAccounts.bind(cloudflare.client)
+    let outage = true
+    cloudflare.client.listAccounts = async () => {
+      if (outage) throw new Error('Cloudflare is down')
+      return listAccounts()
+    }
+    fake.client = cloudflare.client
+    const bundle = bundleFile()
+    const failed = await restoreDeployment({ restore: file, yes: true, bundle }).catch((error: Error) => error.message)
+    const pending = fake.state.deployments!['acc/sigillo']!
+    const unfinished = 'The restore to the backup of 2026-09-29T10:00:00.000Z is unfinished, so the workers may still use the databases from before: run self-host to finish it first'
+    const refused = await Promise.all([backupDeployment({}), rotateKey({}), resetPasskeys({ resetPasskeys: 'ada@acme.com' })].map((run) => run.catch((error: Error) => error.message)))
+    expect({ failed, pending, bound: { ...cloudflare.bound }, refused }).toEqual({
+      failed: 'Cloudflare is down\nThe restored databases are saved in ~/.sigillo/selfhost.json, but the workers may still use the ones from before (app-before, auth-before). ' +
+        'Run self-host to finish the restore: --backup, --rotate-key and --reset-passkeys wait for it.',
+      pending: { ...saved, databaseId: expect.stringMatching(/^sigillo-db-/), providerDatabaseId: expect.stringMatching(/^sigillo-auth-db-/), restoring: '2026-09-29T10:00:00.000Z' },
+      bound: {},
+      refused: [unfinished, unfinished, unfinished],
+    })
+
+    outage = false
+    await selfHost({ bundle, yes: true })
+    expect({ saved: fake.state.deployments!['acc/sigillo'], bound: cloudflare.bound }).toEqual({
+      saved: { ...pending, restoring: undefined },
+      bound: { 'sigillo-auth': pending.providerDatabaseId, sigillo: pending.databaseId },
+    })
   })
 })

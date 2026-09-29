@@ -133,10 +133,10 @@ cli
 // Recovery for a sole admin who lost every passkey: whoever controls the
 // Cloudflare account controls the instance anyway, so the passkeys are
 // removed in D1 directly, and the removal is logged like any other
-async function resetPasskeys(options: SelfHostOptions) {
+export async function resetPasskeys(options: SelfHostOptions) {
   const email = options.resetPasskeys!.trim()
   if (!email) throw new Error('Pass the email of the user: --reset-passkeys you@acme.com')
-  const { deployment } = savedDeployment(options)
+  const { deployment } = liveDeployment(options)
   const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
   const database = { accountId: deployment.accountId, databaseId: deployment.databaseId }
   const [found] = await client.d1Query({
@@ -182,6 +182,16 @@ function savedDeployment(options: SelfHostOptions): { key: string; deployment: D
   return { key, deployment }
 }
 
+// The saved deployment, for a command that acts on the databases its workers
+// use: after a restore that didn't finish, those may not be the saved ones
+function liveDeployment(options: SelfHostOptions): { key: string; deployment: DeploymentState } {
+  const saved = savedDeployment(options)
+  if (saved.deployment.restoring) {
+    throw new Error(`The restore to the backup of ${saved.deployment.restoring} is unfinished, so the workers may still use the databases from before: run self-host to finish it first`)
+  }
+  return saved
+}
+
 function saveDeployment(key: string, deployment: DeploymentState) {
   const state = readState()
   writeState({ ...state, deployments: { ...state.deployments, [key]: deployment } })
@@ -192,7 +202,7 @@ function saveDeployment(key: string, deployment: DeploymentState) {
 // (rotate.ts); and once none uses them, the older keys leave the Worker and
 // selfhost.json. Stopped halfway, the next run finishes the same rotation.
 export async function rotateKey(options: SelfHostOptions) {
-  const { key, deployment } = savedDeployment(options)
+  const { key, deployment } = liveDeployment(options)
   const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
   const worker = { accountId: deployment.accountId, scriptName: deployment.workerName }
   const query: Query = async (sql, params) =>
@@ -241,8 +251,8 @@ export async function rotateKey(options: SelfHostOptions) {
 
 // Both databases as Cloudflare exports them, without the tables of live
 // logins, in one file encrypted to the deployment's backup key (backup.ts)
-async function backupDeployment(options: SelfHostOptions) {
-  const { key, deployment } = savedDeployment(options)
+export async function backupDeployment(options: SelfHostOptions) {
+  const { key, deployment } = liveDeployment(options)
   const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
   let identity = deployment.backupIdentity
   if (!identity) {
@@ -334,10 +344,21 @@ export async function restoreDeployment(options: SelfHostOptions) {
   }
   spinner.stop(`Restored ${check.environments} environment${check.environments === 1 ? '' : 's'}`)
   reportHistoryCheck(check, witnesses.length > 0)
-  saveDeployment(key, { ...deployment, databaseId: appDatabaseId, providerDatabaseId })
-  // An update of both workers, bound to the restored databases
-  await selfHost(options)
-  clack.log.info(`The databases from before the restore stay (${deployment.databaseId}${deployment.providerDatabaseId ? `, ${deployment.providerDatabaseId}` : ''}): delete them once you're happy with it.`)
+  // Saved as unfinished, so that until both workers use the restored
+  // databases, nothing takes them for the ones in use
+  saveDeployment(key, { ...deployment, databaseId: appDatabaseId, providerDatabaseId, restoring: backup.createdAt })
+  const before = `${deployment.databaseId}${deployment.providerDatabaseId ? `, ${deployment.providerDatabaseId}` : ''}`
+  try {
+    // An update of both workers, bound to the restored databases
+    await selfHost(options)
+  } catch (error) {
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\n` +
+        `The restored databases are saved in ~/.sigillo/selfhost.json, but the workers may still use the ones from before (${before}). ` +
+        'Run self-host to finish the restore: --backup, --rotate-key and --reset-passkeys wait for it.',
+    )
+  }
+  clack.log.info(`The databases from before the restore stay (${before}): delete them once you're happy with it.`)
 }
 
 // What the check of a restored history covered, and what it can't
@@ -542,6 +563,8 @@ export async function selfHost(options: SelfHostOptions) {
     encryptionKeys: saved?.encryptionKeys,
     // Every backup made so far opens only with it
     backupIdentity: saved?.backupIdentity,
+    // Until the app worker is bound to the restored database
+    restoring: saved?.restoring,
     ...provider,
     // Recorded once both workers have the new list, so a failed run retries
     allowedUsers: saved?.allowedUsers,
@@ -591,6 +614,8 @@ export async function selfHost(options: SelfHostOptions) {
 
   deployment.deployedVersion = bundle.version
   deployment.allowedUsers = allowedUsers
+  // Both workers use the saved databases now
+  deployment.restoring = undefined
   writeState({ ...readState(), deployments: { ...readState().deployments, [stateKey]: deployment } })
 
   spinner.start('Waiting for the deployment to become healthy')

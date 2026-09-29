@@ -80,6 +80,12 @@ export interface DeploymentState {
   encryptionKeys?: { current: string; keys: Record<string, string> }
   /** The age identity backups are encrypted to (backup.ts), made with the first backup */
   backupIdentity?: string
+  /**
+   * Set by a restore, to the time of its backup, while the workers may not
+   * use its databases yet: until a self-host run has bound both to them.
+   * Commands that act on the databases wait for it.
+   */
+  restoring?: string
   /** the deployment's own login provider (unset when it uses another one) */
   providerWorkerName?: string
   providerDatabaseId?: string
