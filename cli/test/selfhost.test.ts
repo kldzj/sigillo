@@ -5,7 +5,7 @@
 
 import { createHash, createHmac, hkdfSync, webcrypto } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -19,7 +19,7 @@ import {
 import { deriveStateKey, isSealed, openState, sealState, unlockStateFile } from '../src/selfhost/state-file.js'
 import { baseKeyOf, countNotUnder, newKeyId, openValue, reencryptAll, sealValue, type KeyRing, type Query } from '../src/selfhost/rotate.js'
 import { verifyHistory } from '../src/selfhost/history.js'
-import { backupFileName, dumpDatabase, keyFingerprint, loadDatabase, newBackupIdentity, openBackup, sealBackup, splitStatements, type Backup } from '../src/selfhost/backup.js'
+import { LEFT_OUT, backupFileName, dumpDatabase, keyFingerprint, loadDatabase, newBackupIdentity, openBackup, sealBackup, splitStatements, type Backup } from '../src/selfhost/backup.js'
 import { DatabaseSync } from 'node:sqlite'
 
 describe('parseWranglerToml', () => {
@@ -889,6 +889,59 @@ describe('backups', () => {
         'import ingest',
         'import poll',
       ],
+    })
+  })
+})
+
+describe('sign-in ID tokens', () => {
+  // A database migrated like the real one, answering queries and exports as D1 does
+  const migrated = (dir: string) => {
+    const db = new DatabaseSync(':memory:')
+    const folder = new URL(dir, import.meta.url)
+    for (const file of readdirSync(folder).filter((name) => name.endsWith('.sql')).sort()) db.exec(readFileSync(new URL(file, `${folder.href}/`), 'utf8'))
+    return db
+  }
+  // D1's export: every value quoted by SQLite
+  const exportOf = (db: DatabaseSync, options: { no_data?: boolean; tables?: string[] }) => options.no_data
+    ? (db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ sql: string }>).map((row) => `${row.sql};`).join('\n')
+    : options.tables!.flatMap((table) => {
+      const columns = (db.prepare(`SELECT name FROM pragma_table_info('${table}')`).all() as Array<{ name: string }>).map((row) => `quote("${row.name}")`)
+      return (db.prepare(`SELECT 'INSERT INTO "${table}" VALUES(' || ${columns.join(" || ',' || ")} || ');' AS statement FROM "${table}"`).all() as Array<{ statement: string }>).map((row) => row.statement)
+    }).join('\n')
+  const cloudflare = (db: DatabaseSync) => ({
+    async d1Query({ sql, params = [] }: { sql: string; params?: string[] }) {
+      return [{ results: db.prepare(sql).all(...params) }]
+    },
+    async d1ExportStep({ dumpOptions }: { dumpOptions: object }) {
+      return { status: 'complete', result: { signed_url: `https://export.example/?${encodeURIComponent(JSON.stringify(dumpOptions))}`, filename: 'x.sql' } }
+    },
+  }) as unknown as CfClient
+
+  test.each([
+    { name: 'app', migrations: '../../db/drizzle-app', leftOut: LEFT_OUT.app },
+    { name: 'provider', migrations: '../../provider/drizzle', leftOut: LEFT_OUT.provider },
+  ])('are left out of the $name database, which restores without them', async ({ migrations, leftOut }) => {
+    const live = migrated(migrations)
+    live.prepare("INSERT INTO user (id, name, email, email_verified, created_at, updated_at) VALUES ('u1', 'Ada', 'ada@acme.com', 1, 1, 1)").run()
+    const account = ['a1', 'u1', 'google-sub', 'google', `enc'd; "access"\ntoken`, null, 1790000000000, null, 'openid email', 'eyJhbGciOiJSUzI1NiJ9.google.id-token', null, 1, 2]
+    live.prepare('INSERT INTO account (id, user_id, account_id, provider_id, access_token, refresh_token, access_token_expires_at, refresh_token_expires_at, scope, id_token, password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...account)
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => new Response(exportOf(live, JSON.parse(decodeURIComponent(new URL(String(input)).search.slice(1))))))
+    const dump = await dumpDatabase({ client: cloudflare(live), accountId: 'acc', databaseId: 'db' }, leftOut)
+    vi.restoreAllMocks()
+
+    const restored = new DatabaseSync(':memory:')
+    restored.exec(`PRAGMA foreign_keys = ON;\n${dump.schema}\n${dump.data}`)
+    const columns = 'id, user_id, account_id, provider_id, access_token, refresh_token, access_token_expires_at, refresh_token_expires_at, scope, id_token, password, created_at, updated_at'
+    expect({
+      inDump: JSON.stringify(dump).includes('google.id-token'),
+      tables: dump.tables.includes('account') && dump.tables.includes('user'),
+      account: Object.values(restored.prepare(`SELECT ${columns} FROM account`).get()!),
+      user: restored.prepare('SELECT email FROM user').get(),
+    }).toEqual({
+      inDump: false,
+      tables: true,
+      account: account.map((value, i) => (i === 9 ? null : value)),
+      user: { email: 'ada@acme.com' },
     })
   })
 })

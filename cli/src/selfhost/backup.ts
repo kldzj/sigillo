@@ -2,7 +2,8 @@
  * Backups of a self-hosted instance (`self-host --backup` and `--restore`).
  *
  * A backup holds both D1 databases as Cloudflare's export API dumps them,
- * without the tables that only matter to live logins, gzipped and encrypted
+ * without the tables that only matter to live logins and without sign-in ID
+ * tokens, gzipped and encrypted
  * with age to the deployment's backup key in selfhost.json. It is a standard
  * age file, so `age -d` opens it too. The instance's keys are never in it:
  * a restore takes them from selfhost.json, imports into fresh databases, and
@@ -22,6 +23,11 @@ export const LEFT_OUT = {
   app: ['session', 'verification', 'rate_limit', 'device_code', 'step_up_request', 'step_up_grant', 'enrollment_approval'],
   provider: ['session', 'verification', 'rate_limit', 'oauth_access_token', 'oauth_refresh_token', 'oauth_client_assertion'],
 }
+
+// Columns a backup leaves empty. better-auth keeps Google's ID token, and in
+// the app the login provider's, unencrypted, and neither worker reads it
+// after the sign-in that stored it.
+export const LEFT_EMPTY: Record<string, string[]> = { account: ['id_token'] }
 
 export type DatabaseDump = {
   /** CREATE statements of every table, left out ones too */
@@ -106,12 +112,33 @@ export async function dumpDatabase(database: Database, leftOut: string[]): Promi
     if (!/^[A-Za-z0-9_]+$/.test(table)) throw new Error(`Unexpected table name: ${table}`)
     references.set(table, (await query(`SELECT "table" AS ref FROM pragma_foreign_key_list('${table}')`)).map((row) => String(row.ref)))
   }
+  const schema = await exportSql(database, { no_data: true })
+  // Tables with columns left empty are read here instead of exported
+  const exported = kept.filter((table) => !LEFT_EMPTY[table])
+  const statements = [
+    exported.length > 0 ? await exportSql(database, { no_schema: true, tables: exported }) : '',
+    ...(await Promise.all(kept.filter((table) => LEFT_EMPTY[table]).map((table) => insertStatements(query, table, LEFT_EMPTY[table]!)))).flat(),
+  ].filter(Boolean)
   return {
-    schema: await exportSql(database, { no_data: true }),
-    data: kept.length > 0 ? orderByReferences(await exportSql(database, { no_schema: true, tables: kept }), references) : '',
+    schema,
+    data: statements.length > 0 ? orderByReferences(statements.join('\n'), references) : '',
     tables: kept,
     migrations,
   }
+}
+
+/** A table's rows as INSERT statements, as D1's export writes them (SQLite quotes each value), with these columns NULL */
+async function insertStatements(query: Query, table: string, empty: string[]): Promise<string[]> {
+  const columns = (await query(`SELECT name FROM pragma_table_info('${table}') ORDER BY cid`)).map((row) => String(row.name))
+  for (const column of columns) if (!/^[A-Za-z0-9_]+$/.test(column)) throw new Error(`Unexpected column name: ${table}.${column}`)
+  const values = columns.map((column) => (empty.includes(column) ? "'NULL'" : `quote("${column}")`)).join(" || ',' || ")
+  const page = (where: string) => query(`SELECT rowid AS r, 'INSERT INTO "${table}" VALUES(' || ${values} || ');' AS statement FROM "${table}" ${where} ORDER BY rowid LIMIT 500`)
+  const statements: string[] = []
+  // A page at a time, to keep each answer small
+  for (let rows = await page(''); rows.length > 0; rows = await page(`WHERE rowid > ${Number(rows.at(-1)!.r)}`)) {
+    statements.push(...rows.map((row) => String(row.statement)))
+  }
+  return statements
 }
 
 /** SQL statements, split at each ';' outside quotes */
