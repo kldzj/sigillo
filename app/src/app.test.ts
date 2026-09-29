@@ -3144,6 +3144,31 @@ describe('remembered environment', () => {
       reads: await opened(`/dash/projects/${projectId}/envs/prod/history/reads`),
     }).toEqual({ changes: remembered('preview'), reads: remembered('prod') })
   })
+
+  test('someone who can\'t open the project is sent away without learning an environment\'s slug', async () => {
+    const outsider = await createTestUser({ name: 'Env Outsider' })
+    const limited = await createTestUser({ name: 'Env Limited' })
+    const af = authedFetch(token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Hidden Env Org' } })).id
+    const hidden = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Hidden', orgId } })).id
+    const visible = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Visible', orgId } })).id
+    const dev = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId: hidden, id: 'dev' } })).id
+    assertOk(await af('/api/v0/projects/:projectId/environments/:id', { method: 'PATCH', params: { projectId: hidden, id: dev }, body: { name: 'Codename Falcon', slug: 'codename-falcon' } }))
+    // A member of the organization limited to the other project
+    const [member] = await getDb().insert(schema.orgMember).values({ orgId, userId: limited.user.id, role: 'member', projectAccess: 'selected' }).returning({ id: schema.orgMember.id })
+    await getDb().insert(schema.memberAccess).values({ orgMemberId: member!.id, projectId: visible })
+    const where = async (who: string, path: string) => new URL((await app.handle(new Request(`http://e.ly/dash/projects/${hidden}${path}`, {
+      headers: { authorization: `Bearer ${who}` }, redirect: 'manual',
+    }))).headers.get('location') ?? '', 'http://e.ly').pathname
+    const places: Record<string, string> = {}
+    for (const [who, whoToken] of [['outsider', outsider.token], ['limited', limited.token]] as const) {
+      for (const path of ['/envs/nope', '/envs/nope/history', '/envs/nope/history/reads']) places[`${who} ${path}`] = await where(whoToken, path)
+    }
+    // The dashboard, or the root when the layout's check answers first
+    expect(Object.values(places).filter((place) => place !== '/dash' && place !== '/')).toEqual([])
+    // The owner is sent on to the environment
+    expect(await where(token, '/envs/nope/history')).toBe(`/dash/projects/${hidden}/envs/codename-falcon/history`)
+  })
 })
 
 describe('passkeys', () => {

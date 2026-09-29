@@ -546,6 +546,9 @@ export const app = new Spiceflow({ tracer })
     const db = getDb()
     const { projectId, envSlug } = params
     const session = await requirePageSession(request)
+    // Loaders run in parallel, so don't rely on the parent loader's checks:
+    // only someone who can open the project learns its environments' slugs
+    const access = await requirePageProjectAccess(session.userId, projectId)
 
     const environments = await db.query.environment.findMany({
       where: { projectId },
@@ -559,9 +562,7 @@ export const app = new Spiceflow({ tracer })
       throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}`)
     }
 
-    // Never decrypt envs the user can't access (admin-only for members).
-    // Loaders run in parallel, so don't rely on the parent loader's checks.
-    const access = await getProjectMemberAccess(session.userId, projectId)
+    // Never decrypt envs the user can't access (admin-only for members)
     const readableEnvIds = environments.filter((e) => !getEnvironmentAccessError(access, e)).map((e) => e.id)
     const locked = !!selectedEnvId && !readableEnvIds.includes(selectedEnvId)
 
@@ -637,6 +638,8 @@ export const app = new Spiceflow({ tracer })
     const db = getDb()
     const { projectId, envSlug } = params
     const session = await requirePageSession(request)
+    // Before the redirect below names an environment
+    const access = await requirePageProjectAccess(session.userId, projectId)
 
     const environments = await db.query.environment.findMany({ where: { projectId }, orderBy: { createdAt: 'asc' } })
 
@@ -647,7 +650,6 @@ export const app = new Spiceflow({ tracer })
       throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/history`)
     }
 
-    const access = await getProjectMemberAccess(session.userId, projectId)
     const locked = !!matchedEnv && !!getEnvironmentAccessError(access, matchedEnv)
 
     // Load events for selected env, sorted by createdAt DESC
@@ -710,6 +712,8 @@ export const app = new Spiceflow({ tracer })
     const db = getDb()
     const { projectId, envSlug } = params
     const session = await requirePageSession(request)
+    // Before the redirect below names an environment
+    const access = await requirePageProjectAccess(session.userId, projectId)
 
     const environments = await db.query.environment.findMany({ where: { projectId }, orderBy: { createdAt: 'asc' } })
     const matchedEnv = environments.find((e) => e.slug === envSlug)
@@ -717,7 +721,6 @@ export const app = new Spiceflow({ tracer })
       throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/history/reads`)
     }
 
-    const access = await getProjectMemberAccess(session.userId, projectId)
     const isAdmin = access?.role === 'admin'
     let reads: { id: string; seq: number; kind: string; names: string[]; ipAddress: string | null; createdAt: number; who: string }[] = []
     if (matchedEnv && isAdmin) {
