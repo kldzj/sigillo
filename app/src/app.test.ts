@@ -4893,6 +4893,49 @@ describe('renewals', () => {
     })
   })
 
+  test('someone outside the organization gets the same answer for a rule or token that exists as for one that doesn\'t', async () => {
+    const stranger = await createTestUser({ name: 'Renewal Stranger' })
+    assertOk(await authedFetch(stranger.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Stranger Org' } }))
+    const strangerLogin = { userId: stranger.user.id, sessionId: await sessionIdOf(stranger.token) }
+    const { id: protectedRule } = await rule({ name: 'Unseen protected', subject: 'unseen-protected', environmentIds: [prod], protectedAccess: true, expiresInDays: 90 })
+    const { id: discovered } = await rule({ name: 'Unseen discovered', subject: 'unseen-discovered' })
+    const { id: pasted } = await rule({ name: 'Unseen pasted', subject: 'unseen-pasted', jwks: JSON.stringify({ keys: [publicOf(workerEnv.TEST_ISSUER_KEYS.rsa)] }) })
+    const { tokenId } = await insertApiToken({ name: 'Unseen CI', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 90 * DAY })
+    const missingRule = '01NOTARULE'
+    const missingToken = '01NOTATOKEN'
+    const renew = (ruleId: string, expiresInDays: number, by: Login) => outcome(renewTrustRule({ ...by, ownHost: 'e.ly', ruleId, expiresInDays }))
+    const answers = async (by: Login) => ({
+      renewProtectedForAYear: await renew(protectedRule, 365, by),
+      renewProtected: await renew(protectedRule, 30, by),
+      renewDiscovered: await renew(discovered, 365, by),
+      renewMissing: await renew(missingRule, 30, by),
+      evidence: await outcome(trustRuleEvidence({ userId: by.userId, ruleId: discovered })),
+      evidenceMissing: await outcome(trustRuleEvidence({ userId: by.userId, ruleId: missingRule })),
+      keysDiscovered: await outcome(replaceTrustRuleKeys({ ...by, ruleId: discovered, jwks: '{}' })),
+      keysPasted: await outcome(replaceTrustRuleKeys({ ...by, ruleId: pasted, jwks: '{}' })),
+      keysMissing: await outcome(replaceTrustRuleKeys({ ...by, ruleId: missingRule, jwks: '{}' })),
+      regenerate: await outcome(regenerateToken({ ...by, tokenId, prefix: 'x', expiresInDays: 30, graceDays: 0 })),
+      regenerateMissing: await outcome(regenerateToken({ ...by, tokenId: missingToken, prefix: 'x', expiresInDays: 30, graceDays: 0 })),
+      stop: await outcome(stopPreviousValue({ ...by, tokenId })),
+      stopMissing: await outcome(stopPreviousValue({ ...by, tokenId: missingToken })),
+      deleteToken: await outcome(deleteToken({ ...by, tokenId })),
+      deleteTokenMissing: await outcome(deleteToken({ ...by, tokenId: missingToken })),
+    })
+    const byStranger = await answers(strangerLogin)
+    const byMember = await answers(memberLogin)
+    const notFound = (rule: string, token: string) => ({
+      renewProtectedForAYear: rule, renewProtected: rule, renewDiscovered: rule, renewMissing: 'Trust rule not found',
+      evidence: rule, evidenceMissing: 'Trust rule not found',
+      keysDiscovered: rule, keysPasted: rule, keysMissing: 'Trust rule not found',
+      regenerate: token, regenerateMissing: 'Token not found', stop: token, stopMissing: 'Token not found', deleteToken: token, deleteTokenMissing: 'Token not found',
+    })
+    expect({ byStranger, byMember }).toEqual({
+      byStranger: notFound('Trust rule not found', 'Token not found'),
+      // A member learns that they exist, and nothing else about them
+      byMember: notFound('Only admins can do this', 'Only its creator or an org admin deletes or regenerates a token'),
+    })
+  })
+
   test('the renewal dialog shows how a rule was used, which workloads used it, and what looks stale', async () => {
     const { id } = await rule({ name: 'Evidence', subject: 'evidence' })
     for (const [actor, ref] of [['alice', 'refs/heads/main'], ['bob', 'refs/heads/main'], ['alice', 'refs/tags/v1']]) {

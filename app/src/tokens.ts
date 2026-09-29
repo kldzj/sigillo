@@ -15,7 +15,7 @@ import * as orm from 'drizzle-orm'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import {
-  generateApiToken, getEnvironmentAccessError, getMemberAccess, getOrgIdForProject, requireValidName, tokenCreatorError,
+  generateApiToken, getEnvironmentAccessError, getMemberAccess, getOrgIdForProject, getProjectMemberAccess, requireValidName, tokenCreatorError,
 } from './db.ts'
 import { requireMachineTokenApproval, requireMachineTokenDeletion, requirePasskeyOnceEnrolled, requireTokenDeletion } from './step-up.ts'
 import { securityEvent } from './security-log.ts'
@@ -100,7 +100,9 @@ export async function createToken({ userId, sessionId, request = null, name, pro
 }
 
 // A token of the Machines tab, with what changing it takes: its creator or
-// an org admin, access to its whole scope, and for a machine token an org admin
+// an org admin, access to its whole scope, and for a machine token an org
+// admin. Someone outside its organization gets the same answer as for a token
+// that doesn't exist.
 async function changeableToken({ userId, sessionId, tokenId }: Login & { tokenId: string }) {
   const token = await getDb().query.apiToken.findFirst({
     // A workload's token of an hour is its trust rule's
@@ -111,7 +113,7 @@ async function changeableToken({ userId, sessionId, tokenId }: Login & { tokenId
     },
     with: { environments: { columns: { environmentId: true } } },
   })
-  if (!token) throw new Error('Token not found')
+  if (!token || !await getProjectMemberAccess(userId, token.projectId)) throw new Error('Token not found')
   await requireTokenDeletion({ userId, sessionId, token })
   await requireTokenScopeAccess({ userId, projectId: token.projectId, environmentIds: token.environments.map((row) => row.environmentId) })
   return token

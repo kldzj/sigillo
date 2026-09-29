@@ -356,9 +356,12 @@ export async function createTrustRule({ userId, sessionId, request = null, ownHo
   return { id }
 }
 
-async function findRule(ruleId: string) {
+// Someone outside the rule's organization gets the same answer as for a
+// rule that doesn't exist. Its callers check for an org admin next, before
+// they look at the rule, so a member learns nothing about it either.
+async function findRule({ userId, ruleId }: { userId: string; ruleId: string }) {
   const rule = await getDb().query.trustRule.findFirst({ where: { id: ruleId }, with: { creator: { columns: { id: true, name: true } } } })
-  if (!rule) throw new InvalidInputError('Trust rule not found')
+  if (!rule || !await getProjectMemberAccess(userId, rule.projectId)) throw new InvalidInputError('Trust rule not found')
   return rule
 }
 
@@ -374,7 +377,7 @@ function ruleEvent({ userId, request, kind, rule, details }: {
 
 // Its tokens stop with it. Their rows stay, for the read log.
 export async function deleteTrustRule({ userId, sessionId, request = null, ruleId }: { userId: string; sessionId: string; request?: Request | null; ruleId: string }) {
-  const rule = await findRule(ruleId)
+  const rule = await findRule({ userId, ruleId })
   await requireAdminWithPasskey({ userId, sessionId, projectId: rule.projectId })
   const db = getDb()
   const now = Date.now()
@@ -388,9 +391,9 @@ export async function deleteTrustRule({ userId, sessionId, request = null, ruleI
 // After a private cluster rotates its signing key, its admin pastes the new
 // key set. Rules with discovered keys refresh on their own.
 export async function replaceTrustRuleKeys({ userId, sessionId, request = null, ruleId, jwks }: { userId: string; sessionId: string; request?: Request | null; ruleId: string; jwks: string }) {
-  const rule = await findRule(ruleId)
-  if (rule.jwksUri) throw new InvalidInputError('This rule gets its keys from its issuer')
+  const rule = await findRule({ userId, ruleId })
   await requireAdminWithPasskey({ userId, sessionId, projectId: rule.projectId })
+  if (rule.jwksUri) throw new InvalidInputError('This rule gets its keys from its issuer')
   const keys = await parseJwks(parseJson(jwks))
   const db = getDb()
   await db.batch([
@@ -418,12 +421,12 @@ export async function renewTrustRule({ userId, sessionId, request = null, ownHos
   ruleId: string
   expiresInDays: number
 }): Promise<{ id: string; expiresAt: number }> {
-  const rule = await findRule(ruleId)
+  const rule = await findRule({ userId, ruleId })
+  await requireAdminWithPasskey({ userId, sessionId, projectId: rule.projectId })
   if (!TOKEN_EXPIRY_DAYS.some((days) => days === expiresInDays)) throw new InvalidInputError(`Expiry must be one of ${TOKEN_EXPIRY_DAYS.join(', ')} days`)
   if (rule.protectedAccess && expiresInDays > MACHINE_TOKEN_MAX_DAYS) {
     throw new InvalidInputError(`A rule for protected environments expires after ${MACHINE_TOKEN_MAX_DAYS} days at most`)
   }
-  await requireAdminWithPasskey({ userId, sessionId, projectId: rule.projectId })
   const keys = rule.jwksUri ? { ...await discoverKeys(rule.issuer, ownHost), jwksFetchedAt: Date.now() } : {}
   const now = Date.now()
   const expiresAt = now + expiresInDays * DAY_MS
@@ -448,7 +451,7 @@ const MONTH_MS = 30 * DAY_MS
 // what expiry is there to catch.
 export async function trustRuleEvidence({ userId, ruleId, now = Date.now() }: { userId: string; ruleId: string; now?: number }) {
   const db = getDb()
-  const rule = await findRule(ruleId)
+  const rule = await findRule({ userId, ruleId })
   const access = await getProjectMemberAccess(userId, rule.projectId)
   if (access?.role !== 'admin') throw new ForbiddenError('Only admins can do this')
   const [recent, [counts], owner] = await Promise.all([
