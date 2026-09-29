@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.16.0
+
+### Minor Changes
+
+- 6836236: `self-host` deploys the release of its own version, and only the exact bundle that version was released with: CI records the bundle's SHA-256 in the npm package, and `self-host` refuses anything else, from GitHub, `--release-url` or `--bundle` alike. It also refuses to deploy a version older than the one the instance runs, unless you pass `--allow-downgrade`. Run `npx @kldzj/sigillo@latest self-host` to update to the newest release, as before.
+- 78c1955: Reading or changing a protected environment now takes a passkey, and so do admin actions in an organization that has one. A stolen browser session or CLI login alone can no longer read production, change it, or invite someone.
+
+  - **Passkeys.** Add them under **user menu → Passkeys**. The first one needs a Google sign-in from the last 5 minutes. Once your organization has an admin with a passkey, an admin also approves it on the **Access** tab, and a member of several organizations with protected environments needs an approval from each. Adding or removing one after that needs an approval with a passkey you already have: in the same browser, or for a new device such as your phone, with a code you type on `/approve` where you have one. Org admins see on the **Access** tab how many passkeys each member has and every passkey added or removed, and can reset a member's passkeys, which signs them out.
+  - **In the browser**, revealing, copying, downloading, saving or deleting a value of a protected environment asks for your passkey on the spot. One approval covers that browser for 15 minutes.
+  - **In the CLI**, reads such as `sigillo run` and `secrets get`, and changes such as `secrets set`, print a link and a code, and wait while you approve on `/approve` with your passkey:
+
+    ```
+    This environment is protected: approve with your passkey.
+      Open https://secrets.acme.com/approve and enter BCDF-GHJK
+    Waiting for your approval...
+    ✔ Approved for 15 minutes
+    ```
+
+  - Deleting or renaming a protected environment, or its project, is up to an org admin with their passkey.
+  - Once you have a passkey, approving a CLI login on `/device` and creating an API token take it too, since both outlive the session that makes them.
+  - `sigillo login` opens the login page without the code, and you type the code it shows; the page no longer takes a code from a link.
+  - **Admin actions** in an organization with a protected environment take a passkey, covering 5 minutes: invites, roles, a member's projects, removing members, auto-join, an environment's min role or protection, resetting passkeys, machine tokens and deleting the organization.
+  - **Machine tokens** read and change protected environments without a passkey, for CI and servers. Only an org admin creates one, with their passkey. It expires after 90 days at most, and it stops working when its creator is no longer an admin. Other API tokens can't use protected environments.
+  - The **Tokens** tab shows the IP each token was last used from, to the hour.
+  - `npx @kldzj/sigillo self-host --reset-passkeys <email>` removes a user's passkeys and signs them out, for a sole admin who lost theirs.
+
+### Patch Changes
+
+- 40f217a: `sigillo audit verify` writes `~/.sigillo/audit.json` to a new file and renames it into place, so a crash or two checks at once can't leave it half written.
+- 1610a22: Login and approval codes read `XXXX-XXXX` everywhere. `sigillo login` prints its code with the dash, and the code fields on `/device` and `/approve` add it while you type or paste, so a code works with or without it.
+- 371fdde: `sigillo run` and `sigillo login`:
+
+  - `sigillo run` matches the names it skips in any case, as Windows does, so a secret named `node_options` or `Path` is skipped too. It also skips `PS4`, pagers and editors such as `GIT_PAGER` and `EDITOR`, `GIT_EXTERNAL_DIFF`, `LESSOPEN`, every `npm_config_*` setting, package sources such as `PIP_INDEX_URL`, `GOPROXY` or `YARN_NPM_REGISTRY_SERVER`, and `NODE_TLS_REJECT_UNAUTHORIZED`. No such list is complete: it catches the names known to change how programs run.
+  - `sigillo login` says which account it logged in as, and how to log out if that isn't you: whoever enters a login code first approves it.
+  - Error messages and names from the server print without terminal control characters, including the project name `sigillo setup` saves.
+- 0267b89: `self-host` tells the login provider your instance's URL, so its error page links back to your login, and asks about a custom domain before uploading. It stops when the bundle digest file in the package is there but damaged.
+- 40f217a: The **Sessions** page no longer fails for logins older than a day. better-auth 1.7.6 only lists sessions for a login from the last day, so the page now asks you to sign in again and brings you back to it. **End all other sessions** works right away, without signing in again. Run `npx @kldzj/sigillo self-host` to update your instance.
+- 20f6b6a: Security fixes and tighter defaults:
+
+  - No page of an instance or its login provider can be embedded in another site, so nobody can frame `/device` or `/approve` and have you click through them unseen. Responses are never cached, so values and names don't stay in the browser's cache.
+  - The API refuses a change sent with your browser's session from a page on another origin. The CLI and scripts are unaffected.
+  - better-auth endpoints the app never uses are off, so nobody can rename themselves to appear under someone else's name in the logs, and a member's picture no longer tells its host who looked at the **Access** tab.
+  - An API token acts with its creator's current access: it stops working when they're taken off the sign-in list, or can no longer open its project.
+  - Someone removed from an organization that auto-joins their email domain stays removed: auto-join used to add them back on their next page load. An invitation still brings them back.
+  - A demoted admin's invite links stop working, as a removed member's already did.
+  - A secret whose value starts with a byte order mark keeps it, and no longer breaks the environment's history for good. Values and names that aren't valid text are refused.
+  - Pages name who made a change as its history row does, and the event log marks a change that isn't part of the signed history.
+  - Changes from before the signed history joined it as "adopted" rows, and `sigillo audit verify` counts them. Someone with the database could clear a chain's row numbers and have the next write sign it again, with a row of their own inside; the head `audit verify` saved now no longer matches then. The Hardening page says what the history can't prove: rows no check has seen yet.
+  - The event log and read log links of a project no longer name its environments to someone who can't open it.
+  - `sigillo run` skips a secret named like a variable that controls how programs run, such as `PATH`, `NODE_OPTIONS`, `LD_PRELOAD` or `BASH_ENV`, and says so: anyone who can change the environment's secrets could otherwise run code on your machine. Pass `--allow-env NAME` to use one.
+  - `sigillo run` masks a secret that contains another one, such as a database URL with its password, even when the program's output arrives in pieces between them.
+  - `sigillo login` no longer replaces the server saved for a scope with one that came from `SIGILLO_API_URL` (which a repository's `.envrc` can set): that takes `--api-url`. Saving makes `~/.sigillo/config.json` readable only by you, also when an older copy wasn't.
+  - `sigillo login` opens only a plain web address from the server, and on Windows no longer through `cmd.exe`. Names and codes from the server print without terminal control characters.
+  - `sigillo audit verify` remembers what it saw by the project and environment you asked for, not by the id the server answers with.
+- be49508: Deleting something that can't come back now takes its name, typed out:
+
+  - **An organization's settings** moved out of the project tabs into the sidebar, under **Organization settings**: auto-join, leaving it and deleting it. The project's **Settings** tab now renames or deletes that project.
+  - **Deleting an organization** lists its projects and how many environments and secrets go with them, and asks for the organization's name. **Deleting a project** asks for its name the same way.
+  - **Deleting an environment** with secrets asks for its slug and says how many secrets go with it. An empty one only asks.
+  - `sigillo projects delete` and `sigillo environments delete` ask you to type the project's name or the environment's slug. Without a terminal they take `--yes`.
+
+- 0166456: Git worktrees pick up the right project and env, also in subfolders. A worktree uses the main checkout's setup at the same relative path: before, `sigillo run` in `<worktree>/app` used the repo root's setup and ignored the one for `<main>/app`. A setup saved inside a worktree now always wins over the main checkout's. Inside a worktree, `sigillo setup` asks whether to save for the main checkout and all its worktrees or for this worktree only, `--scope <dir>` picks the directory to save for, and `sigillo me` names the main checkout.
+
 ## 0.15.0
 
 ### Minor Changes

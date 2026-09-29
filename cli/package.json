@@ -1,6 +1,6 @@
 {
   "name": "@kldzj/sigillo",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "type": "module",
   "description": "CLI for Sigillo — self-hostable secret manager. Manage secrets, environments, and configs from the terminal.",
   "bin": {
