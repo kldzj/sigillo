@@ -1,0 +1,64 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Configuration and environment variables'
+sidebarTitle: 'Configuration and environment variables'
+description: 'The flags and environment variables the sigillo CLI and self-host read, and the files they keep in ~/.sigillo.'
+icon: lucide:sliders-horizontal
+---
+
+## Global flags
+
+Most commands that resolve the login, project or environment accept these, and each has an environment variable. A flag wins over its variable, and both over what `sigillo login` and `sigillo setup` saved.
+
+| Flag | Environment variable | What it sets |
+|---|---|---|
+| `--token <sig_xxx>` | `SIGILLO_TOKEN` | An API or machine token to use instead of a login |
+| `--api-url <url>` | `SIGILLO_API_URL` | Your instance. There is no default; `sigillo login --api-url` saves it |
+| `--project <id>` / `-p <id>` | `SIGILLO_PROJECT` | The project, by ID or name |
+| `--env <slug>` / `--config <slug>` / `-c <slug>` | `SIGILLO_ENVIRONMENT` | The environment's slug, such as `dev` or `prod` |
+
+The [CLI reference](/docs/cli) lists every command's own flags.
+
+## Workload identity
+
+Without a token or a login, the CLI exchanges a workload's JWT for a token of one hour, from the first of these that is set. Empty variables count as unset.
+
+| Environment variable | What it holds |
+|---|---|
+| `SIGILLO_OIDC_TOKEN_FILE` | A file with the JWT, such as a Kubernetes projected service account token |
+| `SIGILLO_OIDC_TOKEN` | The JWT itself |
+| `ACTIONS_ID_TOKEN_REQUEST_URL`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | Set by GitHub Actions in a job with `id-token: write`: the CLI asks GitHub for a JWT for your instance |
+
+With workload identity, `SIGILLO_PROJECT` must be the project's ID. See [workload identity](./workload-identity.mdx).
+
+## self-host
+
+| Environment variable | What it sets |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | The Cloudflare API token to deploy with, like `--api-token` |
+| `SIGILLO_SELFHOST_PASSPHRASE` | The passphrase of `~/.sigillo/selfhost.json`, for runs without a terminal |
+| `SIGILLO_ENCRYPTION_KEY` | Your own encryption key, on the first deploy only |
+
+`self-host`'s flags are on [Self-host your instance](./self-hosting.mdx#all-options).
+
+## Files
+
+The CLI keeps its files in `~/.sigillo`, or `%APPDATA%\sigillo` on Windows:
+
+| File | What's in it |
+|---|---|
+| `config.json` | Your logins, one per server, and the project and environment `sigillo setup` saved for each directory |
+| `audit.json` | The newest row of each history chain `sigillo audit verify` has seen, and the instance's signing key |
+| `selfhost.json` | Written by `self-host`, in `~/.sigillo` on every system: the keys and settings of your deployments, encrypted with your passphrase. See [your deploy file](./updating.mdx#your-deploy-file) |
+| `bin/sigillo` | The CLI itself, when installed with the curl script |
+
+## Scoped logins
+
+A login is saved for a directory and everything below it, `/` unless you say otherwise. To use another login, or a token, in one directory:
+
+```bash
+sigillo login --api-url https://secrets.acme.com --scope .
+sigillo login --api-url https://secrets.acme.com --token sig_xxx --scope .
+```
+
+`sigillo login` always starts a new login, also when one is saved, so run it again when the CLI says `not signed in, or the session expired`. A saved login is only sent to the server it was saved for.

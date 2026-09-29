@@ -61,6 +61,11 @@
             "group": "Run your instance",
             "icon": "lucide:server-cog",
             "pages": ["docs/updating", "docs/backups", "docs/rotate-key", "docs/from-source"]
+          },
+          {
+            "group": "Reference",
+            "icon": "lucide:book-marked",
+            "pages": ["docs/configuration", "docs/api"]
           }
         ]
       },

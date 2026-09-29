@@ -1,0 +1,49 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'REST API'
+sidebarTitle: 'REST API'
+description: 'Authenticate to the Sigillo REST API with a token, read and change secrets with curl, and the Doppler-compatible routes for External Secrets Operator.'
+icon: lucide:plug
+---
+
+Everything the CLI does goes through the REST API under `/api/v0`, and the **API Reference** tab above documents every route. Its OpenAPI description is at `/api/v0/openapi.json` on your instance.
+
+## Authentication
+
+Send an [API or machine token](./ci.mdx) as a bearer token:
+
+```bash
+curl -H "Authorization: Bearer sig_xxx" https://<your-instance>/api/v0/me
+```
+
+A token reaches only its project, and only the environments it's scoped to. Reading or changing a protected environment takes a machine token. A workload gets a token for its JWT from `POST /api/v0/workload/token`: see [workload identity](./workload-identity.mdx).
+
+## Examples
+
+```bash
+# list secrets
+curl -H "Authorization: Bearer sig_xxx" \
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets
+
+# set a secret
+curl -X POST -H "Authorization: Bearer sig_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "API_KEY", "value": "sk-live-xxx"}' \
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets
+
+# bulk download as JSON
+curl -H "Authorization: Bearer sig_xxx" \
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets/download?format=json
+
+# bulk set
+curl -X PUT -H "Authorization: Bearer sig_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"secrets": {"KEY1": "val1", "KEY2": "val2"}}' \
+  https://<your-instance>/api/v0/projects/{projectId}/environments/{environmentId}/secrets
+```
+
+`{environmentId}` also takes the environment's slug. The download takes the same formats as [`sigillo secrets download`](./secrets.mdx#download-all-secrets), but defaults to JSON.
+
+## Doppler-compatible routes
+
+For [External Secrets Operator](./workload-identity.mdx#external-secrets-operator)'s Doppler provider, the instance also answers three of Doppler's routes, at its root rather than under `/api/v0`: `POST /v3/auth/oidc`, `GET /v3/projects` and `GET /v3/configs/config/secrets/download`. They take the token as Basic auth user name, as that provider sends it, and answer in Doppler's shape. They exist for ESO; use `/api/v0` for anything else.
