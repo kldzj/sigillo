@@ -275,33 +275,74 @@ export async function countOldValues(environmentId: string): Promise<number> {
   return (await findOldValues(environmentId)).length
 }
 
+// The old values as they are now, each with the digest its row keeps once
+// the value goes
+export async function readOldValues(environmentId: string) {
+  const old = await findOldValues(environmentId)
+  const digests = await Promise.all(old.map((row) => storedValueDigest(row)))
+  // Their digest couldn't be kept, and their rows would never verify again
+  const unreadable = [...new Set(old.filter((_, i) => digests[i] === 'undecryptable').map((row) => row.name))]
+  if (unreadable.length) throw new Error(`Old values of ${unreadable.join(', ')} can't be decrypted, so nothing was purged`)
+  return old.map((row, i) => ({ id: row.id, name: row.name, iv: row.iv!, digest: digests[i]! }))
+}
+
+export type OldValue = Awaited<ReturnType<typeof readOldValues>>[number]
+
+// A value changed between reading and removing it: a key rotation
+// re-encrypted it, or another purge removed it
+class OldValuesChangedError extends Error {}
+
 // Removes an environment's old values: every value but each secret's
 // current one. Their rows stay, with who and when, and keep the digest their
 // history row was signed with, so the chain still verifies. A purge row per
 // name records who removed them. The caller checks that it's an org admin's,
 // with their passkey (requireOldValuesPurge).
 export async function purgeOldValues({ environmentId, author, request = null }: { environmentId: string; author: Reader; request?: Request | null }): Promise<{ purged: number }> {
+  for (let attempt = 1; ; attempt++) {
+    const old = await readOldValues(environmentId)
+    if (old.length === 0) return { purged: 0 }
+    try {
+      await removeOldValues({ environmentId, old, author, request })
+      return { purged: old.length }
+    } catch (error) {
+      // Read them again
+      if (attempt >= 3 || !(error instanceof OldValuesChangedError)) throw error
+    }
+  }
+}
+
+// Removes the values as read, all of them or none. A value changed since
+// would stay, and its purge row and the security log would report a removal
+// that didn't happen.
+export async function removeOldValues({ environmentId, old, author, request = null }: { environmentId: string; old: OldValue[]; author: Reader; request?: Request | null }) {
   const db = getDb()
-  const old = await findOldValues(environmentId)
-  if (old.length === 0) return { purged: 0 }
   const environment = await db.query.environment.findFirst({ where: { id: environmentId }, columns: { id: true, name: true, projectId: true } })
   if (!environment) throw new Error('Environment not found')
-  const digests = await Promise.all(old.map((row) => storedValueDigest(row)))
-  // Their digest couldn't be kept, and their rows would never verify again
-  const unreadable = [...new Set(old.filter((_, i) => digests[i] === 'undecryptable').map((row) => row.name))]
-  if (unreadable.length) throw new Error(`Old values of ${unreadable.join(', ')} can't be decrypted, so nothing was purged`)
   const prepared = [...new Set(old.map((row) => row.name))].map((name) => ({ ...newRow({ environmentId, name, operation: 'purge', author }), encrypted: null, digest: null }))
-  // Each value goes only if it is still the one read above
-  await appendPrepared(prepared, [
-    ...old.map((row, i) => db.update(schema.secretEvent)
-      .set({ valueEncrypted: null, iv: null, valueDigest: digests[i] })
-      .where(orm.and(orm.eq(schema.secretEvent.id, row.id), orm.eq(schema.secretEvent.valueEncrypted, row.valueEncrypted!)))),
-    securityEvent({
-      request, author, kind: 'values.purged', where: { projectId: environment.projectId },
-      subject: { id: environment.id, name: environment.name }, details: { values: old.length, names: prepared.length },
-    }),
-  ])
-  return { purged: old.length }
+  // Named only while every value still has the IV read, which re-encrypting
+  // it changes and purging it clears. Otherwise the name is null and the
+  // whole batch fails, before the updates below could match nothing.
+  const asRead = JSON.stringify(old.map((row) => [row.id, row.iv]))
+  const name = orm.sql`(select ${schema.environment.name} from ${schema.environment} where ${schema.environment.id} = ${environmentId} and (
+    select count(*) from ${schema.secretEvent}, json_each(${asRead}) as seen
+    where ${schema.secretEvent.id} = json_extract(seen.value, '$[0]') and ${schema.secretEvent.iv} = json_extract(seen.value, '$[1]')
+  ) = ${old.length})`
+  try {
+    await appendPrepared(prepared, [
+      securityEvent({
+        request, author, kind: 'values.purged', where: { projectId: environment.projectId },
+        subject: { id: environment.id, name }, details: { values: old.length, names: prepared.length },
+      }),
+      ...old.map((row) => db.update(schema.secretEvent)
+        .set({ valueEncrypted: null, iv: null, valueDigest: row.digest })
+        .where(orm.and(orm.eq(schema.secretEvent.id, row.id), orm.eq(schema.secretEvent.iv, row.iv)))),
+    ])
+  } catch (error) {
+    const now = await db.select({ id: schema.secretEvent.id, iv: schema.secretEvent.iv }).from(schema.secretEvent).where(orm.eq(schema.secretEvent.environmentId, environmentId))
+    const ivs = new Map(now.map((row) => [row.id, row.iv]))
+    if (old.some((row) => ivs.get(row.id) !== row.iv)) throw new OldValuesChangedError('Old values changed while purging them, so nothing was purged: try again')
+    throw error
+  }
 }
 
 export type SecretReadKind = (typeof schema.SECRET_READ_KINDS)[number]

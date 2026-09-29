@@ -21,7 +21,7 @@ import worker, { app } from './app.js'
 import { getAuth, encrypt, decrypt, hashTokenKey, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions, internalErrorMessage } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
-import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue, purgeOldValues, goneValues } from './audit.js'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue, purgeOldValues, readOldValues, removeOldValues, goneValues } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
 import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
@@ -2879,6 +2879,37 @@ describe('tamper-evident history', () => {
       after: { ok: false, problem: 'row 2 lost its value without a purge' },
       afterGone: [true, true, false],
       shown: { [first.id]: 'purged', [current.id]: 'removed' },
+    })
+  })
+
+  test('a purge removes nothing when a value was re-encrypted after it read them, and all of them once it reads again', async () => {
+    const envId = await newEnv()
+    for (const [name, value] of [['X', 'one'], ['X', 'two'], ['Y', 'old'], ['Y', 'new']] as const) await setSecret(admin.token, envId, name, value)
+    const author = { userId: admin.user.id, apiTokenId: null, sessionId: null }
+    const rows = async () => (await getDb().query.secretEvent.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } }))
+      .map((row) => [row.seq, row.name, row.operation, !!row.valueEncrypted])
+    const logged = async () => (await getDb().query.securityEvent.findMany({ where: { subjectId: envId, kind: 'values.purged' } })).map((event) => event.details)
+    const old = await readOldValues(envId)
+    // A key rotation re-encrypts X's old value in between
+    const first = await eventRow(envId, 1)
+    const rotated = await encrypt('one', { environmentId: envId, name: 'X' })
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: rotated.encrypted, iv: rotated.iv }).where(orm.eq(schema.secretEvent.id, first.id))
+    const refused = await removeOldValues({ environmentId: envId, old, author }).then(() => 'ok', (error: Error) => error.message)
+    const afterRefusal = { rows: await rows(), logged: await logged() }
+    const purged = await purgeOldValues({ environmentId: envId, author })
+    expect({ refused, afterRefusal, purged, rows: await rows(), logged: await logged(), verified: (await verify(envId)).events.ok }).toEqual({
+      refused: 'Old values changed while purging them, so nothing was purged: try again',
+      afterRefusal: {
+        rows: [[1, 'X', 'set', true], [2, 'X', 'set', true], [3, 'Y', 'set', true], [4, 'Y', 'set', true]],
+        logged: [],
+      },
+      purged: { purged: 2 },
+      rows: [
+        [1, 'X', 'set', false], [2, 'X', 'set', true], [3, 'Y', 'set', false], [4, 'Y', 'set', true],
+        [5, 'X', 'purge', false], [6, 'Y', 'purge', false],
+      ],
+      logged: [{ values: 2, names: 2 }],
+      verified: true,
     })
   })
 
