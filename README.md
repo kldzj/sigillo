@@ -425,6 +425,7 @@ Most commands that resolve auth, project, or environment from config accept thes
 | Flag | Env var | Description |
 |---|---|---|
 | `--token <sig_xxx>` | `SIGILLO_TOKEN` | Bearer token for auth |
+| | `SIGILLO_OIDC_TOKEN_FILE`, `SIGILLO_OIDC_TOKEN` | Without a token: a workload's JWT to exchange for one ([workload identity](https://sigillo.kldzj.dev/docs/workload-identity)) |
 | `--api-url <url>` | `SIGILLO_API_URL` | Your Sigillo instance (no default; saved by `sigillo login --api-url`) |
 | `--env <slug>` / `--config <slug>` / `-c <slug>` | `SIGILLO_ENVIRONMENT` | Environment slug (e.g. `dev`, `prod`) |
 | `--project <id>` / `-p <id>` | `SIGILLO_PROJECT` | Project ID or name override |
@@ -543,7 +544,20 @@ sigillo run -- docker compose up
 
 ### CI / GitHub Actions
 
-Use an API token for non-interactive environments. Create it on the project's **Tokens** tab; it expires after the 7 to 365 days you choose, and an expired one gets `401 API token expired`. To read or change a protected environment, an org admin checks **Machine token** when creating it: that takes their passkey, and the token expires after 90 days at most.
+With [workload identity](https://sigillo.kldzj.dev/docs/workload-identity), a job stores no token: an org admin adds a trust rule for the repository and its GitHub environment on the project's **Tokens** tab, and the job gets `id-token: write`. With no `SIGILLO_TOKEN` set, the CLI asks GitHub for a JWT and exchanges it for a token of one hour. Kubernetes pods do the same with a projected service account token in `SIGILLO_OIDC_TOKEN_FILE`, and External Secrets Operator through its Doppler provider.
+
+```yaml
+permissions:
+  id-token: write
+steps:
+  - run: npx @kldzj/sigillo run -- ./deploy.sh
+    env:
+      SIGILLO_API_URL: ${{ vars.SIGILLO_API_URL }}
+      SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}   # the project's ID
+      SIGILLO_ENVIRONMENT: prod
+```
+
+Otherwise, use an API token for non-interactive environments. Create it on the project's **Tokens** tab; it expires after the 7 to 365 days you choose, and an expired one gets `401 API token expired`. To read or change a protected environment, an org admin checks **Machine token** when creating it: that takes their passkey, and the token expires after 90 days at most.
 
 ```yaml
 - name: Run with secrets

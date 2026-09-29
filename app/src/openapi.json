@@ -481,6 +481,24 @@
               }
             }
           },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
           "403": {
             "description": "",
             "content": {
@@ -789,6 +807,24 @@
                     "name",
                     "slug",
                     "projectId"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ]
                 }
               }
@@ -1903,11 +1939,15 @@
                         },
                         "outside": {
                           "type": "number"
+                        },
+                        "adopted": {
+                          "type": "number"
                         }
                       },
                       "required": [
                         "rows",
-                        "outside"
+                        "outside",
+                        "adopted"
                       ]
                     },
                     "reads": {
@@ -1968,6 +2008,82 @@
           "Audit"
         ],
         "summary": "Get the audit chains"
+      }
+    },
+    "/api/v0/workload/token": {
+      "post": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string"
+                    },
+                    "expiresAt": {
+                      "type": "number"
+                    },
+                    "projectId": {
+                      "type": "string"
+                    },
+                    "environmentIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "token",
+                    "expiresAt",
+                    "projectId",
+                    "environmentIds"
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Exchange a workload JWT for an API token",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "rule": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "token"
+                ]
+              }
+            }
+          }
+        }
       }
     },
     "/api/v0/me": {

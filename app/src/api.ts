@@ -41,6 +41,7 @@ import {
 import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
 import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected, requireProjectChange } from './step-up.ts'
 import { memoize } from './lib/memoize.ts'
+import { exchangeWorkloadToken } from './workload.ts'
 import { SECRET_NAME_REGEX, getEnvSlugError, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
 
 // Latest GitHub release carrying a self-host bundle asset. Memoized via the
@@ -267,6 +268,43 @@ const downloadedSecretsFormats = [
 const downloadedSecretsFormatSchema = z.enum(downloadedSecretsFormats)
 const downloadedSecretsSchema = z.record(z.string(), z.string())
 const errorResponseSchema = z.object({ error: z.string() })
+
+// A workload's JWT for an API token of one hour (workload.ts)
+function exchangeForRequest(request: Request, { jwt, project, ruleId }: { jwt: unknown; project?: string; ruleId?: string }) {
+  return exchangeWorkloadToken({ jwt, project, ruleId, ownHost: new URL(request.url).hostname, ipAddress: request.headers.get('cf-connecting-ip') })
+}
+
+// External Secrets Operator's Doppler provider sends the token as the Basic
+// auth user name; the rest of the API reads it from Bearer
+function withBearer(request: Request): Request {
+  const header = request.headers.get('authorization')
+  if (!header?.startsWith('Basic ')) return request
+  let user = ''
+  try {
+    user = atob(header.slice(6)).split(':')[0] ?? ''
+  } catch {}
+  const headers = new Headers(request.headers)
+  headers.set('authorization', `Bearer ${user}`)
+  return new Request(request, { headers })
+}
+
+// Doppler's answer shape: success, and on errors the messages ESO shows
+async function dopplerAnswer(handler: () => Promise<Response | Record<string, unknown>>): Promise<Response> {
+  const failed = (status: number, message: string) => json({ success: false, messages: [message] }, { status })
+  try {
+    const result = await handler()
+    return result instanceof Response ? result : json({ success: true, ...result })
+  } catch (error) {
+    if (error instanceof Response) {
+      const body = await error.clone().json().catch(() => null) as { error?: unknown } | null
+      return failed(error.status, typeof body?.error === 'string' ? body.error : error.statusText)
+    }
+    if (error instanceof StepUpRequiredError) return failed(403, error.message)
+    const status = (error as { status?: unknown })?.status
+    if (typeof status === 'number' && status >= 400 && status < 500) return failed(status, (error as Error).message)
+    throw error
+  }
+}
 
 // Session access to an environment (org member, project, admin-only role).
 async function requireApiEnvironmentAccess({ userId, environmentRef, projectId }: { userId: string; environmentRef: string; projectId: string }) {
@@ -956,6 +994,95 @@ export const apiApp = new Spiceflow()
       const member = await requireApiOrgMember(auth.userId, orgId!)
       if (member.role !== 'admin') throw json({ error: 'only org admins can read the audit chains' }, { status: 403 })
       return { environmentId: auth.environmentId, ...await getAuditChains(auth.environmentId) }
+    },
+  })
+
+  // ── Workload identity ────────────────────────────────────────────
+  // A job or pod exchanges the JWT its platform issues for an API token of
+  // one hour, when a trust rule of the project accepts it (workload.ts)
+  .route({
+    method: 'POST',
+    path: '/api/v0/workload/token',
+    detail: { tags: ['Auth'], summary: 'Exchange a workload JWT for an API token' },
+    request: z.object({ token: z.string(), project: z.string().optional(), rule: z.string().optional() }),
+    response: z.object({ token: z.string(), expiresAt: z.number(), projectId: z.string(), environmentIds: z.array(z.string()) }),
+    async handler({ request }) {
+      const body = await request.json()
+      const exchanged = await exchangeForRequest(request, { jwt: body.token, project: body.project, ruleId: body.rule })
+      return { token: exchanged.key, expiresAt: exchanged.expiresAt, projectId: exchanged.projectId, environmentIds: exchanged.environmentIds }
+    },
+  })
+
+  // ── Doppler-compatible routes ────────────────────────────────────
+  // What External Secrets Operator's Doppler provider calls, so it copies an
+  // environment into a Kubernetes Secret once its controller's
+  // DOPPLER_BASE_URL is this instance. It logs in with workload identity
+  // (its identity is a trust rule's id) or with a sig_ token.
+  .route({
+    method: 'POST',
+    path: '/v3/auth/oidc',
+    detail: { hide: true },
+    request: z.object({ identity: z.string(), token: z.string() }),
+    async handler({ request }) {
+      return dopplerAnswer(async () => {
+        const body = await request.json()
+        const exchanged = await exchangeForRequest(request, { jwt: body.token, ruleId: body.identity })
+        return { token: exchanged.key, expires_at: new Date(exchanged.expiresAt).toISOString().replace(/\.\d+Z$/, 'Z') }
+      })
+    },
+  })
+
+  // ESO checks a store with it: the token's project
+  .route({
+    method: 'GET',
+    path: '/v3/projects',
+    detail: { hide: true },
+    async handler({ request }) {
+      return dopplerAnswer(async () => {
+        const token = await getRequestApiToken(withBearer(request))
+        if (!token) throw json({ error: 'Pass a Sigillo API token' }, { status: 401 })
+        const project = await getDb().query.project.findFirst({ where: { id: token.projectId }, columns: { id: true, name: true, createdAt: true } })
+        return { projects: project ? [{ id: project.id, slug: project.id, name: project.name, created_at: new Date(project.createdAt).toISOString() }] : [] }
+      })
+    },
+  })
+
+  // Doppler's config is Sigillo's environment. Without one, a token scoped
+  // to a single environment reads that one.
+  .route({
+    method: 'GET',
+    path: '/v3/configs/config/secrets/download',
+    detail: { hide: true },
+    query: z.object({
+      project: z.string().optional(),
+      config: z.string().optional(),
+      format: downloadedSecretsFormatSchema.optional(),
+      name_transformer: z.string().optional(),
+      secrets: z.string().optional(),
+    }),
+    async handler({ request, query }) {
+      return dopplerAnswer(async () => {
+        const authed = withBearer(request)
+        const token = await getRequestApiToken(authed)
+        if (!token) throw json({ error: 'Pass a Sigillo API token' }, { status: 401 })
+        if (query.name_transformer) throw json({ error: 'Sigillo keeps secret names as they are: remove nameTransformer' }, { status: 400 })
+        if (query.project && query.project !== token.projectId) {
+          const project = await getDb().query.project.findFirst({ where: { id: token.projectId }, columns: { name: true } })
+          if (query.project !== project?.name) throw json({ error: 'This token belongs to another project' }, { status: 403 })
+        }
+        const config = query.config || (token.environmentIds?.length === 1 ? token.environmentIds[0] : undefined)
+        if (!config) throw json({ error: "Name the environment as config: its slug" }, { status: 400 })
+        const auth = await requireSecretsApiAuth({ request: authed, environmentRef: config, projectId: token.projectId })
+        const wanted = query.secrets ? new Set(query.secrets.split(',').map((name) => name.trim())) : null
+        const derived = (await deriveSecrets(auth.environmentId)).filter((secret) => !wanted || wanted.has(secret.name))
+        await recordSecretRead({ request: authed, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'download', names: derived.map((d) => d.name) })
+        const entries: Record<string, string> = {}
+        for (const d of derived) entries[d.name] = await decrypt(d.valueEncrypted, d.iv, d)
+        const rendered = renderDownloadedSecrets(entries, query.format || 'json')
+        if (rendered instanceof Error) throw json({ error: rendered.message }, { status: 400 })
+        // A flat map of names to values, as ESO reads it
+        return rendered instanceof Response ? rendered : json(rendered)
+      })
     },
   })
 

@@ -364,9 +364,54 @@ export const apiToken = sqliteCore.sqliteTable('api_token', {
   // a pod or a CI job can't approve anything. Made by an org admin with a
   // passkey approval, and it must expire.
   protectedAccess: sqliteCore.integer('protected_access', { mode: 'boolean' }).notNull().default(false),
+  // Set on a token a workload got for its JWT (app/src/workload.ts): the
+  // trust rule that accepted it, and the verified JWT, which says which job
+  // or pod it was. Kept after the rule is deleted, for the read log.
+  trustRuleId: sqliteCore.text('trust_rule_id').references(() => trustRule.id, { onDelete: 'set null' }),
+  workload: sqliteCore.text('workload', { mode: 'json' }).$type<{ kid: string | null; claims: Record<string, unknown> }>(),
 }, (table) => [
   sqliteCore.index('api_token_project_id_idx').on(table.projectId),
   sqliteCore.index('api_token_hashed_key_idx').on(table.hashedKey),
+  sqliteCore.index('api_token_trust_rule_id_idx').on(table.trustRuleId),
+])
+
+// ── Workload identities ─────────────────────────────────────────────
+// A trust rule lets a workload, such as a GitHub Actions job or a
+// Kubernetes pod, exchange the JWT its platform issues for an API token of
+// one hour (app/src/workload.ts). The JWT must come from the rule's issuer,
+// be signed with one of its keys, and carry the rule's audience, subject
+// and claims exactly. Org admins make rules with a passkey approval, like
+// machine tokens, and every rule expires.
+
+export const trustRule = sqliteCore.sqliteTable('trust_rule', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  projectId: sqliteCore.text('project_id').notNull().references(() => project.id, { onDelete: 'cascade' }),
+  name: sqliteCore.text('name').notNull(),
+  // The JWT's iss, exactly
+  issuer: sqliteCore.text('issuer').notNull(),
+  // Where the keys came from through OIDC discovery; null when an admin
+  // pasted them (a private cluster Cloudflare can't reach)
+  jwksUri: sqliteCore.text('jwks_uri'),
+  // The keys JWTs are verified with
+  jwks: sqliteCore.text('jwks', { mode: 'json' }).$type<{ keys: Array<Record<string, unknown>> }>().notNull(),
+  jwksFetchedAt: epochMs('jwks_fetched_at'),
+  audience: sqliteCore.text('audience').notNull(),
+  subject: sqliteCore.text('subject').notNull(),
+  // Further claims the JWT must carry, each exactly: a top-level claim by
+  // name, a nested one by JSON pointer (/kubernetes.io/namespace)
+  claims: sqliteCore.text('claims', { mode: 'json' }).$type<Record<string, string>>().notNull(),
+  // The environments its tokens may use; empty for all of the project's
+  environmentIds: sqliteCore.text('environment_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  // Its tokens read and change protected environments, like a machine token's
+  protectedAccess: sqliteCore.integer('protected_access', { mode: 'boolean' }).notNull().default(false),
+  // An org admin, for as long as they are one: tokens act for them
+  createdBy: sqliteCore.text('created_by').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+  expiresAt: epochMs('expires_at').notNull(),
+  lastUsedAt: epochMs('last_used_at'),
+}, (table) => [
+  sqliteCore.index('trust_rule_issuer_idx').on(table.issuer),
+  sqliteCore.index('trust_rule_project_id_idx').on(table.projectId),
 ])
 
 // Env allowlist for a token. Zero rows = all envs in the project.
@@ -442,7 +487,7 @@ export const deviceCode = sqliteCore.sqliteTable('device_code', {
 // ── Relations (v2 API) ──────────────────────────────────────────────
 
 export const relations = defineRelations(
-  { user, session, account, verification, passkey, passkeyEvent, stepUpRequest, stepUpGrant, org, orgMember, orgInvitation, project, environment, secretEvent, secretRead, apiToken, apiTokenEnvironment, deviceCode, oauthDomain, memberAccess },
+  { user, session, account, verification, passkey, passkeyEvent, stepUpRequest, stepUpGrant, org, orgMember, orgInvitation, project, environment, secretEvent, secretRead, apiToken, apiTokenEnvironment, trustRule, deviceCode, oauthDomain, memberAccess },
   (r) => ({
     user: {
       sessions: r.many.session(),
@@ -485,6 +530,7 @@ export const relations = defineRelations(
       org: r.one.org({ from: r.project.orgId, to: r.org.id }),
       environments: r.many.environment(),
       apiTokens: r.many.apiToken(),
+      trustRules: r.many.trustRule(),
     },
     environment: {
       project: r.one.project({ from: r.environment.projectId, to: r.project.id }),
@@ -504,6 +550,12 @@ export const relations = defineRelations(
       project: r.one.project({ from: r.apiToken.projectId, to: r.project.id }),
       creator: r.one.user({ from: r.apiToken.createdBy, to: r.user.id }),
       environments: r.many.apiTokenEnvironment(),
+      trustRule: r.one.trustRule({ from: r.apiToken.trustRuleId, to: r.trustRule.id }),
+    },
+    trustRule: {
+      project: r.one.project({ from: r.trustRule.projectId, to: r.project.id }),
+      creator: r.one.user({ from: r.trustRule.createdBy, to: r.user.id }),
+      tokens: r.many.apiToken(),
     },
     apiTokenEnvironment: {
       token: r.one.apiToken({ from: r.apiTokenEnvironment.tokenId, to: r.apiToken.id }),

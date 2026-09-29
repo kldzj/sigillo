@@ -1,9 +1,11 @@
-// Type augmentation for the test-only TEST_MIGRATIONS binding injected via
-// miniflare config in vite.config.ts.
+// Type augmentation for the test-only bindings injected via miniflare config
+// in vite.config.ts: the migrations, and the private keys of the fake OIDC
+// issuer the workload identity tests sign JWTs with.
 
 declare namespace Cloudflare {
   interface Env {
     TEST_MIGRATIONS: D1Migration[]
+    TEST_ISSUER_KEYS: { rsa: JsonWebKey & { kid: string; alg: string }; ec: JsonWebKey & { kid: string; alg: string } }
   }
 }
 

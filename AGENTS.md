@@ -89,6 +89,21 @@ Rules:
 - Pages send secret names, never values. The web UI fetches a value when someone reveals, downloads or copies it, through `readSecretValues()` / `readEventValue()`, so the read log shows who looked at which value, not who opened a page.
 - Changing `BETTER_AUTH_SECRET` changes the signing key. Old rows then no longer verify, and `sigillo audit verify` reports the new key.
 
+## Workload identity (fork)
+
+`app/src/workload.ts`: a project's trust rules (`trust_rule`) let a GitHub Actions job, a Kubernetes pod or External Secrets Operator exchange its platform's JWT at `POST /api/v0/workload/token` for an `api_token` row of one hour, with `trust_rule_id` and the verified JWT in `workload`. That token acts for the rule's creator, so every API token check applies unchanged. The CLI exchanges on its own when no token is configured (`cli/zig/src/workload.zig`). `/v3/auth/oidc`, `/v3/projects` and `/v3/configs/config/secrets/download` in `api.ts` answer ESO's Doppler provider (Basic auth with the token as user name, Doppler's `success`/`messages` shape).
+
+Rules:
+- **Every rule change is an org admin's with a passkey** (`requireAdminWithPasskey`). Protected rules expire after `MACHINE_TOKEN_MAX_DAYS`, like machine tokens.
+- **Claims match exactly, `sub` always.** No wildcards or prefixes. Nested claims go by JSON pointer (`/kubernetes.io/namespace`): claim names contain dots.
+- **Until a rule accepts a JWT, a refusal only repeats what the JWT says**, never which rules exist.
+- **The Worker fetches only admin-typed issuer URLs**, https on port 443 with a host name, no redirects, 5 s, 64 KiB, never its own host. Tests answer them in `testOutboundService` (`issuer.test` and friends in `vite.config.ts`).
+- Exchanged tokens never show in the token list. Deleting a rule or removing its creator from the org expires them instead of deleting them, so the read log keeps naming the job or pod; they go only with their project or environments.
+- **A workload's token works only while its rule's creator is an org admin** (`getRequestApiToken`), not just for protected or admin-only environments.
+- **The exchange's `project` is an ID, never a name**, and the CLI refuses to exchange with a project name: names repeat across organizations, so another org's admin could make a rule for your workload in a project named like yours.
+- An unknown key id refetches at most every 5 minutes per rule, and discovered keys are refetched once a day. `refreshKeys` claims the fetch with a conditional update first, so requests arriving together fetch once.
+- The Doppler download must stay a flat map of names to values (ESO unmarshals it into `map[string]string`), so it never gets a `success` field.
+
 ## Backups (fork)
 
 `self-host --backup` exports both D1 databases through Cloudflare's export API and saves them gzipped and age-encrypted to `backupIdentity` in `selfhost.json` (`cli/src/selfhost/backup.ts`). `--restore` imports into new databases, checks the history (`history.ts`), then saves their ids and redeploys both workers. It never deletes the old databases.

@@ -38,6 +38,7 @@ import {
   requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
   requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
 } from './step-up.ts'
+import { createTrustRule, deleteTrustRule, replaceTrustRuleKeys, type TrustRuleInput } from './workload.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 
 async function requireSession() {
@@ -590,6 +591,32 @@ export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
     // Deleting a machine token stops CI: an admin action, like making one
     if (token.protectedAccess) await requireMachineTokenDeletion({ userId: session.userId, sessionId: session.sessionId, projectId: token.projectId })
     await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
+    return { ok: true }
+  })
+}
+
+// ── Workload identities ─────────────────────────────────────────────
+// Trust rules (workload.ts), each change an org admin's with their passkey
+
+export async function createTrustRuleAction(rule: TrustRuleInput) {
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    return createTrustRule({ userId: session.userId, sessionId: session.sessionId, ownHost: new URL(getActionRequest().url).hostname, rule })
+  })
+}
+
+export async function deleteTrustRuleAction({ ruleId }: { ruleId: string }) {
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    await deleteTrustRule({ userId: session.userId, sessionId: session.sessionId, ruleId })
+    return { ok: true }
+  })
+}
+
+export async function replaceTrustRuleKeysAction({ ruleId, jwks }: { ruleId: string; jwks: string }) {
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    await replaceTrustRuleKeys({ userId: session.userId, sessionId: session.sessionId, ruleId, jwks })
     return { ok: true }
   })
 }

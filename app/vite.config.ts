@@ -1,6 +1,7 @@
 /// <reference types="vitest/config" />
 // Read D1 migration SQL files so they can be applied in the workerd setup file
 import path from 'node:path'
+import { webcrypto } from 'node:crypto'
 import { cloudflare } from '@cloudflare/vite-plugin'
 import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers'
 import { holocron } from '@holocron.so/vite'
@@ -27,8 +28,34 @@ const TEST_PROVIDER_ORIGIN = 'https://provider.invalid'
 // Anything unrecognized gets a 501 instead of reaching the internet, so tests
 // stay hermetic and a new unmocked dependency fails loudly and instantly
 // instead of hanging.
-function testOutboundService(request: Request): Response {
+//
+// It also plays the OIDC issuers of the workload identity tests: issuer.test
+// signs with the keys issuerKeys() makes, which the tests get as the
+// TEST_ISSUER_KEYS binding, and the other hosts misbehave in one way each.
+function testOutboundService(keys: IssuerKeys, request: Request): Response {
   const url = new URL(request.url)
+  const discovery = url.pathname === '/.well-known/openid-configuration'
+  if (url.origin === 'https://issuer.test' && discovery) {
+    return Response.json({ issuer: 'https://issuer.test', jwks_uri: 'https://issuer.test/jwks' })
+  }
+  if (url.href === 'https://issuer.test/jwks') {
+    keys.fetches++
+    return Response.json({ keys: [publicJwk(keys.rsa), publicJwk(keys.ec)] })
+  }
+  if (url.href === 'https://issuer.test/fetches') return Response.json({ fetches: keys.fetches })
+  // Its document names another issuer
+  if (url.origin === 'https://liar.test' && discovery) {
+    return Response.json({ issuer: 'https://issuer.test', jwks_uri: 'https://issuer.test/jwks' })
+  }
+  if (url.origin === 'https://redirect.test' && discovery) {
+    return new Response(null, { status: 302, headers: { location: 'https://issuer.test/.well-known/openid-configuration' } })
+  }
+  if (url.origin === 'https://plain.test' && discovery) {
+    return Response.json({ issuer: 'https://plain.test', jwks_uri: 'http://plain.test/jwks' })
+  }
+  if (url.origin === 'https://huge.test' && discovery) {
+    return new Response(`{"issuer":"https://huge.test","padding":"${'x'.repeat(1 << 20)}"}`, { headers: { 'content-type': 'application/json' } })
+  }
 
   if (url.origin === TEST_PROVIDER_ORIGIN && url.pathname === '/api/auth/.well-known/openid-configuration') {
     return Response.json({
@@ -52,10 +79,29 @@ function testOutboundService(request: Request): Response {
   )
 }
 
+type IssuerKeys = { rsa: JsonWebKey & { kid: string }; ec: JsonWebKey & { kid: string }; fetches: number }
+
+async function issuerKeys(): Promise<IssuerKeys> {
+  const privateJwk = async (algorithm: RsaHashedKeyGenParams | EcKeyGenParams, kid: string, alg: string) => {
+    const pair = await webcrypto.subtle.generateKey(algorithm, true, ['sign', 'verify']) as CryptoKeyPair
+    return { ...await webcrypto.subtle.exportKey('jwk', pair.privateKey), kid, alg }
+  }
+  return {
+    rsa: await privateJwk({ name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, 'rsa-1', 'RS256'),
+    ec: await privateJwk({ name: 'ECDSA', namedCurve: 'P-256' }, 'ec-1', 'ES256'),
+    fetches: 0,
+  }
+}
+
+function publicJwk({ d: _d, p: _p, q: _q, dp: _dp, dq: _dq, qi: _qi, key_ops: _ops, ext: _ext, ...key }: JsonWebKey) {
+  return key
+}
+
 export default defineConfig(async () => {
   const migrations = process.env.VITEST
     ? await readD1Migrations(path.join(__dirname, '../db/drizzle-app'))
     : []
+  const keys = process.env.VITEST ? await issuerKeys() : null
 
   return {
     server: { port, strictPort: true },
@@ -72,9 +118,10 @@ export default defineConfig(async () => {
             miniflare: {
               bindings: {
                 TEST_MIGRATIONS: migrations,
+                TEST_ISSUER_KEYS: { rsa: keys!.rsa, ec: keys!.ec },
                 BETTER_AUTH_SECRET: 'test-secret-at-least-32-characters-long!!',
               },
-              outboundService: testOutboundService,
+              outboundService: (request: Request) => testOutboundService(keys!, request),
             },
           })
         : null,

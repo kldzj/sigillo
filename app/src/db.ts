@@ -224,7 +224,7 @@ export async function ensureOAuthClient(request: Request): Promise<string> {
 // ── Sign-in allowlist ───────────────────────────────────────────────
 // ALLOWED_USERS limits who may sign up and sign in (see isUserAllowed).
 
-function isAllowed(user: { email: string; emailVerified: boolean }): boolean {
+export function isAllowed(user: { email: string; emailVerified: boolean }): boolean {
   return isUserAllowed(user, process.env.ALLOWED_USERS)
 }
 
@@ -661,18 +661,22 @@ async function lookupOrgMember(userId: string, orgId: string): Promise<{ role: s
 }
 
 // Removes a member together with what let them keep acting in the org on
-// their own: the API tokens they created for its projects, and the invite
-// links they created. Tokens and invites used to outlive their creator, so a
+// their own: the API tokens and trust rules they created for its projects,
+// and the invite links they created. Tokens and invites used to outlive their creator, so a
 // departed member's CI token kept reading secrets. The secrets those tokens
 // wrote stay (secret_event.api_token_id is SET NULL).
 export async function deleteOrgMember(member: { id: string; orgId: string; userId: string }) {
   const db = getDb()
+  const now = Date.now()
   const orgProjectIds = db.select({ id: schema.project.id }).from(schema.project).where(orm.eq(schema.project.orgId, member.orgId))
+  const theirs = <T extends typeof schema.apiToken | typeof schema.trustRule>(table: T) =>
+    orm.and(orm.eq(table.createdBy, member.userId), orm.inArray(table.projectId, orgProjectIds))
   await db.batch([
-    db.delete(schema.apiToken).where(orm.and(
-      orm.eq(schema.apiToken.createdBy, member.userId),
-      orm.inArray(schema.apiToken.projectId, orgProjectIds),
-    )),
+    // Tokens workloads got under their trust rules stay, expired, for the read log
+    db.update(schema.apiToken).set({ expiresAt: now })
+      .where(orm.and(theirs(schema.apiToken), orm.isNotNull(schema.apiToken.workload), orm.gt(schema.apiToken.expiresAt, now))),
+    db.delete(schema.apiToken).where(orm.and(theirs(schema.apiToken), orm.isNull(schema.apiToken.workload))),
+    db.delete(schema.trustRule).where(theirs(schema.trustRule)),
     db.delete(schema.orgInvitation).where(orm.and(
       orm.eq(schema.orgInvitation.orgId, member.orgId),
       orm.eq(schema.orgInvitation.createdBy, member.userId),
@@ -1202,12 +1206,13 @@ export async function verifyApiToken(key: string, ipAddress: string | null = nul
   projectId: string
   createdBy: string
   environmentIds: string[] | null
+  workload: boolean
 } | null> {
   const hashedKey = await hashTokenKey(key)
   const db = getDb()
   const token = await db.query.apiToken.findFirst({
     where: { hashedKey },
-    columns: { id: true, projectId: true, createdBy: true, expiresAt: true, lastUsedAt: true },
+    columns: { id: true, projectId: true, createdBy: true, expiresAt: true, lastUsedAt: true, trustRuleId: true, workload: true },
     with: { environments: { columns: { environmentId: true } } },
   })
   if (!token) return null
@@ -1227,6 +1232,7 @@ export async function verifyApiToken(key: string, ipAddress: string | null = nul
     environmentIds: token.environments.length === 0
       ? null
       : token.environments.map((row) => row.environmentId),
+    workload: token.workload !== null,
   }
 }
 
@@ -1238,6 +1244,7 @@ export async function getRequestApiToken(request: Request): Promise<{
   projectId: string
   createdBy: string
   environmentIds: string[] | null
+  workload: boolean
 } | null> {
   const authHeader = request.headers.get('authorization')
   const bearer = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null
@@ -1252,6 +1259,8 @@ export async function getRequestApiToken(request: Request): Promise<{
   if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(token.projectId))) {
     throw forbiddenResponse('the creator of this API token can no longer open its project')
   }
+  // A workload's token acts for the admin who made its trust rule, only while they are one
+  if (token.workload && access.role !== 'admin') throw forbiddenResponse('the admin who made this trust rule no longer is one')
   return token
 }
 

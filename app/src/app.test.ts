@@ -18,13 +18,15 @@ import { env as workerEnv } from 'cloudflare:workers'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import worker, { app } from './app.js'
-import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions, internalErrorMessage } from './db.js'
+import { getAuth, encrypt, decrypt, hashTokenKey, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions, internalErrorMessage } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue, purgeOldValues } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
 import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
+import { createTrustRule, deleteTrustRule, replaceTrustRuleKeys, type TrustRuleInput } from './workload.js'
+import * as jose from 'jose'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
@@ -3346,7 +3348,7 @@ describe('step-up', () => {
     }
     // Each one follows recordSecretRead, or keeps the value on the server:
     // the audit digest, and a rename within one environment
-    expect(calls).toEqual({ './actions.ts': 2, './api.ts': 3, './audit.ts': 3 })
+    expect(calls).toEqual({ './actions.ts': 2, './api.ts': 4, './audit.ts': 3 })
   })
 })
 
@@ -4003,5 +4005,413 @@ describe('passkey enrollment', () => {
     await getDb().update(schema.session).set({ createdAt: Date.now() - 10 * 60 * 1000 }).where(orm.eq(schema.session.id, await sessionIdOf(user.token)))
     const cli = await deviceLogin(user.token)
     expect({ oldLogin: await register(user.token), newCliLogin: await register(cli) }).toEqual({ oldLogin: 403, newCliLogin: 403 })
+  })
+})
+
+describe('workload identity', () => {
+  const ISSUER = 'https://issuer.test'
+  const AUDIENCE = 'https://secrets.test'
+  let admin: Awaited<ReturnType<typeof createTestUser>>
+  let sessionId: string
+  let orgId: string
+  let projectId: string
+  let dev: string
+  let prod: string
+  const download = (environmentId: string) => `/api/v0/projects/${projectId}/environments/${environmentId}/secrets/download`
+
+  beforeAll(async () => {
+    admin = await createTestUser({ name: 'Workload Admin' })
+    const af = authedFetch(admin.token)
+    orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Workload Org' } })).id
+    projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Workloads', orgId } })).id
+    dev = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'dev' } })).id
+    prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+    sessionId = await sessionIdOf(admin.token)
+    await appendSecretEvents({
+      author: { userId: admin.user.id, apiTokenId: null, sessionId },
+      events: [
+        { environmentId: dev, name: 'DB_URL', operation: 'set', value: 'dev-db' },
+        { environmentId: dev, name: 'API_KEY', operation: 'set', value: 'dev-key' },
+        { environmentId: prod, name: 'DB_URL', operation: 'set', value: 'prod-db' },
+      ],
+    })
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: prod, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    await grantAdmin(admin.token, Date.now() + 10 * 60_000)
+  })
+
+  const now = () => Math.floor(Date.now() / 1000)
+  const publicOf = ({ d: _d, p: _p, q: _q, dp: _dp, dq: _dq, qi: _qi, key_ops: _ops, ext: _ext, ...key }: JsonWebKey & { kid: string; alg: string }) => key
+
+  // A JWT from the fake issuer (vite.config.ts), valid for five minutes
+  async function signed(claims: Record<string, unknown>, key: 'rsa' | 'ec' = 'rsa') {
+    const jwk = workerEnv.TEST_ISSUER_KEYS[key]
+    return new jose.SignJWT({ iss: ISSUER, aud: AUDIENCE, iat: now(), exp: now() + 300, ...claims })
+      .setProtectedHeader({ alg: jwk.alg, kid: jwk.kid })
+      .sign(await jose.importJWK(jwk, jwk.alg))
+  }
+
+  function rule(overrides: Partial<TrustRuleInput> = {}, by: { userId: string; sessionId: string } = { userId: admin.user.id, sessionId }) {
+    return createTrustRule({
+      ...by,
+      ownHost: 'e.ly',
+      rule: { projectId, name: 'GitHub deploy', issuer: ISSUER, audience: AUDIENCE, subject: 'repo:acme/api:environment:dev', claims: {}, environmentIds: [dev], protectedAccess: false, expiresInDays: 30, ...overrides },
+    })
+  }
+
+  async function exchange(body: Record<string, unknown>) {
+    const res = await app.handle(new Request('http://e.ly/api/v0/workload/token', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }))
+    return { status: res.status, body: await res.json() as { token?: string; error?: string; expiresAt?: number; projectId?: string; environmentIds?: string[] } }
+  }
+
+  async function call(key: string, path: string) {
+    const res = await app.handle(new Request(`http://e.ly${path}`, { headers: { authorization: `Bearer ${key}` } }))
+    return { status: res.status, body: await res.json() as Record<string, unknown> }
+  }
+
+  const outcome = (run: Promise<unknown>) => run.then(() => 'ok', (error) => error instanceof StepUpRequiredError ? `step-up:${error.purpose}` : (error as Error).message)
+
+  test('a job exchanges its JWT for a token of an hour, which reads the rule\'s environments', async () => {
+    const { id } = await rule({ name: 'GitHub dev', claims: { repository_id: '74' } })
+    const jwt = await signed({ sub: 'repo:acme/api:environment:dev', repository: 'acme/api', repository_id: '74', environment: 'dev', run_id: '8123', run_attempt: '1' })
+    const exchanged = await exchange({ token: jwt })
+    const key = exchanged.body.token!
+    const row = await getDb().query.apiToken.findFirst({ where: { hashedKey: await hashTokenKey(key) } })
+    expect({
+      status: exchanged.status,
+      environmentIds: exchanged.body.environmentIds,
+      minutes: Math.round((exchanged.body.expiresAt! - Date.now()) / 60_000),
+      dev: await call(key, download(dev)),
+      prod: await call(key, download(prod)),
+      row: { name: row?.name, trustRuleId: row?.trustRuleId, sub: row?.workload?.claims.sub, kid: row?.workload?.kid, createdBy: row?.createdBy },
+    }).toEqual({
+      status: 200,
+      environmentIds: [dev],
+      minutes: 60,
+      dev: { status: 200, body: { DB_URL: 'dev-db', API_KEY: 'dev-key' } },
+      prod: { status: 403, body: { error: 'token is scoped to a different environment' } },
+      row: { name: 'GitHub dev · acme/api environment dev run 8123.1', trustRuleId: id, sub: 'repo:acme/api:environment:dev', kid: 'rsa-1', createdBy: admin.user.id },
+    })
+  })
+
+  test('refuses a JWT the rule doesn\'t accept, saying only what the JWT says', async () => {
+    await rule({ name: 'Refusals', subject: 'refusals', claims: { repository_id: '74' } })
+    const base = { sub: 'refusals', repository_id: '74' }
+    const statusOf = async (token: string) => {
+      const { status, body } = await exchange({ token })
+      return status === 200 ? '200' : `${status} ${body.error}`
+    }
+    const unsigned = `${btoa(JSON.stringify({ alg: 'none' }))}.${btoa(JSON.stringify({ iss: ISSUER, ...base }))}.`.replaceAll('=', '')
+    const hmac = await new jose.SignJWT({ iss: ISSUER, aud: AUDIENCE, iat: now(), exp: now() + 300, ...base })
+      .setProtectedHeader({ alg: 'HS256', kid: 'rsa-1' })
+      .sign(new TextEncoder().encode(JSON.stringify(publicOf(workerEnv.TEST_ISSUER_KEYS.rsa))))
+    const stranger = await crypto.subtle.generateKey({ name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign', 'verify']) as CryptoKeyPair
+    const foreign = await new jose.SignJWT({ iss: ISSUER, aud: AUDIENCE, iat: now(), exp: now() + 300, ...base })
+      .setProtectedHeader({ alg: 'RS256', kid: 'rsa-1' })
+      .sign(stranger.privateKey)
+    const refused = `403 No trust rule accepts this JWT (issuer ${ISSUER}, subject refusals, audience "https://other.test")`
+    expect({
+      accepted: await statusOf(await signed(base)),
+      thirtySecondsLate: await statusOf(await signed({ ...base, exp: now() - 30 })),
+      ninetySecondsLate: await statusOf(await signed({ ...base, exp: now() - 90 })),
+      noExpiry: await statusOf(await signed({ ...base, exp: undefined })),
+      issuedYesterday: await statusOf(await signed({ ...base, iat: now() - 25 * 3600 })),
+      notYetValid: (await statusOf(await signed({ ...base, nbf: now() + 600 }))).slice(0, 3),
+      otherAudience: await statusOf(await signed({ ...base, aud: 'https://other.test' })),
+      otherSubject: (await statusOf(await signed({ ...base, sub: 'refusals-2' }))).slice(0, 3),
+      otherRepository: (await statusOf(await signed({ ...base, repository_id: '75' }))).slice(0, 3),
+      otherIssuer: (await statusOf(await signed({ ...base, iss: 'https://elsewhere.test' }))).slice(0, 3),
+      unsigned: await statusOf(unsigned),
+      hmac: await statusOf(hmac),
+      foreignKey: (await statusOf(foreign)).slice(0, 3),
+      notAJwt: await statusOf('hello'),
+    }).toEqual({
+      accepted: '200',
+      thirtySecondsLate: '200',
+      ninetySecondsLate: '401 The JWT has expired, or never does',
+      noExpiry: '401 The JWT has expired, or never does',
+      issuedYesterday: '401 The JWT is older than 24 hours, or doesn\'t say when it was issued',
+      notYetValid: '403',
+      otherAudience: refused,
+      otherSubject: '403',
+      otherRepository: '403',
+      otherIssuer: '403',
+      unsigned: '400 JWTs signed with none aren\'t accepted, only RS256 and ES256',
+      hmac: '400 JWTs signed with HS256 aren\'t accepted, only RS256 and ES256',
+      foreignKey: '403',
+      notAJwt: '400 Not a JWT',
+    })
+  })
+
+  test('pasted keys, ES256, an audience list and nested claims, as a Kubernetes pod sends them', async () => {
+    const fetches = async () => (await (await fetch('https://issuer.test/fetches')).json() as { fetches: number }).fetches
+    const before = await fetches()
+    const cluster = 'https://kubernetes.default.svc.cluster.local'
+    const { id } = await rule({
+      name: 'Pods',
+      issuer: cluster,
+      jwks: JSON.stringify({ keys: [publicOf(workerEnv.TEST_ISSUER_KEYS.ec)] }),
+      subject: 'system:serviceaccount:payments:api',
+      claims: { '/kubernetes.io/namespace': 'payments', '/kubernetes.io/serviceaccount/uid': 'uid-1' },
+    })
+    const pod = (uid: string, key: 'rsa' | 'ec' = 'ec') => signed({
+      iss: cluster,
+      sub: 'system:serviceaccount:payments:api',
+      aud: [AUDIENCE, 'https://kubernetes.default.svc'],
+      'kubernetes.io': { namespace: 'payments', serviceaccount: { name: 'api', uid }, pod: { name: 'api-7d9f5b-x2k9q', uid: 'pod-1' } },
+    }, key)
+    const accepted = await exchange({ token: await pod('uid-1') })
+    const recreated = (await exchange({ token: await pod('uid-2') })).status
+    // The cluster rotates to its RSA key, and the admin pastes the new set
+    const beforePaste = (await exchange({ token: await pod('uid-1', 'rsa') })).status
+    await replaceTrustRuleKeys({ userId: admin.user.id, sessionId, ruleId: id, jwks: JSON.stringify({ keys: [publicOf(workerEnv.TEST_ISSUER_KEYS.rsa)] }) })
+    const afterPaste = (await exchange({ token: await pod('uid-1', 'rsa') })).status
+    const discovered = await rule({ name: 'Discovered', subject: 'discovered' })
+    const row = await getDb().query.apiToken.findFirst({ where: { hashedKey: await hashTokenKey(accepted.body.token!) }, columns: { name: true } })
+    expect({
+      accepted: accepted.status,
+      name: row?.name,
+      recreated,
+      beforePaste,
+      afterPaste,
+      pastingOverDiscovered: await outcome(replaceTrustRuleKeys({ userId: admin.user.id, sessionId, ruleId: discovered.id, jwks: '{}' })),
+      // One fetch: the discovered rule's keys. Pasted keys never fetch.
+      fetched: await fetches() - before,
+    }).toEqual({
+      accepted: 200,
+      name: 'Pods · payments/api pod api-7d9f5b-x2k9q',
+      recreated: 403,
+      beforePaste: 403,
+      afterPaste: 200,
+      pastingOverDiscovered: 'This rule gets its keys from its issuer',
+      fetched: 1,
+    })
+  })
+
+  test('requests that arrive together fetch the issuer\'s keys once, and keys a day old are fetched again', async () => {
+    const fetches = async () => (await (await fetch('https://issuer.test/fetches')).json() as { fetches: number }).fetches
+    const insertRule = (subject: string, jwks: { keys: Array<Record<string, unknown>> }, jwksFetchedAt: number) => getDb().insert(schema.trustRule).values({
+      projectId, name: 'Keys', issuer: ISSUER, jwksUri: 'https://issuer.test/jwks', jwks, jwksFetchedAt,
+      audience: AUDIENCE, subject, claims: {}, environmentIds: [dev], createdBy: admin.user.id, expiresAt: Date.now() + 86_400_000,
+    })
+    const ec = publicOf(workerEnv.TEST_ISSUER_KEYS.ec)
+    const rsa = publicOf(workerEnv.TEST_ISSUER_KEYS.rsa)
+    await insertRule('together', { keys: [ec] }, Date.now() - 10 * 60_000)
+    const before = await fetches()
+    // The one that claims the fetch gets through; the others try again later
+    const together = await Promise.all([1, 2, 3, 4].map(async () => (await exchange({ token: await signed({ sub: 'together' }), project: projectId })).status))
+    const afterTogether = await fetches()
+    // A key set that would still verify, but was fetched more than a day ago
+    await insertRule('yesterday', { keys: [ec, rsa] }, Date.now() - 25 * 3600_000)
+    const yesterday = (await exchange({ token: await signed({ sub: 'yesterday' }), project: projectId })).status
+    const [fetchedAt] = await getDb().select({ at: schema.trustRule.jwksFetchedAt }).from(schema.trustRule).where(orm.eq(schema.trustRule.subject, 'yesterday'))
+    expect({ fetchedTogether: afterTogether - before, oneGotThrough: together.includes(200), yesterday, fetchedForYesterday: await fetches() - afterTogether, refreshedToday: Date.now() - fetchedAt!.at! < 60_000 })
+      .toEqual({ fetchedTogether: 1, oneGotThrough: true, yesterday: 200, fetchedForYesterday: 1, refreshedToday: true })
+  })
+
+  test('an unknown key id fetches the issuer\'s keys again, at most every five minutes', async () => {
+    const fetches = async () => (await (await fetch('https://issuer.test/fetches')).json() as { fetches: number }).fetches
+    // Rules that know only the issuer's EC key, fetched long ago and just now
+    const staleRule = (subject: string, jwksFetchedAt: number) => getDb().insert(schema.trustRule).values({
+      projectId, name: 'Stale keys', issuer: ISSUER, jwksUri: 'https://issuer.test/jwks', jwks: { keys: [publicOf(workerEnv.TEST_ISSUER_KEYS.ec)] },
+      jwksFetchedAt, audience: AUDIENCE, subject, claims: {}, environmentIds: [dev], createdBy: admin.user.id, expiresAt: Date.now() + 86_400_000,
+    })
+    await staleRule('keys-long-ago', Date.now() - 10 * 60_000)
+    await staleRule('keys-just-now', Date.now())
+    const before = await fetches()
+    const longAgo = (await exchange({ token: await signed({ sub: 'keys-long-ago' }) })).status
+    const afterLongAgo = await fetches()
+    const justNow = (await exchange({ token: await signed({ sub: 'keys-just-now' }) })).status
+    const again = (await exchange({ token: await signed({ sub: 'keys-just-now' }) })).status
+    expect({ longAgo, fetchedForIt: afterLongAgo - before, justNow, again, fetchedSince: await fetches() - afterLongAgo })
+      .toEqual({ longAgo: 200, fetchedForIt: 1, justNow: 403, again: 403, fetchedSince: 0 })
+  })
+
+  test('keys come only from an https issuer that names itself, in a small answer', async () => {
+    expect({
+      liar: await outcome(rule({ issuer: 'https://liar.test' })),
+      redirect: await outcome(rule({ issuer: 'https://redirect.test' })),
+      plainJwks: await outcome(rule({ issuer: 'https://plain.test' })),
+      huge: await outcome(rule({ issuer: 'https://huge.test' })),
+      http: await outcome(rule({ issuer: 'http://issuer.test' })),
+      address: await outcome(rule({ issuer: 'https://10.0.0.1' })),
+      itself: await outcome(rule({ issuer: 'https://e.ly' })),
+      privateKey: await outcome(rule({ issuer: 'https://k8s.test', jwks: JSON.stringify({ keys: [workerEnv.TEST_ISSUER_KEYS.rsa] }) })),
+      // jose never picks an RSA key named for another algorithm for RS256
+      otherAlgorithm: await outcome(rule({ issuer: 'https://k8s.test', jwks: JSON.stringify({ keys: [{ ...publicOf(workerEnv.TEST_ISSUER_KEYS.rsa), alg: 'PS256' }] }) })),
+      notJson: await outcome(rule({ issuer: 'https://k8s.test', jwks: 'keys please' })),
+    }).toEqual({
+      liar: 'The discovery document of https://liar.test names another issuer: https://issuer.test',
+      redirect: 'https://redirect.test/.well-known/openid-configuration answered 302',
+      plainJwks: 'http://plain.test/jwks must be an https URL without a port, query or credentials',
+      huge: 'https://huge.test/.well-known/openid-configuration answered with more than 64 KiB',
+      http: 'http://issuer.test must be an https URL without a port, query or credentials',
+      address: '10.0.0.1 can\'t be fetched: it must be another host\'s name',
+      itself: 'e.ly can\'t be fetched: it must be another host\'s name',
+      privateKey: 'That key set holds a private key: paste only the public keys',
+      otherAlgorithm: 'The key set has no RSA or P-256 signing key',
+      notJson: 'Paste the keys as JSON, as `kubectl get --raw /openid/v1/jwks` prints them',
+    })
+  })
+
+  test('only an org admin with their passkey makes or deletes a rule, and protected ones last 90 days at most', async () => {
+    const member = await createTestUser({ name: 'Workload Member' })
+    const newAdmin = await createTestUser({ name: 'Workload Admin Too' })
+    await getDb().insert(schema.orgMember).values([{ orgId, userId: member.user.id, role: 'member' }, { orgId, userId: newAdmin.user.id, role: 'admin' }])
+    const asMember = { userId: member.user.id, sessionId: await sessionIdOf(member.token) }
+    const asNewAdmin = { userId: newAdmin.user.id, sessionId: await sessionIdOf(newAdmin.token) }
+    const { id } = await rule({ subject: 'authorization' })
+    expect({
+      member: await outcome(rule({ subject: 'authorization-1' }, asMember)),
+      adminWithoutPasskey: await outcome(rule({ subject: 'authorization-2' }, asNewAdmin)),
+      protectedForAYear: await outcome(rule({ subject: 'authorization-3', protectedAccess: true, expiresInDays: 365 })),
+      protectedFor90Days: await outcome(rule({ subject: 'authorization-4', protectedAccess: true, expiresInDays: 90 })),
+      otherProjectsEnvironment: await outcome(rule({ subject: 'authorization-5', environmentIds: ['01NOTANENVIRONMENT'] })),
+      memberDeletes: await outcome(deleteTrustRule({ ...asMember, ruleId: id })),
+      adminWithoutPasskeyDeletes: await outcome(deleteTrustRule({ ...asNewAdmin, ruleId: id })),
+    }).toEqual({
+      member: 'Only admins can do this',
+      adminWithoutPasskey: 'step-up:admin',
+      protectedForAYear: 'A rule for protected environments expires after 90 days at most',
+      protectedFor90Days: 'ok',
+      otherProjectsEnvironment: 'Environment not found in this project',
+      memberDeletes: 'Only admins can do this',
+      adminWithoutPasskeyDeletes: 'step-up:admin',
+    })
+  })
+
+  test('a workload\'s token stops with its creator\'s admin role, and removing them removes their rules', async () => {
+    const creator = await createTestUser({ name: 'Leaving Admin' })
+    const [membership] = await getDb().insert(schema.orgMember).values({ orgId, userId: creator.user.id, role: 'admin' }).returning({ id: schema.orgMember.id })
+    await grantAdmin(creator.token, Date.now() + 10 * 60_000)
+    const { id } = await rule({ name: 'Leaving', subject: 'leaving' }, { userId: creator.user.id, sessionId: await sessionIdOf(creator.token) })
+    const key = (await exchange({ token: await signed({ sub: 'leaving' }) })).body.token!
+    const before = (await call(key, download(dev))).status
+    await getDb().update(schema.orgMember).set({ role: 'member' }).where(orm.eq(schema.orgMember.id, membership!.id))
+    const demoted = await call(key, download(dev))
+    await deleteOrgMember({ id: membership!.id, orgId, userId: creator.user.id })
+    const row = await getDb().query.apiToken.findFirst({ where: { hashedKey: await hashTokenKey(key) }, columns: { expiresAt: true, trustRuleId: true } })
+    expect({
+      before,
+      demoted,
+      ruleLeft: await getDb().query.trustRule.findFirst({ where: { id }, columns: { id: true } }) ?? null,
+      token: row && { expired: row.expiresAt! <= Date.now(), trustRuleId: row.trustRuleId },
+    }).toEqual({
+      before: 200,
+      demoted: { status: 403, body: { error: 'the admin who made this trust rule no longer is one' } },
+      ruleLeft: null,
+      token: { expired: true, trustRuleId: null },
+    })
+  })
+
+  test('deleting a rule ends its tokens at once, and keeps them for the read log', async () => {
+    const { id } = await rule({ name: 'Short-lived', subject: 'short-lived' })
+    const key = (await exchange({ token: await signed({ sub: 'short-lived' }) })).body.token!
+    const before = (await call(key, download(dev))).status
+    await deleteTrustRule({ userId: admin.user.id, sessionId, ruleId: id })
+    const row = await getDb().query.apiToken.findFirst({ where: { hashedKey: await hashTokenKey(key) }, columns: { trustRuleId: true, workload: true } })
+    expect({
+      before,
+      after: await call(key, download(dev)),
+      row: { trustRuleId: row?.trustRuleId, sub: row?.workload?.claims.sub },
+      exchangedAgain: (await exchange({ token: await signed({ sub: 'short-lived' }) })).status,
+    }).toEqual({
+      before: 200,
+      after: { status: 401, body: { error: 'API token expired' } },
+      row: { trustRuleId: null, sub: 'short-lived' },
+      exchangedAgain: 403,
+    })
+  })
+
+  test('a rule reads a protected environment only when it says so, and only while its creator is an admin', async () => {
+    const creator = await createTestUser({ name: 'Rule Creator' })
+    await getDb().insert(schema.orgMember).values({ orgId, userId: creator.user.id, role: 'admin' })
+    await grantAdmin(creator.token, Date.now() + 10 * 60_000)
+    const by = { userId: creator.user.id, sessionId: await sessionIdOf(creator.token) }
+    await rule({ name: 'Deploy prod', subject: 'deploy-prod', environmentIds: [prod], protectedAccess: true, expiresInDays: 90 }, by)
+    await rule({ name: 'Read prod', subject: 'read-prod', environmentIds: [prod] }, by)
+    const keyFor = async (sub: string) => (await exchange({ token: await signed({ sub }) })).body.token!
+    const deploy = await keyFor('deploy-prod')
+    const allowed = await call(deploy, download(prod))
+    const refused = await call(await keyFor('read-prod'), download(prod))
+    const token = await getDb().query.apiToken.findFirst({ where: { hashedKey: await hashTokenKey(deploy) }, columns: { id: true } })
+    const lastRead = await getDb().query.secretRead.findFirst({ where: { environmentId: prod }, orderBy: { seq: 'desc' }, columns: { actor: true, kind: true } })
+    await getDb().update(schema.orgMember).set({ role: 'member' })
+      .where(orm.and(orm.eq(schema.orgMember.orgId, orgId), orm.eq(schema.orgMember.userId, creator.user.id)))
+    expect({
+      allowed,
+      refused: refused.body.code,
+      lastRead,
+      afterDemotion: { read: (await call(deploy, download(prod))).status, exchange: (await exchange({ token: await signed({ sub: 'deploy-prod' }) })).body.error },
+    }).toEqual({
+      allowed: { status: 200, body: { DB_URL: 'prod-db' } },
+      refused: 'MACHINE_TOKEN_REQUIRED',
+      lastRead: { actor: `token:${token!.id}`, kind: 'download' },
+      afterDemotion: { read: 403, exchange: 'The admin who made this trust rule no longer is one: another admin has to make it again' },
+    })
+  })
+
+  test('a workload two projects trust names its project by ID, or its rule', async () => {
+    const af = authedFetch(admin.token)
+    const other = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Workloads Too', orgId } })).id
+    const otherDev = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId: other, id: 'dev' } })).id
+    await rule({ name: 'Here', subject: 'shared' })
+    const { id } = await rule({ name: 'There', subject: 'shared', projectId: other, environmentIds: [otherDev] })
+    const token = await signed({ sub: 'shared' })
+    const neither = await exchange({ token })
+    expect({
+      neither: `${neither.status} ${neither.body.error}`,
+      // Names repeat across organizations, so one never picks a rule
+      byName: (await exchange({ token, project: 'Workloads Too' })).status,
+      byId: (await exchange({ token, project: projectId })).body.projectId,
+      byRule: (await exchange({ token, rule: id })).body.projectId,
+    }).toEqual({
+      neither: '409 Several trust rules accept this JWT: name the project or the rule',
+      byName: 403,
+      byId: projectId,
+      byRule: other,
+    })
+  })
+
+  test('External Secrets Operator\'s Doppler provider logs in with its service account and downloads an environment', async () => {
+    const { id } = await rule({ name: 'ESO', subject: 'system:serviceaccount:external-secrets:sigillo' })
+    // As ESO's Doppler client sends them: the token as Basic auth user name
+    const doppler = async (path: string, { token, ...init }: RequestInit & { token?: string } = {}) => {
+      const headers = new Headers(init.headers)
+      if (token !== undefined) headers.set('authorization', `Basic ${btoa(`${token}:`)}`)
+      const res = await app.handle(new Request(`http://e.ly${path}`, { ...init, headers }))
+      const text = await res.text()
+      return { status: res.status, body: res.headers.get('content-type')?.includes('json') ? JSON.parse(text) as Record<string, unknown> : text }
+    }
+    const login = (identity: string, token: string) => doppler('/v3/auth/oidc', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ identity, token }),
+    })
+    const serviceAccountToken = await signed({ sub: 'system:serviceaccount:external-secrets:sigillo', aud: [AUDIENCE, 'secretStore:payments:sigillo'] })
+    const loggedIn = await login(id, serviceAccountToken)
+    const token = (loggedIn.body as { token: string }).token
+    const secrets = '/v3/configs/config/secrets/download'
+    expect({
+      loggedIn: { ...loggedIn, body: { ...loggedIn.body as object, token: token.startsWith('sig_'), expires_at: /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test((loggedIn.body as { expires_at: string }).expires_at) } },
+      otherIdentity: await login('01NOTARULE', serviceAccountToken),
+      projects: await doppler('/v3/projects', { token }),
+      all: await doppler(`${secrets}?project=${projectId}&config=dev`, { token }),
+      // Without a config, the rule's only environment
+      one: await doppler(`${secrets}?project=Workloads&secrets=DB_URL`, { token }),
+      env: await doppler(`${secrets}?config=dev&format=env`, { token, headers: { accept: 'text/plain' } }),
+      nameTransformer: await doppler(`${secrets}?config=dev&name_transformer=camel`, { token }),
+      otherProject: await doppler(`${secrets}?project=Elsewhere&config=dev`, { token }),
+      noToken: await doppler('/v3/projects'),
+    }).toEqual({
+      loggedIn: { status: 200, body: { success: true, token: true, expires_at: true } },
+      otherIdentity: { status: 403, body: { success: false, messages: [`No trust rule accepts this JWT (issuer ${ISSUER}, subject system:serviceaccount:external-secrets:sigillo, audience ["${AUDIENCE}","secretStore:payments:sigillo"])`] } },
+      projects: { status: 200, body: { success: true, projects: [{ id: projectId, slug: projectId, name: 'Workloads', created_at: expect.any(String) }] } },
+      all: { status: 200, body: { DB_URL: 'dev-db', API_KEY: 'dev-key' } },
+      one: { status: 200, body: { DB_URL: 'dev-db' } },
+      env: { status: 200, body: "DB_URL='dev-db'\nAPI_KEY='dev-key'\n" },
+      nameTransformer: { status: 400, body: { success: false, messages: ['Sigillo keeps secret names as they are: remove nameTransformer'] } },
+      otherProject: { status: 403, body: { success: false, messages: ['This token belongs to another project'] } },
+      noToken: { status: 401, body: { success: false, messages: ['Pass a Sigillo API token'] } },
+    })
   })
 })

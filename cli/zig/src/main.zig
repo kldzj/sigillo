@@ -8,12 +8,14 @@ const config = @import("config.zig");
 const client = @import("client.zig");
 const audit = @import("audit.zig");
 const pty = @import("pty.zig");
+const workload = @import("workload.zig");
 
 test {
     // Pull tests from imported files into `zig build test`.
     _ = config;
     _ = pty;
     _ = audit;
+    _ = workload;
 }
 
 const color = @import("color.zig");
@@ -662,7 +664,7 @@ fn meAction(_: Me.Args, opts: Me.Options, global: Global.Options) !void {
 
     const cwd = try config.getCwd(allocator);
 
-    const resolved = try config.resolve(allocator, cwd, .{
+    const resolved = try resolveConfig(allocator, cwd, .{
         .token = global.token,
         .api_url = global.api_url,
     });
@@ -776,7 +778,7 @@ fn setupAction(_: Setup.Args, opts: Setup.Options, global: Global.Options) !void
 
     const cwd = try config.getCwd(allocator);
 
-    const resolved = try config.resolve(allocator, cwd, .{
+    const resolved = try resolveConfig(allocator, cwd, .{
         .token = global.token,
         .api_url = global.api_url,
     });
@@ -1003,7 +1005,7 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
 
     const cwd = try config.getCwd(allocator);
 
-    const resolved = try config.resolve(allocator, cwd, .{
+    const resolved = try resolveConfig(allocator, cwd, .{
         .token = global.token,
         .api_url = global.api_url,
         .project = opts.project,
@@ -1703,8 +1705,46 @@ const EnvironmentContext = struct {
     environment_id: []const u8,
 };
 
+// A command exchanges its workload's JWT once, however often it resolves
+var workload_token: ?[]const u8 = null;
+
+// The configured token, or else one for the JWT of the job or pod this runs
+// in (workload.zig). login saves only tokens it's given, so it doesn't ask.
+fn resolveConfig(allocator: std.mem.Allocator, cwd: []const u8, flags: config.ResolvedConfig) !config.ResolvedConfig {
+    var resolved = try config.resolve(allocator, cwd, flags);
+    if (resolved.token != null) return resolved;
+    const api_url = resolved.api_url orelse return resolved;
+    if (workload_token) |token| {
+        resolved.token = token;
+        return resolved;
+    }
+    const env = try workload.envFromProcess(allocator);
+    if (!workload.hasSource(env)) return resolved;
+    const stderr = getStderr();
+    // The exchange picks among the trust rules of every organization, where
+    // project names repeat
+    if (resolved.project) |project| if (!isProjectId(project)) {
+        try color.err(stderr, "error");
+        try stderr.print(": workload identity needs the project's ID in SIGILLO_PROJECT or --project, not its name {s}\n", .{try color.plain(allocator, project)});
+        std.process.exit(1);
+    };
+    switch (try workload.exchange(allocator, env, api_url, resolved.project)) {
+        .none => {},
+        .token => |token| {
+            workload_token = token;
+            resolved.token = token;
+        },
+        .failed => |message| {
+            try color.err(stderr, "error");
+            try stderr.print(": {s}\n", .{try color.plain(allocator, message)});
+            std.process.exit(1);
+        },
+    }
+    return resolved;
+}
+
 fn resolveApiContext(allocator: std.mem.Allocator, cwd: []const u8, flags: config.ResolvedConfig) !ApiContext {
-    const resolved = try config.resolve(allocator, cwd, flags);
+    const resolved = try resolveConfig(allocator, cwd, flags);
     return .{
         .api_url = resolved.api_url orelse return error.NoApiUrl,
         .token = resolved.token orelse return error.NotLoggedIn,
@@ -1712,7 +1752,7 @@ fn resolveApiContext(allocator: std.mem.Allocator, cwd: []const u8, flags: confi
 }
 
 fn resolveProjectContext(allocator: std.mem.Allocator, cwd: []const u8, flags: config.ResolvedConfig) !ProjectContext {
-    const resolved = try config.resolve(allocator, cwd, flags);
+    const resolved = try resolveConfig(allocator, cwd, flags);
     return .{
         .api = .{
             .api_url = resolved.api_url orelse return error.NoApiUrl,
@@ -1725,7 +1765,7 @@ fn resolveProjectContext(allocator: std.mem.Allocator, cwd: []const u8, flags: c
 // The CLI stores the chosen env reference as-is. New setups store slugs,
 // older configs may still store raw IDs, and the API resolves either form.
 fn resolveEnvironmentContext(allocator: std.mem.Allocator, cwd: []const u8, flags: config.ResolvedConfig) !EnvironmentContext {
-    const resolved = try config.resolve(allocator, cwd, flags);
+    const resolved = try resolveConfig(allocator, cwd, flags);
     return .{
         .api = .{
             .api_url = resolved.api_url orelse return error.NoApiUrl,
@@ -4646,4 +4686,49 @@ test "requests with a token never follow a redirect" {
     const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.baseUrl(allocator), .path = "/api/v0/me", .token = "tok123" });
     thread.join();
     try std.testing.expectError(error.ApiUrlRedirected, result);
+}
+
+test "a GitHub job gets a JWT for this server from GitHub, and exchanges it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var server = try ScriptedServer.init();
+    defer server.inner.server.deinit();
+    const base = try server.inner.baseUrl(allocator);
+
+    const responses = [_][]const u8{
+        try httpResponse(allocator, 200, "{\"value\":\"github-jwt\"}"),
+        try httpResponse(allocator, 200, "{\"token\":\"sig_workload\",\"expiresAt\":1}"),
+    };
+    const thread = try std.Thread.spawn(.{}, ScriptedServer.serve, .{ &server, &responses });
+    const outcome = workload.exchange(allocator, .{
+        .github_url = try std.fmt.allocPrint(allocator, "{s}/github-token?api-version=2.0", .{base}),
+        .github_token = "request-token",
+    }, base, "payments");
+    std.posix.shutdown(server.inner.server.stream.handle, .both) catch {};
+    thread.join();
+    try std.testing.expectEqualStrings("sig_workload", (try outcome).token);
+    const port = server.inner.server.listen_address.getPort();
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "GET /github-token?api-version=2.0&audience=http%3A%2F%2F127.0.0.1%3A{d} HTTP/1.1", .{port}), server.line(0));
+    try std.testing.expectEqualStrings("POST /api/v0/workload/token HTTP/1.1", server.line(1));
+}
+
+test "a pod's JWT goes to the server with the project, and a refusal says what the server saw" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var server = try OneShotServer.init();
+    defer server.server.deinit();
+
+    const refusal = try httpResponse(allocator, 403, "{\"error\":\"No trust rule accepts this JWT (issuer https://k8s.test, subject system:serviceaccount:payments:api, audience \\\"https://secrets.test\\\")\"}");
+    const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, refusal });
+    const outcome = workload.exchange(allocator, .{ .token = " pod-jwt\n" }, try server.baseUrl(allocator), "payments");
+    thread.join();
+    try std.testing.expectEqualStrings(
+        "the server refused the workload's JWT (403): No trust rule accepts this JWT (issuer https://k8s.test, subject system:serviceaccount:payments:api, audience \"https://secrets.test\")",
+        (try outcome).failed,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, server.request(), "\r\n\r\n{\"token\":\"pod-jwt\",\"project\":\"payments\"}"));
 }

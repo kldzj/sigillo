@@ -16,6 +16,7 @@ Sigillo encrypts every secret, but the key lives in the Worker that decrypts the
 | Anyone who can edit the D1 databases | Make any account that can sign in an org admin, change the history | A dedicated account, [protected environments](#4-limit-access-inside-sigillo), [the signed history](#6-check-the-history) |
 | Anyone with `~/.sigillo/selfhost.json` and its passphrase | Decrypt a database export or backup and use the sessions in an export, sign history rows, and with a saved login deploy to the account | [The passphrase](#2-protect-the-deploy-file) |
 | Anyone who can sign in | What their org role and project access allow | [The sign-in allowlist](#3-decide-who-can-sign-in) |
+| A CI job or pod that a trust rule accepts | What the rule grants, with a token of one hour | [Narrow trust rules](./workload-identity.mdx) |
 | Anyone with a stolen browser session or CLI login | What that person can read and change, except protected environments, and admin actions in an org that has one | [Passkeys](#5-require-a-passkey-for-production) |
 | Org admins | Every project and environment of their org | [Few admins](#4-limit-access-inside-sigillo) |
 
@@ -93,6 +94,8 @@ npx @kldzj/sigillo self-host --reset-passkeys you@acme.com
 ```
 
 **Machine tokens.** CI and servers can't use a passkey. For them, an org admin creates a token on the **Tokens** tab with **Machine token** checked. Making it takes the admin's passkey, also before the organization has a protected environment, so a stolen admin session can't leave one behind that reads environments protected later. It expires after 90 days at most, reads and changes protected environments without a passkey, and stops working when its creator is no longer an admin. The **Tokens** tab marks it **Machine**. Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
+
+**Workload identity.** Better than a machine token for GitHub Actions and Kubernetes: nothing is stored. A trust rule accepts the JWT a job or pod gets from its platform and gives it a token of one hour. Rules take the same approval as machine tokens, may read protected environments on the same terms, and expire after 90 days at most when they do. See [Workload identity](./workload-identity.mdx).
 
 ## 6. Check the history
 

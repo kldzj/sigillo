@@ -1,0 +1,149 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Workload identity'
+sidebarTitle: 'Workload identity'
+description: 'GitHub Actions jobs and Kubernetes pods read secrets with the identity their platform gives them, instead of a stored token. External Secrets Operator works the same way.'
+icon: lucide:fingerprint
+---
+
+A token stored in CI or in a cluster works for anyone who copies it, until it expires. With workload identity nothing is stored. A GitHub Actions job or a Kubernetes pod gets a JWT from its platform, which says which repository and environment, or which service account, it runs as. Sigillo exchanges that JWT for a token of one hour when a **trust rule** of the project accepts it.
+
+## Trust rules
+
+Org admins add rules on a project's **Tokens** tab, under **Workload identities**, and each change takes their passkey. A rule names:
+
+- the **issuer** whose keys signed the JWT: GitHub Actions, a cluster, or another OIDC issuer
+- the **audience** the JWT must be for, your instance's URL unless you change it, so a JWT made for another service doesn't work here
+- the **subject**, exactly, and any further claims, each exactly. There are no wildcards.
+- the environments its tokens may use, and whether they may use protected ones
+- when it expires: after 7 to 365 days, and 90 at most when it reaches protected environments
+
+A token from a rule acts for the admin who made it, for as long as they are an admin. Workloads name the project by its ID in `SIGILLO_PROJECT`, not by its name: names repeat across organizations, and another organization's admin could otherwise make a rule for your workload in a project named like yours. Deleting the rule ends its tokens at once. The read log names the job or pod behind each read, such as `Deploy · acme/api environment production run 8123.1 (workload)`, and the rule's history button lists its last 20 tokens.
+
+## GitHub Actions
+
+Choose **GitHub Actions**, then the repository and the GitHub environment its jobs declare. The rule accepts jobs of that environment only. Without an environment, it accepts jobs on a branch. Repositories created or renamed since 15 July 2026 carry their owner's ID and their own in the subject, such as `repo:acme@65/api@74:environment:production`. Older ones carry only names, `repo:acme/api:environment:production`, unless switched to IDs in their OIDC settings. The rule needs the IDs either way, which `gh api repos/acme/api --jq '.owner.id, .id'` prints: after a rename, someone else can take the old name, but not the IDs.
+
+The job needs `id-token: write` to ask GitHub for a JWT. With no `SIGILLO_TOKEN` set, the CLI asks for one and exchanges it:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - run: npx @kldzj/sigillo run -- ./deploy.sh
+        env:
+          SIGILLO_API_URL: ${{ vars.SIGILLO_API_URL }}
+          SIGILLO_PROJECT: ${{ vars.SIGILLO_PROJECT }}
+          SIGILLO_ENVIRONMENT: prod
+```
+
+For protected environments, name a GitHub environment with **required reviewers**. Someone then approves each deployment, and pushing to a branch isn't enough to read production.
+
+When a rule refuses a job, the error shows the subject GitHub sent.
+
+## Kubernetes
+
+A pod gets its JWT as a projected service account token, with your instance as its audience:
+
+```yaml
+spec:
+  serviceAccountName: api
+  containers:
+    - name: api
+      command: ["sigillo", "run", "--", "node", "server.js"]
+      env:
+        - name: SIGILLO_API_URL
+          value: https://secrets.acme.com
+        - name: SIGILLO_PROJECT
+          value: 01K5ZQ4N7Y3B8XW2VJ6HT9RMCE   # the project's ID
+        - name: SIGILLO_ENVIRONMENT
+          value: prod
+        - name: SIGILLO_OIDC_TOKEN_FILE
+          value: /var/run/secrets/sigillo/token
+      volumeMounts:
+        - name: sigillo-token
+          mountPath: /var/run/secrets/sigillo
+          readOnly: true
+  volumes:
+    - name: sigillo-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: https://secrets.acme.com
+              expirationSeconds: 600
+```
+
+The rule: **Kubernetes**, the namespace and the service account (subject `system:serviceaccount:payments:api`), and the service account's UID, so an account deleted and made again under the same name isn't trusted: `kubectl get serviceaccount api -n payments -o jsonpath='{.metadata.uid}'`.
+
+Sigillo checks the JWT's signature with the cluster's public keys. Clusters on EKS, GKE and AKS publish them: choose **Public issuer**. For a cluster Cloudflare can't reach, such as k3s at home, paste them:
+
+```bash
+kubectl get --raw /.well-known/openid-configuration | jq -r .issuer   # the issuer
+kubectl get --raw /openid/v1/jwks                                       # the keys
+```
+
+When the cluster rotates its signing key, paste the new keys with the key button on the rule. Until you do, JWTs signed with the new key are refused.
+
+Sigillo can't see into the cluster: the JWT of a deleted pod works until it expires. `expirationSeconds: 600`, the shortest Kubernetes allows, keeps that short.
+
+Other platforms work too: put the JWT in `SIGILLO_OIDC_TOKEN`, as GitLab's `id_tokens` can, and add a rule with **Other issuer**.
+
+## External Secrets Operator
+
+[External Secrets Operator](https://external-secrets.io) copies an environment into a Kubernetes Secret through its Doppler provider, whose requests Sigillo answers. Point its controller at your instance with the `DOPPLER_BASE_URL` environment variable, with the Helm chart's `extraEnv` for example. It applies to every Doppler store in the cluster.
+
+```yaml
+extraEnv:
+  - name: DOPPLER_BASE_URL
+    value: https://secrets.acme.com
+```
+
+Add a **Kubernetes** rule for the service account the store names (below, `sigillo` in `payments`), and a store with the rule's ID as its identity. The copy button on the rule copies the ID.
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: sigillo
+  namespace: payments
+spec:
+  provider:
+    doppler:
+      project: payments   # the project's name or ID
+      config: prod        # the environment's slug
+      auth:
+        oidcConfig:
+          identity: 01K5...   # the trust rule's ID
+          serviceAccountRef:
+            name: sigillo
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: api
+  namespace: payments
+spec:
+  secretStoreRef:
+    name: sigillo
+  target:
+    name: api-secrets
+  dataFrom:
+    - find:
+        name:
+          regexp: .*
+```
+
+ESO gets a new token every hour, and every refresh shows in the read log. A `sig_` token in a Kubernetes Secret works as `auth.secretRef.dopplerToken` too, but then a token is stored again. Either way the values end up in a Kubernetes Secret, which anyone who can read Secrets in that namespace can read: `sigillo run` in the pod keeps them out of the cluster.
+
+## What a rule can't stop
+
+- A job or pod the rule accepts reads what the rule grants, and its token works for up to an hour. Scope each rule to the environments its workload needs, and delete it to cut the workload off at once.
+- Whoever can change a workflow or a pod that runs as the rule's subject gets its access. For GitHub, protect the branch or the environment the rule names, and don't trust a workflow triggered by `pull_request_target` that checks out a pull request's code.
+- A JWT copied out of a job can be exchanged until it expires, about five minutes for GitHub's. Each exchange shows in the rule's history.

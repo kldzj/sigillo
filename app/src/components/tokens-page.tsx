@@ -5,7 +5,8 @@
 // create dialog has a "copy key" step before closing. Admins can make a
 // machine token, which uses protected environments without a passkey: it
 // takes their own passkey approval for those environments first, and expires
-// after 90 days at most.
+// after 90 days at most. Below, admins manage workload identities
+// (trust-rules.tsx).
 
 "use client"
 
@@ -30,6 +31,7 @@ import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
 import { cn, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatIp } from "sigillo-app/src/lib/utils"
 import { createTokenAction, deleteTokenAction } from "../actions.ts"
 import { withStepUp } from "./step-up.ts"
+import { WorkloadIdentities } from "./trust-rules.tsx"
 
 
 export function TokensPage() {
@@ -68,6 +70,8 @@ export function TokensPage() {
         environments={environments}
         isAdmin={isAdmin}
       />
+
+      {isAdmin && <WorkloadIdentities />}
     </>
   )
 }

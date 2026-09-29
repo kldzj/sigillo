@@ -58,11 +58,11 @@ async function actorNames(actors: (string | null)[]): Promise<Map<string, string
   const ids = (prefix: string) => [...new Set(actors.filter((a): a is string => !!a?.startsWith(prefix)).map((a) => a.slice(prefix.length)))]
   const [users, tokens] = await Promise.all([
     db.query.user.findMany({ where: { id: { in: ids('user:') } }, columns: { id: true, name: true } }),
-    db.query.apiToken.findMany({ where: { id: { in: ids('token:') } }, columns: { id: true, name: true } }),
+    db.query.apiToken.findMany({ where: { id: { in: ids('token:') } }, columns: { id: true, name: true, workload: true } }),
   ])
   return new Map<string, string>([
     ...users.map((u) => [`user:${u.id}`, u.name] as const),
-    ...tokens.map((t) => [`token:${t.id}`, `${t.name} (token)`] as const),
+    ...tokens.map((t) => [`token:${t.id}`, `${t.name} (${t.workload ? 'workload' : 'token'})`] as const),
   ])
 }
 
@@ -810,18 +810,50 @@ export const app = new Spiceflow({ tracer })
     const session = await requirePageSession(request)
     const access = await requirePageProjectAccess(session.userId, projectId)
 
-    const tokens = await db.query.apiToken.findMany({
-      where: { projectId },
-      with: {
-        creator: { columns: { id: true, name: true } },
-        environments: { with: { environment: { columns: { id: true, name: true } } } },
-      },
-      orderBy: { createdAt: 'desc' },
-    })
+    const isAdmin = access?.role === 'admin'
+    const [tokens, rules] = await Promise.all([
+      // Tokens workloads got for their JWTs show under their trust rule
+      db.query.apiToken.findMany({
+        where: { projectId, workload: { isNull: true } },
+        with: {
+          creator: { columns: { id: true, name: true } },
+          environments: { with: { environment: { columns: { id: true, name: true } } } },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      isAdmin
+        ? db.query.trustRule.findMany({
+          where: { projectId },
+          with: {
+            creator: { columns: { name: true } },
+            tokens: { columns: { id: true, name: true, createdAt: true, expiresAt: true, lastUsedIp: true }, orderBy: { createdAt: 'desc' }, limit: 20 },
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+        : [],
+    ])
 
     return {
       projectId,
-      isAdmin: access?.role === 'admin',
+      isAdmin,
+      origin: getRequestOrigin(request),
+      rules: rules.map((rule) => ({
+        id: rule.id,
+        name: rule.name,
+        issuer: rule.issuer,
+        discovered: rule.jwksUri !== null,
+        keyIds: rule.jwks.keys.map((key) => String(key.kid ?? '')).filter(Boolean),
+        audience: rule.audience,
+        subject: rule.subject,
+        claims: rule.claims,
+        environmentIds: rule.environmentIds,
+        protectedAccess: rule.protectedAccess,
+        createdBy: rule.creator?.name ?? '—',
+        createdAt: rule.createdAt,
+        expiresAt: rule.expiresAt,
+        lastUsedAt: rule.lastUsedAt,
+        exchanges: rule.tokens,
+      })),
       tokens: tokens.map((t) => ({
         id: t.id,
         name: t.name,

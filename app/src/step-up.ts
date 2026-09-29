@@ -225,6 +225,13 @@ export async function requireMachineTokenApproval({ userId, sessionId, projectId
   expiresInDays: number
 }) {
   if (expiresInDays > MACHINE_TOKEN_MAX_DAYS) throw new Error(`A machine token expires after ${MACHINE_TOKEN_MAX_DAYS} days at most`)
+  await requireAdminWithPasskey({ userId, sessionId, projectId })
+}
+
+// A trust rule gives standing access to whatever its issuer vouches for, like
+// a machine token: made, changed and deleted by an org admin with their
+// passkey every time (workload.ts)
+export async function requireAdminWithPasskey({ userId, sessionId, projectId }: { userId: string; sessionId: string; projectId: string }) {
   await requireMachineTokenDeletion({ userId, sessionId, projectId })
   if (!await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
 }
