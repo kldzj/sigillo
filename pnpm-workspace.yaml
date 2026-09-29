@@ -7,3 +7,11 @@ onlyBuiltDependencies:
   - esbuild
   - sharp
   - workerd
+
+# Fixed versions of vulnerable packages that their parents pin exactly: undici
+# and sharp by miniflare (through wrangler), @opentelemetry/core by the Strada
+# SDK's metrics exporter. Remove each once its parent moves past it.
+overrides:
+  'undici@<7.29.1': 7.29.1
+  'sharp@<0.35.4': 0.35.4
+  '@opentelemetry/core@<2.8.0': 2.10.0
