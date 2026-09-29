@@ -78,7 +78,7 @@
     "tsx": "^4.23.1",
     "typescript": "latest",
     "vite": "latest",
-    "vitest": "^4.1.10",
+    "vitest": "^4.1.11",
     "wrangler": "^4.114.0"
   }
 }
