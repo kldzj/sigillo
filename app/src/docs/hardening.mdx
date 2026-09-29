@@ -12,7 +12,7 @@ Sigillo encrypts every secret, but the key lives in the Worker that decrypts the
 
 Cloudflare hides a secret's value once it's set, in the dashboard and in Wrangler. Code running in the Worker can still read it, so **anyone who can deploy Workers on the account can read every secret**. Anyone who can edit its D1 databases can make any account that signs in an org admin.
 
-- Deploy into an account that holds nothing but Sigillo: `npx @kldzj/sigillo self-host --account <id>`.
+- Deploy into an account that holds nothing but Sigillo: `npx @kldzj/sigillo self-host --account <id>`. Workers Paid is per account, so on Workers Paid it needs its own plan.
 - Keep its members few. Under **Manage Account → Members**, a Super Administrator can turn on **2FA Enforcement**, so every member needs two-factor authentication.
 - Give people who only need to look a read-only role, such as **Administrator Read Only** or **Workers Platform (Read-only)**. **Administrator** and **Workers Platform Admin** can deploy Workers.
 

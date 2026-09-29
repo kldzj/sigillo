@@ -590,6 +590,10 @@ async function selfHost(options: SelfHostOptions) {
   if (!allowedUsers) {
     clack.log.warn('Anyone with a Google account can sign in. Limit it: npx @kldzj/sigillo self-host --allowed-users acme.com')
   }
+  // A dashboard page often takes more CPU than the free plan allows per request
+  if (!workerExists) {
+    clack.log.info("On Cloudflare's free plan, a dashboard page fails now and then with error 1102 (Worker exceeded resource limits); Workers Paid, $5 a month, avoids that. See https://sigillo.kldzj.dev/docs/self-hosting#the-free-plan")
+  }
   clack.outro('Done')
 }
 

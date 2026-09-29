@@ -12,13 +12,17 @@ Run Sigillo on **your own Cloudflare account** with a single command. No git clo
 npx @kldzj/sigillo self-host
 ```
 
-The command provisions **two Workers and their D1 databases** on your account: the Sigillo app and its own login provider. It applies the database migrations, uploads the release, and prints your instance URL. The whole thing runs on Cloudflare's **free plan**, and depends on no one else's servers.
+The command provisions **two Workers and their D1 databases** on your account: the Sigillo app and its own login provider. It applies the database migrations, uploads the release, and prints your instance URL. It depends on no one else's servers.
 
 ## What you need
 
-- A Cloudflare account. One that holds nothing but Sigillo is best: see the [hardening checklist](./hardening.mdx#1-give-sigillo-its-own-cloudflare-account).
+- A Cloudflare account. The free plan works, with a dashboard page failing now and then; Workers Paid, $5 a month, avoids that (see [below](#the-free-plan)). One that holds nothing but Sigillo is best: see the [hardening checklist](./hardening.mdx#1-give-sigillo-its-own-cloudflare-account).
 - Node.js, to run `npx`.
 - A Google Cloud project, where you create the OAuth client people sign in with. The command tells you what to enter.
+
+### The free plan
+
+The free plan allows 10 ms of CPU per request. A page of the dashboard often takes 10 to 40 ms: Cloudflare lets that through most of the time, but stops a Worker that keeps going over the limit with error 1102, `Worker exceeded resource limits`. So on the free plan, expect a dashboard page to fail now and then; loading it again usually works. Workers Paid, $5 a month per account, allows 30 seconds, and its included requests and CPU time are far more than an instance uses. D1 is billed separately, and an instance stays within its included amounts.
 
 ## What the command does
 

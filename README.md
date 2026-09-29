@@ -71,7 +71,7 @@ Values that look random are **redacted** from the command's output, so keys and 
 - [Workload identity](https://sigillo.kldzj.dev/docs/workload-identity): GitHub Actions jobs and Kubernetes pods read secrets without a stored token, and External Secrets Operator works through its Doppler provider
 
 **Your own infrastructure**
-- [One command](https://sigillo.kldzj.dev/docs/self-hosting) deploys it to Cloudflare Workers and D1, on the free plan
+- [One command](https://sigillo.kldzj.dev/docs/self-hosting) deploys it to Cloudflare Workers and D1: on the free plan, with a dashboard page failing now and then, or on Workers Paid ($5 a month)
 - Values encrypted with AES-256-GCM, [key rotation](https://sigillo.kldzj.dev/docs/rotate-key), and [encrypted backups](https://sigillo.kldzj.dev/docs/backups)
 - A [REST API](https://sigillo.kldzj.dev/docs/api) with an OpenAPI description
 
