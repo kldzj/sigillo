@@ -1,0 +1,44 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Deploy Sigillo from source'
+sidebarTitle: 'Deploy from source'
+description: 'Run Sigillo and its login provider locally from a clone of the repository, and deploy them with your own wrangler configuration.'
+icon: lucide:git-branch
+---
+
+`self-host` deploys a release without a clone or a build. To run your own changes instead:
+
+1. Clone the repo and install dependencies:
+
+```bash
+git clone https://github.com/kldzj/sigillo.git
+cd sigillo && pnpm install
+```
+
+2. Create `provider/.dev.vars` (requires a Google OAuth client with `<provider-url>/api/auth/callback/google` as redirect URI):
+
+```
+BETTER_AUTH_SECRET=<any random string>
+GOOGLE_CLIENT_ID=<your Google OAuth client ID>
+GOOGLE_CLIENT_SECRET=<your Google OAuth client secret>
+```
+
+3. Create `app/.dev.vars`:
+
+```
+BETTER_AUTH_SECRET=<any random string>
+ENCRYPTION_KEY=<output of: openssl rand -base64 32>
+```
+
+To limit who can sign in, set the same `ALLOWED_USERS=acme.com,ops@partner.io` in both files, and as a secret on both Workers when you deploy.
+
+4. Run both locally:
+
+```bash
+pnpm --dir provider dev
+pnpm --dir app dev
+```
+
+5. To deploy, add an environment for your account to `provider/wrangler.jsonc` and `app/wrangler.jsonc` (your D1 databases, `BETTER_AUTH_URL` for the provider and `PROVIDER_URL` for the app, plus the `global_fetch_strictly_public` compatibility flag on the app when both Workers share a workers.dev subdomain), then deploy the provider first and the app second.
+
+The app registers itself with its provider on first request via [RFC 7591](https://tools.ietf.org/html/rfc7591) dynamic client registration.

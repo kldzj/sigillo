@@ -1,0 +1,63 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Update and maintain your instance'
+sidebarTitle: 'Update and maintain'
+description: 'Update your self-hosted Sigillo, look after the deploy file that holds its keys, deploy with an API token, and choose your own encryption key.'
+icon: lucide:refresh-cw
+---
+
+## Update
+
+Re-run the same command anytime to **update** to the latest release:
+
+```bash
+npx @kldzj/sigillo self-host
+```
+
+Re-runs are **idempotent**: only new database migrations are applied, unchanged assets are skipped, and no key is ever changed, so your stored secrets stay decryptable and your users stay signed in. The encryption key changes only when you [rotate it](./rotate-key.mdx).
+
+Each version of `@kldzj/sigillo` deploys its own release, which is why `npx @kldzj/sigillo` without a version updates to the latest one. The bundle holds the code that runs with your secrets, so the CLI checks it against the SHA-256 that CI recorded in the npm package when it built both, and deploys nothing that doesn't match. It also refuses to deploy a version older than the one your instance runs, unless you pass `--allow-downgrade`.
+
+A deployment that already signs in through another provider, such as one made with upstream Sigillo's `self-host` against `auth.sigillo.dev`, keeps that provider on update: switching would give every user a new login.
+
+New deployments get their own `ENCRYPTION_KEY`, separate from the `BETTER_AUTH_SECRET` that signs sessions. Deployments made before there was an `ENCRYPTION_KEY` keep deriving their key from `BETTER_AUTH_SECRET`.
+
+## Your deploy file
+
+`self-host` saves everything it needs to update your instance in `~/.sigillo/selfhost.json` on the machine that ran it:
+
+- `BETTER_AUTH_SECRET`, which signs every session and the history
+- `ENCRYPTION_KEY`, or the key ring of a [rotation](./rotate-key.mdx), which decrypts every secret
+- the login provider's secret and your Google OAuth client
+- the key your [backups](./backups.mdx) are encrypted to
+- the Cloudflare login, if you signed in with the browser
+
+It is the only copy outside the Workers: Cloudflare doesn't hand secrets back. The file is **encrypted with a passphrase** of at least 12 characters, chosen on the first run, and each run asks for it once. Keep the passphrase in your password manager; the file can then stay where it is.
+
+**Back up the file, and don't lose the passphrase.** A database backup cannot be decrypted without the keys, and if the worker and the file are both lost, `self-host` refuses to reuse that database.
+
+Runs without a terminal, such as CI, read the passphrase from `SIGILLO_SELFHOST_PASSPHRASE`. A file from before encryption is encrypted on the next run in a terminal, if you agree, or right away when the variable is set. To change the passphrase:
+
+```bash
+npx @kldzj/sigillo self-host --change-passphrase
+```
+
+## Deploy with an API token
+
+Deploy with an API token instead of the browser login, and the file holds no Cloudflare login:
+
+```bash
+CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host
+```
+
+When you create the token under **My Profile → API Tokens**, set a **TTL** so it stops working on its own, and **Client IP Address Filtering** for the machine you deploy from. A browser login you saved before stays in the file, encrypted, and is used again unless you pass a token.
+
+## Your own encryption key
+
+Optional. To choose the key yourself instead of getting a random one, set `SIGILLO_ENCRYPTION_KEY` on the **first** deploy:
+
+```bash
+SIGILLO_ENCRYPTION_KEY="$(openssl rand -base64 32)" npx @kldzj/sigillo self-host
+```
+
+It must be 32 bytes, base64-encoded. It is bound as the worker's `ENCRYPTION_KEY` secret and saved in `~/.sigillo/selfhost.json`. It cannot be set on an existing deployment, because a new key would make its stored secrets unreadable: [rotate](./rotate-key.mdx) instead.

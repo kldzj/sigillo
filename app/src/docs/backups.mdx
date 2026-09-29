@@ -1,0 +1,31 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Back up and restore your instance'
+sidebarTitle: 'Back up and restore'
+description: 'Save both databases of your Sigillo instance in an encrypted file, restore it into fresh databases after checking its history, or go back with Cloudflare time travel.'
+icon: lucide:archive
+---
+
+There are two ways back to an earlier state: backups of your own, which you keep outside Cloudflare, and Cloudflare's time travel, which keeps the last 30 days of each database (7 on the Free plan).
+
+## Make a backup
+
+```bash
+npx @kldzj/sigillo self-host --backup
+```
+
+It exports both databases, the app's and the login provider's, into one file, `sigillo-<time>.backup.age` in the current directory, or the file you name (`--backup /backups/sigillo.backup.age`). The file is encrypted with [age](https://age-encryption.org) to a backup key that the first backup adds to `~/.sigillo/selfhost.json`. The values in it stay encrypted with the instance's keys, which aren't in the file, so restoring it needs `selfhost.json` too. Sessions, sign-in codes, passkey approvals and rate limits are left out.
+
+## Restore a backup
+
+```bash
+npx @kldzj/sigillo self-host --restore sigillo-2026-09-29T10-04-05Z.backup.age
+```
+
+It imports the backup into two new databases and checks their history like `sigillo audit verify`: every row's hash and signature. Only then does it update both workers to use the new databases. Everything changed since the backup is gone and everyone signs in again, while API tokens keep working. An `audit verify` that saw newer rows reports the history as shorter. If a step fails, the instance keeps its databases and the new ones are deleted again. After a restore the old databases stay on the account, for you to delete once you're happy.
+
+A restore goes to the deployment the backup came from, on the same account. A backup from a newer Sigillo needs that version's CLI. [Rotating the key](./rotate-key.mdx) also replaces the backup key, so older backups can't be opened any more.
+
+## Cloudflare's time travel
+
+Cloudflare keeps a point-in-time history of each D1 database for 30 days on Workers Paid, 7 on Free. `wrangler d1 time-travel restore sigillo-db --timestamp=<unix time>` overwrites the database with that point and prints a bookmark that undoes it. Restored data is only readable with the keys in `selfhost.json`: a point from before a key rotation holds values under the old key, which the rotation removed. If the last `sigillo audit verify` came after the point you restored, it then reports the history as shorter.

@@ -33,9 +33,9 @@ Cloudflare hides a secret's value once it's set, in the dashboard and in Wrangle
 `npx @kldzj/sigillo self-host` saves everything it needs to update your instance in `~/.sigillo/selfhost.json` on the machine that ran it:
 
 - `BETTER_AUTH_SECRET`, which signs every session and the history
-- `ENCRYPTION_KEY`, or the key ring of a [rotation](./self-hosting.mdx#rotate-the-encryption-key), which decrypts every secret
+- `ENCRYPTION_KEY`, or the key ring of a [rotation](./rotate-key.mdx), which decrypts every secret
 - the login provider's secret and your Google OAuth client
-- the key your [backups](./self-hosting.mdx#back-up-and-restore) are encrypted to
+- the key your [backups](./backups.mdx) are encrypted to
 - the Cloudflare login, if you signed in with the browser
 
 It is the only copy outside the Workers: Cloudflare doesn't hand secrets back. The file is encrypted with a passphrase you choose on the first run, and each run asks for it once. Keep the passphrase in your password manager and a backup of the file somewhere else: without both, a lost worker means lost secrets. Runs without a terminal read the passphrase from `SIGILLO_SELFHOST_PASSPHRASE`. A file from before encryption is encrypted on the next run, if you agree.
@@ -56,7 +56,7 @@ By default anyone with a Google account can create an account on your instance. 
 npx @kldzj/sigillo self-host --allowed-users acme.com,ops@partner.io
 ```
 
-The app and its login provider both check the list, and someone taken off it is signed out on their next request. See [Limit who can sign in](./self-hosting.mdx#limit-who-can-sign-in).
+The app and its login provider both check the list, and someone taken off it is signed out on their next request. See [Who can sign in](./self-hosting.mdx#who-can-sign-in).
 
 If your team is a Google Cloud organization, through Google Workspace or Cloud Identity, create the Google OAuth client in a project that belongs to it and set its audience to **Internal** (**Google Auth Platform → Audience**). Google then only signs in members of your organization, before Sigillo's own list is checked.
 
@@ -126,4 +126,4 @@ What it can't catch: the signing key comes from `BETTER_AUTH_SECRET`, so someone
 - **Workers Logs.** Both workers have Cloudflare's Workers Logs on, and `self-host` turns them on again with every deploy. A request's log holds its method, URL and headers: the name of a secret fetched on its own, and the client's IP address. Cloudflare replaces credentials such as the `Authorization` header with `REDACTED`, as `wrangler tail` shows. Logs are kept for 3 days on the Free plan or 7 on Workers Paid, and anyone who can read logs on the account can see them.
 - **Old values.** The event log keeps every value a secret ever had, so an org admin can look up or restore an old one. On an environment's **Event Log** tab, **Purge old values** removes all of them but each secret's current one, with the admin's passkey. The rows stay with who changed what and when, and the history still verifies.
 - **`workers.dev`.** Both workers keep their `workers.dev` URLs, also with a custom domain (`--domain`): `self-host` uses them, and the login provider only has that one.
-- **Backups.** Cloudflare keeps a point-in-time history of each D1 database for 30 days on Workers Paid, 7 on Free. `wrangler d1 time-travel restore sigillo-db --timestamp=<unix time>` overwrites the database with that point and prints a bookmark that undoes it. Restored data is only readable with the keys in `selfhost.json`: a point from before a key rotation holds values under the old key, which the rotation removed. If the last `sigillo audit verify` came after the point you restored, it then reports the history as shorter. For copies outside Cloudflare, `self-host --backup` saves both databases in an encrypted file, and `--restore` checks its history before the workers use it: see [Back up and restore](./self-hosting.mdx#back-up-and-restore).
+- **Backups.** Cloudflare keeps a point-in-time history of each D1 database for 30 days on Workers Paid, 7 on Free. `wrangler d1 time-travel restore sigillo-db --timestamp=<unix time>` overwrites the database with that point and prints a bookmark that undoes it. Restored data is only readable with the keys in `selfhost.json`: a point from before a key rotation holds values under the old key, which the rotation removed. If the last `sigillo audit verify` came after the point you restored, it then reports the history as shorter. For copies outside Cloudflare, `self-host --backup` saves both databases in an encrypted file, and `--restore` checks its history before the workers use it: see [Back up and restore](./backups.mdx).

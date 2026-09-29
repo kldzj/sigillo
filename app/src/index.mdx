@@ -1,7 +1,7 @@
 ---
 $schema: https://holocron.so/frontmatter.json
 title: "Secrets manager, open source Doppler alternative"
-sidebarTitle: "Home"
+sidebarTitle: "Introduction"
 description: "Self-hostable, open source Doppler alternative. Inject encrypted secrets into any command with sigillo run, for humans and AI agents."
 icon: lucide:home
 ---
@@ -14,6 +14,64 @@ import { HeroSection } from './components/hero-section.tsx'
 
 </Above>
 
-import Readme from '../../README.md'
+Sigillo keeps your team's secrets on an instance you run on your own Cloudflare account, and hands them to your commands as environment variables. No `.env` files to pass around, and nothing written to disk.
 
-<Readme />
+```bash
+# instead of this
+source .env && next dev
+
+# do this
+sigillo run -- next dev
+```
+
+## How it works
+
+`sigillo run` fetches the environment's secrets from your instance and starts your command with them as environment variables. It also watches the command's output: values that look random are replaced with `*` before they reach your terminal, a CI log or an AI agent's context.
+
+```diagram
+                                                 ┌────────────────┐
+  sigillo run -- next dev                        │   App Worker   │
+         │                                       │ (your account) │
+         │  1. fetch secrets                     │                │
+         │──────────────────────────────────────▶│  decrypt       │
+         │  { DB_URL, API_KEY, ... }             │  AES-256-GCM   │
+         │◀──────────────────────────────────────│                │
+         │                                       └────────────────┘
+         │  2. spawn child with env vars
+         │
+         ▼
+  ┌──────────────┐
+  │  next dev    │
+  │  (child)     │
+  └──────┬───────┘
+         │
+         │  3. stdout / stderr
+         ▼
+  ┌───────────────┐
+  │   redaction   │  high-entropy values replaced with *
+  │    filter     │  secrets never reach your terminal
+  └──────┬────────┘
+         │
+         ▼
+     terminal
+    (safe output)
+```
+
+## Why Sigillo
+
+- **Your own infrastructure.** An open source alternative to Doppler and Infisical that runs on your Cloudflare account, on the free plan. No per-seat pricing, no vendor, and nothing depends on anyone else's servers. MIT licensed.
+- **For teams.** Organizations, projects and environments, with roles and access per project, instead of `.env` files sent over chat. Switch environments with `-c prod`.
+- **For production.** Reading or changing a protected environment takes a passkey, and every change and every read is recorded in a history your instance signs.
+- **For machines.** Tokens that expire, and workload identity for GitHub Actions and Kubernetes, so CI doesn't store a secret at all.
+- **For AI agents.** Agents run commands with your secrets without seeing their values.
+
+## This fork
+
+This is [kldzj/sigillo](https://github.com/kldzj/sigillo), a fork of [remorses/sigillo](https://github.com/remorses/sigillo) for teams who want tighter control over their secrets: passkeys for production, a signed history of every change and read, key rotation, backups and workload identity. Fixes that suit both go upstream as pull requests. There is no hosted service: every instance runs on its owner's Cloudflare account, with its own Google sign-in. The CLI is published as [`@kldzj/sigillo`](https://www.npmjs.com/package/@kldzj/sigillo), and the [releases](https://github.com/kldzj/sigillo/releases) list what each version adds.
+
+## Where to go next
+
+- **Set it up:** [self-host your instance](./docs/self-hosting.mdx), then follow the [quick start](./docs/quick-start.mdx).
+- **Coming from Doppler:** [migrate a project](./docs/doppler-migration.mdx) without printing a value.
+- **CI and Kubernetes:** [workload identity](./docs/workload-identity.mdx) lets jobs and pods read secrets without a stored token.
+- **Before production:** go through the [hardening checklist](./docs/hardening.mdx).

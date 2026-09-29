@@ -1,4 +1,10 @@
-# Doppler migration
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Migrate from Doppler'
+sidebarTitle: 'Migrate from Doppler'
+description: 'Move a Doppler project into Sigillo, environment by environment, without printing a secret value in the terminal.'
+icon: lucide:arrow-right-left
+---
 
 Move one Doppler project into Sigillo without printing secret values in the terminal.
 
@@ -193,3 +199,7 @@ sigillo run -- pnpm dev
 
 `sigillo setup` stores local CLI config in `~/.sigillo/config.json`. It does not write secrets to the
 repository.
+
+## 12. CI, servers and Kubernetes
+
+Doppler service tokens become Sigillo [API tokens or machine tokens](./hardening.mdx#4-limit-access-inside-sigillo), and GitHub Actions jobs and Kubernetes pods can use [workload identity](./workload-identity.mdx) instead of a stored token. External Secrets Operator keeps its Doppler provider: point it at your instance, as [its section](./workload-identity.mdx#external-secrets-operator) shows.

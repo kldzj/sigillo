@@ -133,7 +133,7 @@ sigillo run -- next dev
 
 That's it. No `.env` files, no copy-pasting keys. Go back to your instance any time to add, edit, or rotate secrets. The next `sigillo run` picks them up automatically.
 
-Migrating from Doppler? See the [Doppler migration guide](https://github.com/kldzj/sigillo/blob/main/docs/doppler-migration.md).
+Migrating from Doppler? See the [Doppler migration guide](https://sigillo.kldzj.dev/docs/doppler-migration).
 
 ## Setting up a new project
 

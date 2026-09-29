@@ -32,9 +32,24 @@
         "icon": "lucide:book-open",
         "groups": [
           {
-            "group": "Getting Started",
+            "group": "Get started",
             "icon": "lucide:rocket",
-            "pages": ["index", "docs/self-hosting", "docs/hardening", "docs/workload-identity"]
+            "pages": ["index", "docs/self-hosting", "docs/quick-start", "docs/doppler-migration"]
+          },
+          {
+            "group": "Use Sigillo",
+            "icon": "lucide:terminal",
+            "pages": ["docs/workload-identity"]
+          },
+          {
+            "group": "Security",
+            "icon": "lucide:shield-check",
+            "pages": ["docs/hardening"]
+          },
+          {
+            "group": "Run your instance",
+            "icon": "lucide:server-cog",
+            "pages": ["docs/updating", "docs/backups", "docs/rotate-key", "docs/from-source"]
           }
         ]
       },

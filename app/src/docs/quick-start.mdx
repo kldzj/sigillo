@@ -1,0 +1,111 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Quick start'
+sidebarTitle: 'Quick start'
+description: 'Install the sigillo CLI, log in to your instance, create a project, add secrets and run your app with them.'
+icon: lucide:play
+---
+
+From a running instance to your app running with its secrets. If you don't have an instance yet, [self-host one](./self-hosting.mdx) first.
+
+## 1. Install the CLI
+
+With **curl**, which downloads the native binary to `~/.sigillo/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kldzj/sigillo/main/app/public/install.sh | bash
+```
+
+With **npm**:
+
+```bash
+npm i -g @kldzj/sigillo
+```
+
+Or run it without installing, with npx or bunx:
+
+```bash
+npx @kldzj/sigillo run -- next dev
+bunx @kldzj/sigillo run -- next dev
+```
+
+## 2. Log in
+
+Point the CLI at your instance:
+
+```bash
+sigillo login --api-url https://sigillo.<your-subdomain>.workers.dev
+```
+
+It opens your instance's device page in the browser. Type the code the terminal shows, sign in with Google, and approve; once you have a passkey, approving takes it. The login is saved in `~/.sigillo/config.json`, and later commands reuse it. When one says `not signed in, or the session expired`, run `sigillo login` again.
+
+## 3. Create an organization and a project
+
+Secrets belong to an environment of a project, and projects to an organization. A new project comes with three environments: **dev**, **preview** and **prod**.
+
+In the web UI, click **Create Organization** in the sidebar, then **New Project** in the organization. Or with the CLI:
+
+```bash
+sigillo orgs create --name my-company
+sigillo orgs                                    # shows the organization's ID
+sigillo projects create --org <ORG_ID> --name my-app
+```
+
+## 4. Link a directory
+
+`sigillo setup` saves the project and environment for the current directory, so commands there don't need flags:
+
+```bash
+sigillo setup                                   # pick them interactively
+sigillo setup --project <PROJECT_ID> --env dev  # or name them
+```
+
+Run it in the root of a single-project repository, or in each app's folder of a monorepo:
+
+```bash
+cd monorepo/api && sigillo setup --project <API_PROJECT_ID> --env dev
+cd monorepo/web && sigillo setup --project <WEB_PROJECT_ID> --env dev
+```
+
+The setting lives in `~/.sigillo/config.json` on your machine, not in the repository, so run `sigillo setup` again after cloning on another machine. You can also skip it and pass `--project` and `-c` to every command.
+
+## 5. Add secrets
+
+Set the values your app needs now, or leave some empty and fill them in later in the web UI:
+
+```bash
+sigillo secrets set DATABASE_URL "postgres://localhost:5432/mydb" -c dev
+sigillo secrets set API_KEY "" -c dev
+```
+
+For keys and auth secrets, generate a random value right away:
+
+```bash
+sigillo secrets set AUTH_SECRET "$(openssl rand -base64 32)" -c dev
+```
+
+In the web UI, open the project and pick the environment's tab to add or edit secrets.
+
+## 6. Run your app
+
+```bash
+sigillo secrets -c dev          # the names, without values
+sigillo run -- next dev         # your app, with the secrets as environment variables
+```
+
+That's it: no `.env` file, and nothing to copy. Change a value on your instance, and the next `sigillo run` picks it up.
+
+## With AI agents
+
+Install the Sigillo skill for coding agents like Claude Code, Cursor or Windsurf:
+
+```bash
+npx -y skills add kldzj/sigillo
+```
+
+Agents should run commands through `sigillo run` instead of reading `.env` files: the command gets the secrets, and its output reaches the agent with values that look random replaced by `*`, even after `printenv`. Inside an agent's shell, `sigillo secrets get` and `sigillo secrets download` refuse to print values unless you pass `--force`.
+
+## Next steps
+
+- CI and Kubernetes without a stored token: [workload identity](./workload-identity.mdx).
+- Before you store production secrets: the [hardening checklist](./hardening.mdx).
