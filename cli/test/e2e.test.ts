@@ -1,6 +1,6 @@
 // End-to-end coverage for the real Sigillo CLI against a logged-in local setup.
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -34,14 +34,14 @@ const currentCwd = resolve(repoRoot)
 
 let cliContext: CliContext
 
+// One build of the binary for every suite in this file
+beforeAll(() => {
+  const build = spawnSync('zig', ['build'], { cwd: cliDir, encoding: 'utf8' })
+  expect(build.status, build.stderr).toBe(0)
+}, 120_000)
+
 describe('sigillo cli e2e', () => {
   beforeAll(async () => {
-    const build = spawnSync('zig', ['build'], {
-      cwd: cliDir,
-      encoding: 'utf8',
-    })
-    expect(build.status, build.stderr).toBe(0)
-
     const resolved = resolveConfiguredAuth(currentCwd)
     const me = await apiRequest({ method: 'GET', path: '/api/v0/me', context: resolved })
     expect(Array.isArray(me.orgs)).toBe(true)
@@ -403,6 +403,40 @@ describe('sigillo cli e2e', () => {
     expect(result.stdout.startsWith('*'.repeat(cliContext.secretValue.length))).toBe(true)
     expect(result.stdout.length).toBe(cliContext.secretValue.length + 25_000_000)
   }, 180_000)
+})
+
+describe('sigillo login', () => {
+  let apiUrl: string
+
+  beforeAll(() => {
+    // Only the server URL: this suite needs no working login
+    apiUrl = resolveConfiguredAuth(currentCwd).apiUrl
+  })
+
+  test('starts the device flow even when a token is saved', async () => {
+    // A saved token that no longer works must not stop `sigillo login`
+    const home = mkdtempSync(join(tmpdir(), 'sigillo-cli-login-'))
+    mkdirSync(join(home, '.sigillo'))
+    writeFileSync(join(home, '.sigillo', 'config.json'), JSON.stringify({ scoped: { '/': { token: 'stale-session-token', 'api-url': apiUrl } } }))
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, APPDATA: home }
+    delete env.SIGILLO_TOKEN
+    delete env.SIGILLO_API_URL
+    const child = spawn(binaryPath, ['login'], { cwd: home, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+    await new Promise<void>((resolveDone) => {
+      const onData = (chunk: Buffer) => {
+        output += chunk.toString('utf8')
+        if (output.includes('/device?user_code=') || output.includes('Saved bearer token')) resolveDone()
+      }
+      child.stdout.on('data', onData)
+      child.stderr.on('data', onData)
+      child.on('close', () => resolveDone())
+    })
+    child.kill('SIGKILL')
+    rmSync(home, { recursive: true, force: true })
+    expect(output).not.toContain('Saved bearer token')
+    expect(output).toContain('/device?user_code=')
+  }, 60_000)
 })
 
 async function runCli({
