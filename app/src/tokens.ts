@@ -201,12 +201,29 @@ export async function stopPreviousValue({ userId, sessionId, request = null, tok
     throw new Error('Its previous value has already stopped working')
   }
   const db = getDb()
-  await db.batch([
-    db.update(schema.apiToken)
-      .set({ previousHashedKey: null, previousExpiresAt: null, previousLastUsedAt: null, previousLastUsedIp: null })
-      .where(orm.eq(schema.apiToken.id, token.id)),
-    tokenEvent({ userId, request, kind: 'token.previous_stopped', token, details: { machine: token.protectedAccess, previousExpiresAt: token.previousExpiresAt } }),
-  ])
+  // Only the value read above: a regeneration since made another value the
+  // previous one, which keeps its grace
+  const unchanged = orm.and(orm.eq(schema.apiToken.id, token.id), orm.eq(schema.apiToken.previousHashedKey, token.previousHashedKey))
+  try {
+    await db.batch([
+      tokenEvent({
+        userId, request, kind: 'token.previous_stopped',
+        // Named only while that value is still the previous one: otherwise
+        // the name is null, and the whole batch fails before the update below
+        // could match nothing
+        token: { ...token, name: orm.sql`(select ${schema.apiToken.name} from ${schema.apiToken} where ${unchanged})` },
+        details: { machine: token.protectedAccess, previousExpiresAt: token.previousExpiresAt },
+      }),
+      db.update(schema.apiToken)
+        .set({ previousHashedKey: null, previousExpiresAt: null, previousLastUsedAt: null, previousLastUsedIp: null })
+        .where(unchanged),
+    ])
+  } catch (error) {
+    const current = await db.query.apiToken.findFirst({ where: { id: token.id }, columns: { previousHashedKey: true } })
+    if (!current) throw new Error('Token not found')
+    if (current.previousHashedKey !== token.previousHashedKey) throw new Error(REGENERATED_MEANWHILE)
+    throw error
+  }
 }
 
 // ── Expiring soon ───────────────────────────────────────────────────

@@ -4760,6 +4760,24 @@ describe('renewals', () => {
     })
   })
 
+  test('stopping the previous value ends only the one the page showed', async () => {
+    const token = await insertApiToken({ name: 'Stop race', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 90 * DAY })
+    await regenerate(token.tokenId)
+    // Another admin's regeneration lands between reading the token and
+    // stopping its previous value, and makes another value the previous one
+    const theirs = await hashTokenKey('sig_previous_meanwhile')
+    const [raced] = await Promise.all([
+      outcome(stopPreviousValue({ ...adminLogin, tokenId: token.tokenId })),
+      getDb().update(schema.apiToken).set({ previousHashedKey: theirs }).where(orm.eq(schema.apiToken.id, token.tokenId)),
+    ])
+    const row = await tokenRow(token.tokenId)
+    expect({ raced, theirsKept: row.previousHashedKey === theirs && row.previousExpiresAt !== null, logged: (await eventsOf(token.tokenId)).map((event) => event.kind) }).toEqual({
+      raced: 'Someone regenerated this token meanwhile: reload the page to see its new value\'s expiry',
+      theirsKept: true,
+      logged: ['token.regenerated'],
+    })
+  })
+
   test('stopping the previous value ends it at once, into the security log', async () => {
     const token = await insertApiToken({ name: 'Stop CI', projectId, createdBy: member.user.id, expiresAt: Date.now() + 90 * DAY })
     const regenerated = await regenerate(token.tokenId, { by: memberLogin })
