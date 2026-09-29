@@ -2,7 +2,8 @@
 // Env select filters events. Eye icon fetches and shows an old value (set
 // events only), which protected environments record in the read log.
 // Badges: green for "set", red for "delete", grey for "purge". Admins can
-// purge the old values, all but each secret's current one.
+// purge the old values, all but each secret's current one. A value that no
+// purge removed shows in red.
 
 "use client";
 
@@ -196,6 +197,10 @@ export function ChangesTable() {
                         </div>
                       ) : evt.purged ? (
                         <span className="text-muted-foreground text-xs italic">purged</span>
+                      ) : evt.removedWithoutPurge ? (
+                        <span className="text-destructive text-xs" title="No purge removed it: it was removed in the database, and the signed history no longer verifies">
+                          value removed without a purge
+                        </span>
                       ) : (
                         <span className="text-muted-foreground text-xs">—</span>
                       )}

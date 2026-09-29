@@ -3,7 +3,7 @@
 // The full deploy path is exercised manually/e2e against a real Cloudflare
 // account (network + credentials required), not here.
 
-import { createHash, webcrypto } from 'node:crypto'
+import { createHash, createHmac, hkdfSync, webcrypto } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -756,6 +756,26 @@ describe('checking a restored history', () => {
       signature: [`environment ${env}, changes row 5 has an invalid signature`],
       read: [`environment ${env}, reads row 1 does not match its hash`],
       wrongSecret: [`environment ${env}, changes row 1 does not match its hash`, `environment ${env}, reads row 1 has an invalid signature`],
+    })
+  })
+
+  test('finds a value removed without a purge, even with its digest kept', async () => {
+    // X's current value, removed with its digest kept in value_digest, as a purge does
+    const current = load()
+    const row = fixture.events.find((e: { seq: number }) => e.seq === 3)
+    const value = await openValue({ ring: undefined, baseKey: baseKeyOf({ betterAuthSecret: secret }), encrypted: row.valueEncrypted, iv: row.iv, slot: { environmentId: env, name: row.name } })
+    const digestKey = Buffer.from(hkdfSync('sha256', secret, new Uint8Array(), 'sigillo audit value digest v1', 32))
+    const digest = createHmac('sha256', digestKey).update(JSON.stringify([env, row.name, value])).digest('base64')
+    current.db.prepare('UPDATE secret_event SET value_encrypted = NULL, iv = NULL, value_digest = ? WHERE seq = 3').run(digest)
+    // Old values set again but never purged: the newest rows, the purges, removed
+    const unpurged = load()
+    unpurged.db.prepare('DELETE FROM secret_event WHERE seq > 5').run()
+    expect({
+      current: (await current.check()).problems,
+      unpurged: (await unpurged.check()).problems,
+    }).toEqual({
+      current: [`environment ${env}, changes row 3 lost its value without a purge`],
+      unpurged: [`environment ${env}, changes row 2 lost its value without a purge`],
     })
   })
 

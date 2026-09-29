@@ -21,7 +21,7 @@ import worker, { app } from './app.js'
 import { getAuth, encrypt, decrypt, hashTokenKey, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions, internalErrorMessage } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
-import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue, purgeOldValues } from './audit.js'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue, purgeOldValues, goneValues } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
 import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
@@ -2803,6 +2803,83 @@ describe('tamper-evident history', () => {
     await getDb().update(schema.secretEvent).set({ valueEncrypted: null, iv: null, valueDigest: (await eventRow(envId, 1)).valueDigest }).where(orm.eq(schema.secretEvent.id, second.id))
     expect({ cleared: cleared.events, swapped: (await verify(envId)).events })
       .toEqual({ cleared: { ok: false, problem: 'row 1 does not match its hash' }, swapped: { ok: false, problem: 'row 2 does not match its hash' } })
+  })
+
+  test('a value removed by hand with its own digest breaks the history, and the history page says so', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'WEBHOOK_URL', 'https://hooks.example/real')
+    await setSecret(admin.token, envId, 'OTHER', 'x')
+    // The audit output hands out every set row's digest in its preimage
+    const digest = JSON.parse((await verify(envId)).chains.events.rows[0]!.preimage)[6] as string
+    // Someone with the database removes the current value as a purge would,
+    // but with no purge row
+    const first = await eventRow(envId, 1)
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: null, iv: null, valueDigest: digest }).where(orm.eq(schema.secretEvent.id, first.id))
+    const after = await verify(envId)
+    expect({
+      events: after.events,
+      valueGone: after.chains.events.rows.map((row) => row.valueGone),
+      // What the history page shows for its rows
+      shown: [...goneValues(await getDb().query.secretEvent.findMany({ where: { environmentId: envId } }))],
+    }).toEqual({
+      events: { ok: false, problem: 'row 1 lost its value without a purge' },
+      valueGone: [true, false],
+      shown: [[first.id, 'removed']],
+    })
+  })
+
+  test('a value emptied or left without its IV by hand counts as removed too', async () => {
+    const emptied = await newEnv()
+    const withoutIv = await newEnv()
+    for (const envId of [emptied, withoutIv]) {
+      await setSecret(admin.token, envId, 'A', 'a')
+      await setSecret(admin.token, envId, 'B', 'b')
+    }
+    const digestOf = async (envId: string) => JSON.parse((await verify(envId)).chains.events.rows[0]!.preimage)[6] as string
+    const first = { emptied: await eventRow(emptied, 1), withoutIv: await eventRow(withoutIv, 1) }
+    // Either way the row takes its digest from value_digest
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: '', valueDigest: await digestOf(emptied) }).where(orm.eq(schema.secretEvent.id, first.emptied.id))
+    await getDb().update(schema.secretEvent).set({ iv: null, valueDigest: await digestOf(withoutIv) }).where(orm.eq(schema.secretEvent.id, first.withoutIv.id))
+    const outcome = async (envId: string) => {
+      const result = await verify(envId)
+      return {
+        events: result.events,
+        valueGone: result.chains.events.rows.map((row) => row.valueGone),
+        shown: [...goneValues(await getDb().query.secretEvent.findMany({ where: { environmentId: envId } }))],
+      }
+    }
+    expect({ emptied: await outcome(emptied), withoutIv: await outcome(withoutIv) }).toEqual({
+      emptied: { events: { ok: false, problem: 'row 1 lost its value without a purge' }, valueGone: [true, false], shown: [[first.emptied.id, 'removed']] },
+      withoutIv: { events: { ok: false, problem: 'row 1 lost its value without a purge' }, valueGone: [true, false], shown: [[first.withoutIv.id, 'removed']] },
+    })
+  })
+
+  test('a purge accounts only for values a later set or delete replaced', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'one')
+    await setSecret(admin.token, envId, 'X', 'two')
+    await purgeOldValues({ environmentId: envId, author: { userId: admin.user.id, apiTokenId: null, sessionId: null } })
+    const purged = await verify(envId)
+    // The current value, removed by hand after the purge with its own
+    // digest: the purge row follows it, but no set or delete in between
+    const current = await eventRow(envId, 2)
+    const digest = JSON.parse(purged.chains.events.rows[1]!.preimage)[6] as string
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: null, iv: null, valueDigest: digest }).where(orm.eq(schema.secretEvent.id, current.id))
+    const after = await verify(envId)
+    const first = await eventRow(envId, 1)
+    expect({
+      purged: purged.events.ok,
+      purgedGone: purged.chains.events.rows.map((row) => row.valueGone),
+      after: after.events,
+      afterGone: after.chains.events.rows.map((row) => row.valueGone),
+      shown: Object.fromEntries(goneValues(await getDb().query.secretEvent.findMany({ where: { environmentId: envId } }))),
+    }).toEqual({
+      purged: true,
+      purgedGone: [true, false, false],
+      after: { ok: false, problem: 'row 2 lost its value without a purge' },
+      afterGone: [true, true, false],
+      shown: { [first.id]: 'purged', [current.id]: 'removed' },
+    })
   })
 
   test('only an org admin purges, with their passkey even where nothing is protected', async () => {

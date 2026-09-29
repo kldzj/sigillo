@@ -21,6 +21,9 @@ pub const ChainRow = struct {
     hash: []const u8,
     signature: []const u8,
     preimage: []const u8,
+    // A set event whose value is no longer in the database. Not part of the
+    // preimage, and absent from older servers.
+    valueGone: bool = false,
 };
 
 pub const AuditResponse = struct {
@@ -74,6 +77,53 @@ pub fn verifyChain(allocator: std.mem.Allocator, public_key: []const u8, rows: [
     }
     if (rows.len == 0) return .{ .ok = null };
     return .{ .ok = .{ .seq = rows.len, .hash = rows[rows.len - 1].hash } };
+}
+
+// A set event's preimage holds its value's digest, so a row whose value was
+// removed in the database verifies like one that was purged. The only way
+// the server removes a value is a purge of an old one: the same name was set
+// again or deleted after it, and purged after that. Any other set event
+// without its value lost it some other way. Returns the first such row.
+pub fn findLostValue(allocator: std.mem.Allocator, rows: []const ChainRow) !?[]const u8 {
+    // Per name, walking from the newest row back: whether a purge comes
+    // later, and whether a set or delete that a purge follows comes later
+    const Later = struct { purge: bool = false, replaced_then_purged: bool = false };
+    var later: std.StringHashMapUnmanaged(Later) = .empty;
+    var lost: ?u64 = null;
+    var i = rows.len;
+    while (i > 0) {
+        i -= 1;
+        const row = rows[i];
+        const event = parseEvent(allocator, row.preimage) orelse {
+            if (row.valueGone) lost = row.seq;
+            continue;
+        };
+        const entry = try later.getOrPut(allocator, event.name);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        const seen = entry.value_ptr;
+        const set = std.mem.eql(u8, event.operation, "set");
+        if (set and row.valueGone and !seen.replaced_then_purged) lost = row.seq;
+        if (std.mem.eql(u8, event.operation, "purge")) {
+            seen.purge = true;
+        } else if (seen.purge and (set or std.mem.eql(u8, event.operation, "delete"))) {
+            seen.replaced_then_purged = true;
+        }
+    }
+    const seq = lost orelse return null;
+    return try std.fmt.allocPrint(allocator, "row {d} lost its value without a purge", .{seq});
+}
+
+const Event = struct { name: []const u8, operation: []const u8 };
+
+// A change's name and operation, from its preimage as app/src/audit.ts
+// builds it: [kind, environment, seq, id, name, operation, digest, actor, created at]
+fn parseEvent(allocator: std.mem.Allocator, preimage: []const u8) ?Event {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, allocator, preimage, .{}) catch return null;
+    if (value != .array or value.array.items.len < 6) return null;
+    const name = value.array.items[4];
+    const operation = value.array.items[5];
+    if (name != .string or operation != .string) return null;
+    return .{ .name = name.string, .operation = operation.string };
 }
 
 fn decodeBase64(out: []u8, input: []const u8) !void {
@@ -254,4 +304,85 @@ test "the witness catches a shortened or rewritten chain" {
     // Rebuilt from row 2 on and signed again: intact on its own, not against the witness
     const rewritten = try testChain(allocator, &.{ "a", "B", "c", "d" });
     try std.testing.expectEqualStrings("row 3 changed since you last verified it", (try compareWithWitness(allocator, seen, rewritten.rows)).?);
+}
+
+// A chain of changes as the server builds their preimages: name, operation,
+// and whether the set event's value is gone
+const TestChange = struct { name: []const u8, operation: []const u8, gone: bool = false };
+
+fn testChanges(allocator: std.mem.Allocator, changes: []const TestChange) ![]ChainRow {
+    const preimages = try allocator.alloc([]const u8, changes.len);
+    for (changes, 0..) |change, i| {
+        const digest = if (std.mem.eql(u8, change.operation, "set")) "\"digest\"" else "null";
+        preimages[i] = try std.fmt.allocPrint(allocator, "[\"event\",\"env1\",{d},\"id{d}\",\"{s}\",\"{s}\",{s},\"user:u1\",{d}]", .{ i + 1, i + 1, change.name, change.operation, digest, 1000 + i });
+    }
+    const chain = try testChain(allocator, preimages);
+    for (changes, chain.rows) |change, *row| row.valueGone = change.gone;
+    return chain.rows;
+}
+
+fn lostIn(allocator: std.mem.Allocator, changes: []const TestChange) !?[]const u8 {
+    return findLostValue(allocator, try testChanges(allocator, changes));
+}
+
+test "a value may be gone only as an old value that was purged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Set again, or deleted, and then purged
+    try std.testing.expectEqual(@as(?[]const u8, null), try lostIn(allocator, &.{
+        .{ .name = "X", .operation = "set", .gone = true },
+        .{ .name = "X", .operation = "set", .gone = true },
+        .{ .name = "GONE", .operation = "set", .gone = true },
+        .{ .name = "X", .operation = "set" },
+        .{ .name = "GONE", .operation = "delete" },
+        .{ .name = "X", .operation = "purge" },
+        .{ .name = "GONE", .operation = "purge" },
+    }));
+    // No purge at all
+    try std.testing.expectEqualStrings("row 1 lost its value without a purge", (try lostIn(allocator, &.{
+        .{ .name = "X", .operation = "set", .gone = true },
+        .{ .name = "X", .operation = "set" },
+    })).?);
+    // The current value, with a purge after it
+    try std.testing.expectEqualStrings("row 2 lost its value without a purge", (try lostIn(allocator, &.{
+        .{ .name = "X", .operation = "set" },
+        .{ .name = "X", .operation = "set", .gone = true },
+        .{ .name = "X", .operation = "purge" },
+    })).?);
+    // A purge before the value was replaced
+    try std.testing.expectEqualStrings("row 1 lost its value without a purge", (try lostIn(allocator, &.{
+        .{ .name = "X", .operation = "set", .gone = true },
+        .{ .name = "X", .operation = "purge" },
+        .{ .name = "X", .operation = "set" },
+    })).?);
+    // Another name's purge
+    try std.testing.expectEqualStrings("row 2 lost its value without a purge", (try lostIn(allocator, &.{
+        .{ .name = "Y", .operation = "set" },
+        .{ .name = "X", .operation = "set", .gone = true },
+        .{ .name = "X", .operation = "set" },
+        .{ .name = "Y", .operation = "set" },
+        .{ .name = "Y", .operation = "purge" },
+    })).?);
+}
+
+fn auditBody(allocator: std.mem.Allocator, row: ChainRow, extra: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{{\"environmentId\":\"env1\",\"publicKey\":\"k\",\"events\":{{\"rows\":[{{\"seq\":1,\"hash\":\"{s}\",\"signature\":\"{s}\",\"preimage\":{f}{s}}}],\"outside\":0}},\"reads\":{{\"rows\":[]}}}}", .{ row.hash, row.signature, std.json.fmt(row.preimage, .{}), extra });
+}
+
+test "the server says which values are gone, and an older server's rows keep theirs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const rows = try testChanges(allocator, &.{.{ .name = "X", .operation = "set" }});
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+
+    const gone = try std.json.parseFromSliceLeaky(AuditResponse, allocator, try auditBody(allocator, rows[0], ",\"valueGone\":true"), options);
+    try std.testing.expect(gone.events.rows[0].valueGone);
+    try std.testing.expectEqualStrings("row 1 lost its value without a purge", (try findLostValue(allocator, gone.events.rows)).?);
+
+    const older = try std.json.parseFromSliceLeaky(AuditResponse, allocator, try auditBody(allocator, rows[0], ""), options);
+    try std.testing.expect(!older.events.rows[0].valueGone);
+    try std.testing.expectEqual(@as(?[]const u8, null), try findLostValue(allocator, older.events.rows));
 }

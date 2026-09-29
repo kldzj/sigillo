@@ -14,7 +14,9 @@
 // event's preimage holds a keyed digest of its plaintext, not the ciphertext:
 // swapping in another row's ciphertext changes the digest, while
 // re-encrypting a value later does not. A purged value keeps its digest in
-// value_digest, so its row still verifies once the value is gone.
+// value_digest, so its row still verifies once the value is gone. What says
+// it was purged, not removed by hand, is a purge row after a later change of
+// its secret (valuesGoneWithoutPurge).
 
 import { env } from 'cloudflare:workers'
 import * as orm from 'drizzle-orm'
@@ -420,7 +422,44 @@ export async function readEventValue({ request, userId, sessionId, eventId }: {
 
 // ── Verifying ───────────────────────────────────────────────────────
 
-export type ChainRow = { seq: number; hash: string; signature: string; preimage: string }
+// valueGone, on event rows only: a set row without its value, an empty one
+// or its IV. It is outside the preimage, like the value itself.
+export type ChainRow = { seq: number; hash: string; signature: string; preimage: string; valueGone?: boolean }
+
+// A set row's value may only go in a purge, and a purge removes old values
+// only: a value gone is accounted for by a purge row of its name after a later
+// set or delete of it. Any other value gone was removed by hand, keeping its
+// digest so that its row still verifies. Takes an event chain's rows and
+// returns the seqs of those, in order.
+function valuesGoneWithoutPurge(rows: { seq: number; name: string; operation: string; valueGone: boolean }[]): number[] {
+  // Newest first: the names with a purge after the rows seen so far, and
+  // those with a set or delete that such a purge follows
+  const purgedLater = new Set<string>()
+  const accounted = new Set<string>()
+  const gone: number[] = []
+  for (const row of [...rows].sort((a, b) => b.seq - a.seq)) {
+    if (row.operation === 'purge') purgedLater.add(row.name)
+    if (row.operation !== 'set' && row.operation !== 'delete') continue
+    if (row.valueGone && !accounted.has(row.name)) gone.push(row.seq)
+    if (purgedLater.has(row.name)) accounted.add(row.name)
+  }
+  return gone.reverse()
+}
+
+// As storedValueDigest decides: a set row without both, emptied or not,
+// takes its digest from value_digest
+function isValueGone(row: { operation: string; valueEncrypted: string | null; iv: string | null }) {
+  return row.operation === 'set' && (!row.valueEncrypted || !row.iv)
+}
+
+// For the history page, an environment's set rows whose value is gone, by
+// id: purged, or removed without a purge. A row outside the chain has no
+// purge to account for it.
+export function goneValues(rows: { id: string; seq: number | null; name: string; operation: string; valueEncrypted: string | null; iv: string | null }[]): Map<string, 'purged' | 'removed'> {
+  const chained = rows.flatMap((row) => row.seq === null ? [] : [{ ...row, seq: row.seq, valueGone: isValueGone(row) }])
+  const unaccounted = new Set(valuesGoneWithoutPurge(chained))
+  return new Map(rows.filter(isValueGone).map((row) => [row.id, row.seq !== null && !unaccounted.has(row.seq) ? 'purged' : 'removed']))
+}
 
 // Both chains of an environment with every preimage rebuilt from D1 as it is
 // now, for `sigillo audit verify`. Chains the environment's older events first.
@@ -435,11 +474,12 @@ export async function getAuditChains(environmentId: string) {
   return {
     publicKey: await getAuditPublicKey(),
     events: {
-      rows: await Promise.all(chained.map(async (row): Promise<ChainRow> => ({
+      rows: await Promise.all(chained.map(async (row): Promise<ChainRow & { valueGone: boolean }> => ({
         seq: row.seq!,
         hash: row.hash ?? '',
         signature: row.signature ?? '',
         preimage: eventPreimage({ ...row, seq: row.seq!, actor: row.actor ?? '' }, row.operation === 'set' ? await storedValueDigest(row) : null),
+        valueGone: isValueGone(row),
       }))),
       // Added around the chain, so not covered by it
       outside: events.length - chained.length,
@@ -464,6 +504,15 @@ export async function verifyChain(publicKey: string, rows: ChainRow[]): Promise<
       return { ok: false, problem: `row ${seq} has an invalid signature` }
     }
     head = { seq, hash: row.hash }
+  }
+  // An event chain's rows say which values are gone; its preimages hold
+  // their names and operations
+  if (rows.some((row) => row.valueGone)) {
+    const [gone] = valuesGoneWithoutPurge(rows.map((row) => {
+      const [, , , , name, operation] = JSON.parse(row.preimage) as unknown[]
+      return { seq: row.seq, name: String(name), operation: String(operation), valueGone: row.valueGone === true }
+    }))
+    if (gone !== undefined) return { ok: false, problem: `row ${gone} lost its value without a purge` }
   }
   return { ok: true, head }
 }

@@ -46,9 +46,33 @@ function readPreimage(row: Row): string {
   return JSON.stringify(['read', row.environment_id, row.seq, row.id, row.actor, row.kind, JSON.parse(String(row.names)), row.ip_address ?? null, row.created_at])
 }
 
+/**
+ * A set event's preimage holds its value's digest, so a row whose value was
+ * removed in the database verifies like one that was purged. The only way
+ * the Worker removes a value is a purge of an old one: the same name was set
+ * again or deleted after it, and purged after that. Returns the seq of the
+ * first chained set event that lost its value any other way, as `sigillo
+ * audit verify` (cli/zig/src/audit.zig) finds it.
+ */
+function lostValue(chained: Row[]): number | undefined {
+  // Per name, walking from the newest row back: whether a purge comes later,
+  // and whether a set or delete that a purge follows comes later
+  const later = new Map<string, { purge: boolean; replacedThenPurged: boolean }>()
+  let lost: number | undefined
+  for (const row of [...chained].reverse()) {
+    const seen = later.get(String(row.name)) ?? { purge: false, replacedThenPurged: false }
+    later.set(String(row.name), seen)
+    // Its digest came from value_digest, as for a purged value
+    if (row.operation === 'set' && (!row.value_encrypted || !row.iv) && !seen.replacedThenPurged) lost = Number(row.seq)
+    if (row.operation === 'purge') seen.purge = true
+    else if (seen.purge && (row.operation === 'set' || row.operation === 'delete')) seen.replacedThenPurged = true
+  }
+  return lost
+}
+
 export type HistoryCheck = { environments: number; rows: number; outside: number; problems: string[] }
 
-/** Checks both chains of every environment: each row's hash, and its signature */
+/** Checks both chains of every environment: each row's hash and signature, and that only purges removed values */
 export async function verifyHistory({ query, betterAuthSecret, ring, baseKey }: {
   query: Query
   betterAuthSecret: string
@@ -98,6 +122,8 @@ export async function verifyHistory({ query, betterAuthSecret, ring, baseKey }: 
         head = { seq, hash: String(row.hash) }
         check.rows++
       }
+      const lost = chain === 'changes' && head.seq === rows.length ? lostValue(rows) : undefined
+      if (lost !== undefined) check.problems.push(`environment ${String(id)}, changes row ${lost} lost its value without a purge`)
     }
   }
   return check

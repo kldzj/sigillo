@@ -2093,7 +2093,9 @@ fn auditVerifyAction(_: AuditVerify.Args, opts: AuditVerify.Options, global: Glo
         const problem = switch (try audit.verifyChain(allocator, chains.publicKey, chain.rows)) {
             .ok => |head| blk: {
                 heads[i] = head;
-                break :blk try audit.compareWithWitness(allocator, chain.seen, chain.rows);
+                if (try audit.compareWithWitness(allocator, chain.seen, chain.rows)) |problem| break :blk problem;
+                // Only changes have values
+                break :blk if (i == 0) try audit.findLostValue(allocator, chain.rows) else null;
             },
             .problem => |problem| problem,
         };

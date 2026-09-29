@@ -38,6 +38,6 @@ Changes from before the history existed join it on their environment's next chan
 
 ## Old values, restores and rotations
 
-- [Purging old values](./secrets.mdx#history-and-old-values) removes them for good, and the history still verifies: each purged row keeps the digest it was signed with.
+- [Purging old values](./secrets.mdx#history-and-old-values) removes them for good, and the history still verifies: each purged row keeps the digest it was signed with. A value removed from the database any other way fails `audit verify`, and the check of a restore.
 - After going back to an earlier state, with a [backup or time travel](./backups.mdx), an `audit verify` that saw newer rows reports the history as shorter.
 - [Rotating the encryption key](./rotate-key.mdx) re-encrypts values without breaking the history. Changing `BETTER_AUTH_SECRET` changes the signing key: older rows then no longer verify, and `audit verify` reports the new key.

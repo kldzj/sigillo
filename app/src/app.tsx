@@ -35,7 +35,7 @@ import {
   internalErrorMessage,
 } from './db.ts'
 import { apiApp } from './api.ts'
-import { countOldValues } from './audit.ts'
+import { countOldValues, goneValues } from './audit.ts'
 import { expiryBanner } from './tokens.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
@@ -651,7 +651,7 @@ export const app = new Spiceflow({ tracer })
     const locked = !!matchedEnv && !!getEnvironmentAccessError(access, matchedEnv)
 
     // Load events for selected env, sorted by createdAt DESC
-    let events: { id: string; name: string; operation: string; valueEncrypted: string | null; iv: string | null; createdAt: number; environmentName: string; userName: string; unsigned: boolean; purged: boolean }[] = []
+    let events: { id: string; name: string; operation: string; valueEncrypted: string | null; iv: string | null; createdAt: number; environmentName: string; userName: string; unsigned: boolean; purged: boolean; removedWithoutPurge: boolean }[] = []
     if (selectedEnvId && !locked) {
       const envMap = new Map(environments.map((e) => [e.id, e.name]))
       const rows = await db.query.secretEvent.findMany({
@@ -659,6 +659,7 @@ export const app = new Spiceflow({ tracer })
         orderBy: { createdAt: 'desc' },
       })
       const names = await actorNames(rows.map((r) => r.actor ?? actorOf(r)))
+      const gone = goneValues(rows)
       events = rows.map((r) => ({
         id: r.id,
         name: r.name,
@@ -671,7 +672,9 @@ export const app = new Spiceflow({ tracer })
         // Not part of the signed history: added to the database around it
         unsigned: r.seq === null,
         // Removed by an admin; the row keeps its digest (audit.ts)
-        purged: r.operation === 'set' && !r.valueEncrypted && !!r.valueDigest,
+        purged: gone.get(r.id) === 'purged',
+        // Removed in the database, as `sigillo audit verify` finds too
+        removedWithoutPurge: gone.get(r.id) === 'removed',
       }))
     }
 

@@ -1927,13 +1927,17 @@
                               },
                               "preimage": {
                                 "type": "string"
+                              },
+                              "valueGone": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
                               "seq",
                               "hash",
                               "signature",
-                              "preimage"
+                              "preimage",
+                              "valueGone"
                             ]
                           }
                         },
@@ -2035,13 +2039,21 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "ruleId": {
+                      "type": "string"
+                    },
+                    "ruleExpiresAt": {
+                      "type": "number"
                     }
                   },
                   "required": [
                     "token",
                     "expiresAt",
                     "projectId",
-                    "environmentIds"
+                    "environmentIds",
+                    "ruleId",
+                    "ruleExpiresAt"
                   ]
                 }
               }

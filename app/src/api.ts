@@ -255,7 +255,9 @@ const auditChainRowSchema = z.object({
 const auditResponseSchema = z.object({
   environmentId: z.string(),
   publicKey: z.string(),
-  events: z.object({ rows: z.array(auditChainRowSchema), outside: z.number(), adopted: z.number() }),
+  // valueGone: a set row without its value, an empty one or its IV, which
+  // only a purge after a later set or delete of the same name accounts for
+  events: z.object({ rows: z.array(auditChainRowSchema.extend({ valueGone: z.boolean() })), outside: z.number(), adopted: z.number() }),
   reads: z.object({ rows: z.array(auditChainRowSchema) }),
 })
 
