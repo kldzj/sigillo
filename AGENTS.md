@@ -80,6 +80,8 @@ Rules:
 Rules:
 - **Only `appendSecretEvents()` writes `secret_event`.** A row inserted any other way has no `seq`, so once the environment has a chain the replay ignores it and verify reports it. Tests that need old-style rows insert them before the environment's first chained write; those join the chain in order.
 - **Only a row's value may ever change, and only two ways:** `self-host --rotate-key` re-encrypts it (`value_encrypted`, `iv`), and `purgeOldValues()` removes an old one and keeps its digest in `value_digest`, next to a `purge` row in the chain. Both keep the chain valid because a set event's preimage holds the plaintext's digest. The replay skips `purge` rows.
+- **A value may be gone only as an old value that was purged.** A chained `set` row without a value (`!value_encrypted || !iv`, the condition under which its digest comes from `value_digest`) needs a later `purge` row of its name with a newer `set` or `delete` of that name in between; otherwise the history is broken ("row N lost its value without a purge"). The Worker (`valuesGoneWithoutPurge` in `audit.ts`, `valueGone` on each event row of the audit export), `sigillo audit verify` (`audit.zig`) and restore (`history.ts`) apply the same rule: change them together. A purge is all or none: it writes nothing when a value changed after it read them.
+- The audit export of a protected environment takes the protected step-up and is recorded as a read of kind `audit`, since its digests show whether a value was set back to an earlier one.
 - **Never change a preimage's fields or their order.** Rows are verified by rebuilding their preimage, so any change breaks every existing row. A new field needs a new preimage version.
 - A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it. Values from before v2 have no AAD, so such a ciphertext copied into another environment still decrypts there; only a chained row's digest catches it.
 - `cli/src/selfhost/history.ts` rebuilds the same preimages to check a restored database. A new preimage version goes there too.
@@ -113,6 +115,9 @@ Rules:
 - `LEFT_OUT` lists the tables of live logins that a backup skips. A new table with a foreign key to one of them has to be left out too, or the import fails.
 - D1's export writes tables in its own order, not by foreign keys, and an import checks each row. `orderByReferences()` regroups the rows by `pragma_foreign_key_list`, queried one table at a time: joined to `sqlite_master`, D1 answers `SQLITE_AUTH`.
 - A failed restore deletes the databases it made, so nothing half-imported stays behind.
+- `LEFT_EMPTY` lists columns a backup exports as NULL (`account.id_token`, only needed at sign-in).
+- A restore saves the new database ids with `restoring` set, and only a `self-host` run that switched both workers clears it; `--backup`, `--rotate-key` and `--reset-passkeys` refuse while it's set. `self-host` keeps `backupIdentity` and `restoring` when it rewrites the deployment.
+- A restore checks only the signed history and compares its heads with `~/.sigillo/audit.json`; everything else comes back unchecked, and it says so. Without a terminal it needs `--yes`.
 
 ## Auth flow
 
