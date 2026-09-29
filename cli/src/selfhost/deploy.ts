@@ -19,7 +19,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { CfClient, CloudflareApiError, type DeploymentState } from './cloudflare.js'
-import { baseKeyOf, openValue, type KeyRing } from './rotate.js'
+import { KEY_ID_OF_VALUE, baseKeyOf, openValue, type KeyRing } from './rotate.js'
 
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/kldzj/sigillo/releases'
 export const BUNDLE_ASSET_NAME = 'sigillo-selfhost-bundle.json.gz'
@@ -247,12 +247,13 @@ export async function assertNoStoredSecrets({ client, accountId, databaseId, dat
 }
 
 /**
- * Before binding keys to a new worker, prove they decrypt a value the
- * database already stores. A worker recreated from selfhost.json with the
- * right auth secret but without an ENCRYPTION_KEY added by hand in the
- * dashboard would otherwise make every stored secret unreadable. Reads the
- * value as the Worker does: v2 under its key of the ring, or from before v2
- * under key 0.
+ * Before binding keys to a new worker, prove they decrypt what the database
+ * already stores: one value under each key in use, since an unfinished
+ * rotation, or a restore of one, leaves values under several. A worker
+ * recreated from selfhost.json with the right auth secret but without an
+ * ENCRYPTION_KEY added by hand in the dashboard would otherwise make stored
+ * secrets unreadable. Reads each value as the Worker does: v2 under its key
+ * of the ring, or from before v2 under key 0.
  */
 export async function assertSecretsDecryptDatabase({ client, accountId, databaseId, betterAuthSecret, encryptionKey, encryptionKeys }: {
   client: CfClient
@@ -268,24 +269,29 @@ export async function assertSecretsDecryptDatabase({ client, accountId, database
     sql: "SELECT name FROM sqlite_master WHERE type='table' AND name = 'secret_event';",
   })
   if (!tablesResult?.results?.length) return
-  const [rowResult] = await client.d1Query({
+  const stored = "operation = 'set' AND value_encrypted IS NOT NULL AND iv IS NOT NULL"
+  const [rowsResult] = await client.d1Query({
     accountId,
     databaseId,
-    sql: "SELECT environment_id, name, value_encrypted, iv FROM secret_event WHERE operation = 'set' AND value_encrypted IS NOT NULL AND iv IS NOT NULL LIMIT 1;",
+    sql: `SELECT ${KEY_ID_OF_VALUE} AS key_id, environment_id, name, value_encrypted, iv FROM secret_event ` +
+      `WHERE id IN (SELECT min(id) FROM secret_event WHERE ${stored} GROUP BY ${KEY_ID_OF_VALUE}) ORDER BY key_id;`,
   })
-  const row = rowResult?.results?.[0]
-  if (!row) return
-  const readable = await openValue({
-    ring: encryptionKeys,
-    baseKey: baseKeyOf({ encryptionKey, betterAuthSecret }),
-    encrypted: String(row.value_encrypted),
-    iv: String(row.iv),
-    slot: { environmentId: String(row.environment_id), name: String(row.name) },
-  }).then(() => true, () => false)
-  if (readable) return
+  const baseKey = baseKeyOf({ encryptionKey, betterAuthSecret })
+  const unreadable: string[] = []
+  for (const row of rowsResult?.results ?? []) {
+    const readable = await openValue({
+      ring: encryptionKeys,
+      baseKey,
+      encrypted: String(row.value_encrypted),
+      iv: String(row.iv),
+      slot: { environmentId: String(row.environment_id), name: String(row.name) },
+    }).then(() => true, () => false)
+    if (!readable) unreadable.push(String(row.key_id))
+  }
+  if (unreadable.length === 0) return
   throw new Error(
-    'This D1 database already stores secrets that the keys for this deploy cannot decrypt. Deploying would make ' +
-      'every stored secret unreadable. Restore the original ~/.sigillo/selfhost.json, or pass the original key with ' +
+    `This D1 database already stores secrets under ${unreadable.map((id) => `key ${id}`).join(', ')}, which the keys for this deploy cannot decrypt. ` +
+      'Deploying would make them unreadable. Restore the original ~/.sigillo/selfhost.json, or pass the original key with ' +
       'SIGILLO_ENCRYPTION_KEY if you set one, then re-run. Or deploy under --name <other-name>.',
   )
 }

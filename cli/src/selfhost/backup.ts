@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import { Decrypter, Encrypter, generateX25519Identity, identityToRecipient } from 'age-encryption'
 import type { CfClient } from './cloudflare.js'
-import type { KeyRing, Query } from './rotate.js'
+import { KEY_ID_OF_VALUE, type KeyRing, type Query } from './rotate.js'
 
 // Sessions, codes and grants of logins in progress, and rate limit counters:
 // a restore signs everyone out rather than bring them back. Only these
@@ -165,10 +165,7 @@ export function orderByReferences(sql: string, references: Map<string, string[]>
 
 /** The ids of the keys stored values are encrypted with, '0' for key 0 */
 export async function keyIdsInUse(database: Database): Promise<string[]> {
-  const rows = await queryOf(database)(
-    "SELECT DISTINCT CASE WHEN substr(value_encrypted, 1, 3) = 'v2.' THEN substr(value_encrypted, 4, instr(substr(value_encrypted, 4), '.') - 1) ELSE '0' END AS key_id " +
-      'FROM secret_event WHERE value_encrypted IS NOT NULL ORDER BY key_id',
-  )
+  const rows = await queryOf(database)(`SELECT DISTINCT ${KEY_ID_OF_VALUE} AS key_id FROM secret_event WHERE value_encrypted IS NOT NULL ORDER BY key_id`)
   return rows.map((row) => String(row.key_id))
 }
 

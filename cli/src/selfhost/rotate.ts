@@ -88,6 +88,10 @@ export async function openValue({ ring, baseKey, encrypted, iv, slot }: {
   return new TextDecoder('utf-8', { ignoreBOM: true }).decode(plaintext)
 }
 
+/** SQL for the id of the key a stored value is encrypted with: <id> of v2.<id>., '0' from before v2 */
+export const KEY_ID_OF_VALUE =
+  "CASE WHEN substr(value_encrypted, 1, 3) = 'v2.' THEN substr(value_encrypted, 4, instr(substr(value_encrypted, 4), '.') - 1) ELSE '0' END"
+
 function notUnder(keyId: string) {
   const prefix = `v2.${keyId}.`
   return { sql: `value_encrypted IS NOT NULL AND iv IS NOT NULL AND substr(value_encrypted, 1, ${prefix.length}) <> ?1`, params: [prefix] }

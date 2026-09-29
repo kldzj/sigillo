@@ -894,38 +894,62 @@ describe('backups', () => {
 })
 
 describe('keys for a new worker', () => {
-  // A database holding one stored value, as the D1 API answers
-  const holding = (row: Record<string, string> | null) => ({
-    async d1Query({ sql }: { sql: string }) {
-      if (sql.includes('sqlite_master')) return [{ results: [{ name: 'secret_event' }] }]
-      return [{ results: row ? [row] : [] }]
-    },
-  }) as unknown as CfClient
   const slot = { environmentId: '01ENV', name: 'API_KEY' }
+  // A database holding these values and a purged one, answering as the D1 API does
+  const holding = (values: Array<{ encrypted: string; iv: string }>) => {
+    const db = new DatabaseSync(':memory:')
+    db.exec('CREATE TABLE secret_event (id text PRIMARY KEY, environment_id text, name text, operation text, value_encrypted text, iv text)')
+    db.prepare("INSERT INTO secret_event VALUES ('a-purged', ?, ?, 'set', NULL, NULL)").run(slot.environmentId, slot.name)
+    values.forEach((value, i) => db.prepare("INSERT INTO secret_event VALUES (?, ?, ?, 'set', ?, ?)").run(`e${i}`, slot.environmentId, slot.name, value.encrypted, value.iv))
+    return {
+      async d1Query({ sql }: { sql: string }) {
+        return [{ results: db.prepare(sql).all() }]
+      },
+    } as unknown as CfClient
+  }
   const outcome = (client: CfClient, keys: { betterAuthSecret: string; encryptionKey?: string; encryptionKeys?: KeyRing }) =>
-    assertSecretsDecryptDatabase({ client, accountId: 'acc', databaseId: 'db', ...keys }).then(() => 'ok', (error: Error) => error.message.slice(0, 60))
+    assertSecretsDecryptDatabase({ client, accountId: 'acc', databaseId: 'db', ...keys }).then(() => 'ok', (error: Error) => error.message.split('. ')[0])
+  const ring: KeyRing = { current: 'abc123', keys: { abc123: Buffer.alloc(32, 7).toString('base64') } }
 
   test('must decrypt a stored value, v2 under the ring or from before v2 under key 0', async () => {
-    const ring: KeyRing = { current: 'abc123', keys: { abc123: Buffer.alloc(32, 7).toString('base64') } }
     const v2 = await sealValue({ keyId: 'abc123', key: ring.keys.abc123!, slot, plaintext: 'secret' })
     // From before v2: key 0 derived from BETTER_AUTH_SECRET, no additional data
     const iv = Buffer.alloc(12, 1)
     const key0 = await webcrypto.subtle.importKey('raw', new Uint8Array(baseKeyOf({ betterAuthSecret: 'auth-secret' })), { name: 'AES-GCM' }, false, ['encrypt'])
     const v1 = Buffer.from(await webcrypto.subtle.encrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, key0, new TextEncoder().encode('secret'))).toString('base64')
-    const v2Row = holding({ environment_id: slot.environmentId, name: slot.name, value_encrypted: v2.encrypted, iv: v2.iv })
-    const v1Row = holding({ environment_id: slot.environmentId, name: slot.name, value_encrypted: v1, iv: iv.toString('base64') })
+    const v2Row = holding([v2])
+    const v1Row = holding([{ encrypted: v1, iv: iv.toString('base64') }])
     expect({
       v2WithRing: await outcome(v2Row, { betterAuthSecret: 'auth-secret', encryptionKeys: ring }),
       v2WithoutRing: await outcome(v2Row, { betterAuthSecret: 'auth-secret' }),
       v1WithSecret: await outcome(v1Row, { betterAuthSecret: 'auth-secret' }),
       v1WithNewSecret: await outcome(v1Row, { betterAuthSecret: 'fresh-secret' }),
-      nothingStored: await outcome(holding(null), { betterAuthSecret: 'fresh-secret' }),
+      nothingStored: await outcome(holding([]), { betterAuthSecret: 'fresh-secret' }),
     }).toEqual({
       v2WithRing: 'ok',
-      v2WithoutRing: 'This D1 database already stores secrets that the keys for th',
+      v2WithoutRing: 'This D1 database already stores secrets under key abc123, which the keys for this deploy cannot decrypt',
       v1WithSecret: 'ok',
-      v1WithNewSecret: 'This D1 database already stores secrets that the keys for th',
+      v1WithNewSecret: 'This D1 database already stores secrets under key 0, which the keys for this deploy cannot decrypt',
       nothingStored: 'ok',
+    })
+  })
+
+  test('must decrypt a value under every key in use, as an unfinished rotation leaves them', async () => {
+    const key0 = baseKeyOf({ betterAuthSecret: 'auth-secret' }).toString('base64')
+    // The oldest value under key 0, newer ones under the ring's key
+    const mixed = holding([
+      await sealValue({ keyId: '0', key: key0, slot, plaintext: 'under key 0' }),
+      await sealValue({ keyId: 'abc123', key: ring.keys.abc123!, slot, plaintext: 'under the ring' }),
+      await sealValue({ keyId: 'abc123', key: ring.keys.abc123!, slot, plaintext: 'under the ring too' }),
+    ])
+    expect({
+      withoutRing: await outcome(mixed, { betterAuthSecret: 'auth-secret' }),
+      withRing: await outcome(mixed, { betterAuthSecret: 'auth-secret', encryptionKeys: ring }),
+      withRingOnly: await outcome(mixed, { betterAuthSecret: 'fresh-secret', encryptionKeys: ring }),
+    }).toEqual({
+      withoutRing: 'This D1 database already stores secrets under key abc123, which the keys for this deploy cannot decrypt',
+      withRing: 'ok',
+      withRingOnly: 'This D1 database already stores secrets under key 0, which the keys for this deploy cannot decrypt',
     })
   })
 })
