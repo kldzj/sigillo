@@ -18,7 +18,7 @@ import {
 } from '../src/selfhost/deploy.js'
 import { deriveStateKey, isSealed, openState, sealState, unlockStateFile } from '../src/selfhost/state-file.js'
 import { baseKeyOf, countNotUnder, newKeyId, openValue, reencryptAll, sealValue, type KeyRing, type Query } from '../src/selfhost/rotate.js'
-import { verifyHistory } from '../src/selfhost/history.js'
+import { auditWitnesses, verifyHistory, type Witness } from '../src/selfhost/history.js'
 import { LEFT_OUT, backupFileName, dumpDatabase, keyFingerprint, loadDatabase, newBackupIdentity, openBackup, sealBackup, splitStatements, type Backup } from '../src/selfhost/backup.js'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -713,11 +713,11 @@ describe('checking a restored history', () => {
   const secret = 'test-secret-at-least-32-characters-long!!'
   const load = () => {
     const db = new DatabaseSync(':memory:')
-    db.exec(`CREATE TABLE environment (id text PRIMARY KEY);
+    db.exec(`CREATE TABLE environment (id text PRIMARY KEY, project_id text, slug text);
       CREATE TABLE secret_event (id text PRIMARY KEY, environment_id text, name text, operation text, value_encrypted text, iv text, value_digest text,
         user_id text, api_token_id text, created_at integer, actor text, seq integer, hash text, signature text, adopted integer);
       CREATE TABLE secret_read (id text PRIMARY KEY, environment_id text, actor text, kind text, names text, ip_address text, created_at integer, seq integer, hash text, signature text)`)
-    db.prepare('INSERT INTO environment VALUES (?)').run(fixture.environmentId)
+    db.prepare("INSERT INTO environment VALUES (?, 'p1', 'prod')").run(fixture.environmentId)
     for (const e of fixture.events) {
       db.prepare('INSERT INTO secret_event VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(e.id, e.environmentId, e.name, e.operation, e.valueEncrypted, e.iv, e.valueDigest,
         e.userId, e.apiTokenId, e.createdAt, e.actor, e.seq, e.hash, e.signature, e.adopted ? 1 : 0)
@@ -726,12 +726,52 @@ describe('checking a restored history', () => {
       db.prepare('INSERT INTO secret_read VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(r.id, r.environmentId, r.actor, r.kind, JSON.stringify(r.names), r.ipAddress, r.createdAt, r.seq, r.hash, r.signature)
     }
     const query: Query = async (sql, params = []) => db.prepare(sql).all(...params) as Array<Record<string, unknown>>
-    return { db, check: () => verifyHistory({ query, betterAuthSecret: secret, ring: undefined, baseKey: baseKeyOf({ betterAuthSecret: secret }) }) }
+    return { db, check: (witnesses?: Witness[]) => verifyHistory({ query, betterAuthSecret: secret, ring: undefined, baseKey: baseKeyOf({ betterAuthSecret: secret }), witnesses }) }
   }
   const env = fixture.environmentId
+  const intact = { environments: 1, rows: 8, outside: 0, unsigned: 0, sinceLastCheck: [], problems: [] }
 
   test('accepts the Worker\'s own rows', async () => {
-    expect(await load().check()).toEqual({ environments: 1, rows: 8, outside: 0, problems: [] })
+    expect(await load().check()).toEqual(intact)
+  })
+
+  test('counts environments with changes but no signed history, which nothing checks', async () => {
+    const stripped = load()
+    stripped.db.exec("UPDATE secret_event SET seq = NULL, hash = NULL, signature = NULL, adopted = 0; DELETE FROM secret_read; UPDATE secret_event SET name = 'RENAMED'")
+    stripped.db.exec("INSERT INTO environment VALUES ('empty', 'p1', 'dev')")
+    expect(await stripped.check()).toEqual({ ...intact, environments: 2, rows: 0, unsigned: 1 })
+  })
+
+  test('compares the heads with what sigillo audit verify saw of this instance', async () => {
+    const head = (seq: number) => ({ seq, hash: fixture.events.find((e: { seq: number }) => e.seq === seq).hash })
+    const file = path.join(mkdtempSync(path.join(tmpdir(), 'sigillo-witness-')), 'audit.json')
+    writeFileSync(file, JSON.stringify({
+      // Checked by slug, and by id before witnesses were keyed by project
+      'https://secrets.acme.com p1 prod': { public_key: 'k', events: head(7), reads: { seq: 1, hash: fixture.reads[0].hash }, verified_at: 1 },
+      [`https://sigillo.acme.workers.dev ${env}`]: { public_key: 'k', events: head(5), reads: null, verified_at: 1 },
+      // Another instance
+      'https://other.example p1 prod': { public_key: 'k', events: { seq: 99, hash: 'x' }, reads: null, verified_at: 1 },
+    }))
+    const urls = ['https://sigillo.acme.workers.dev', 'https://secrets.acme.com/']
+    const witnesses = auditWitnesses(urls, file)
+    const later = [...witnesses, { project: 'p1', environment: env, events: { seq: 9, hash: 'x' }, reads: null }, { project: 'p1', environment: 'staging', events: head(1), reads: null }]
+    const rewritten = [{ project: 'p1', environment: 'prod', events: { ...head(3), hash: head(4).hash }, reads: null }]
+    expect({
+      witnesses: witnesses.map((w) => `${w.project} ${w.environment} ${w.events?.seq} ${w.reads?.seq}`),
+      same: (await load().check(witnesses)).sinceLastCheck,
+      later: (await load().check(later)).sinceLastCheck,
+      rewritten: (await load().check(rewritten)).sinceLastCheck,
+      noFile: auditWitnesses(urls, path.join(path.dirname(file), 'missing.json')),
+    }).toEqual({
+      witnesses: ['p1 prod 7 1', `null ${env} 5 undefined`],
+      same: [],
+      later: [
+        `environment ${env}: its changes have 7 rows, but had 9 when sigillo audit verify last checked them`,
+        'environment staging of project p1: not in the backup, but sigillo audit verify checked it',
+      ],
+      rewritten: [`environment ${env}: changes row 3 differs from the one sigillo audit verify last checked`],
+      noFile: [],
+    })
   })
 
   test('finds an edited row, a changed purged digest, a copied signature and an edited read', async () => {
@@ -782,7 +822,7 @@ describe('checking a restored history', () => {
   test('counts a row added around the chain, which the Worker ignores', async () => {
     const planted = load()
     planted.db.prepare(`INSERT INTO secret_event (id, environment_id, name, operation, created_at) VALUES ('planted', '${env}', 'X', 'delete', 1)`).run()
-    expect(await planted.check()).toEqual({ environments: 1, rows: 8, outside: 1, problems: [] })
+    expect(await planted.check()).toEqual({ ...intact, outside: 1 })
   })
 })
 

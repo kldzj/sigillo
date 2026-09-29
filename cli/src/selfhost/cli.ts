@@ -28,7 +28,7 @@ import {
 import { PASSPHRASE_ENV, passphraseProblem } from './state-file.js'
 import { baseKeyOf, countNotUnder, newKeyId, reencryptAll, type Query } from './rotate.js'
 import { LEFT_OUT, backupFileName, dumpDatabase, keyFingerprint, keyIdsInUse, loadDatabase, newBackupIdentity, openBackup, queryOf, sealBackup, type Backup, type DatabaseDump } from './backup.js'
-import { verifyHistory } from './history.js'
+import { auditWitnesses, verifyHistory, type HistoryCheck } from './history.js'
 import {
   appCompatibilityFlags,
   applyMigrations,
@@ -290,6 +290,8 @@ async function restoreDeployment(options: SelfHostOptions) {
   }
   const ring = deployment.encryptionKeys
   const baseKey = baseKeyOf(deployment)
+  // What `sigillo audit verify` saw on this machine, at either address of the instance
+  const witnesses = auditWitnesses([deployment.url, deployment.customDomain && `https://${deployment.customDomain}`].filter((url): url is string => !!url))
   const retired = Object.entries(backup.keys).filter(([id, fingerprint]) => keyFingerprint(id, { ring, baseKey }) !== fingerprint).map(([id]) => `key ${id}`)
   if (retired.length) throw new Error(`This backup's values are encrypted with ${retired.join(', ')}, which a key rotation has since retired from ~/.sigillo/selfhost.json`)
   if (interactive() && !options.yes) {
@@ -307,7 +309,7 @@ async function restoreDeployment(options: SelfHostOptions) {
     await loadDatabase({ client, accountId: deployment.accountId, databaseId }, dump)
     return databaseId
   }
-  let check: Awaited<ReturnType<typeof verifyHistory>>
+  let check: HistoryCheck
   let appDatabaseId: string
   let providerDatabaseId = deployment.providerDatabaseId
   try {
@@ -319,18 +321,43 @@ async function restoreDeployment(options: SelfHostOptions) {
     }
     spinner.message('Checking the restored history')
     const app = { client, accountId: deployment.accountId, databaseId: appDatabaseId }
-    check = await verifyHistory({ query: queryOf(app), betterAuthSecret: deployment.betterAuthSecret, ring, baseKey })
+    check = await verifyHistory({ query: queryOf(app), betterAuthSecret: deployment.betterAuthSecret, ring, baseKey, witnesses })
     if (check.problems.length > 0) throw new Error(`The restored history does not verify:\n${check.problems.join('\n')}`)
   } catch (error) {
     spinner.stop('Restore stopped')
     for (const databaseId of created) await client.deleteD1(deployment.accountId, databaseId).catch(() => undefined)
     throw new Error(`${error instanceof Error ? error.message : String(error)}\nThe instance keeps its databases, and the restored copies are deleted again.`)
   }
-  spinner.stop(`Restored ${check.environments} environments, their history intact (${check.rows} rows${check.outside ? `, ${check.outside} added around it and ignored` : ''})`)
+  spinner.stop(`Restored ${check.environments} environment${check.environments === 1 ? '' : 's'}`)
+  reportHistoryCheck(check, witnesses.length > 0)
   saveDeployment(key, { ...deployment, databaseId: appDatabaseId, providerDatabaseId })
   // An update of both workers, bound to the restored databases
   await selfHost(options)
   clack.log.info(`The databases from before the restore stay (${deployment.databaseId}${deployment.providerDatabaseId ? `, ${deployment.providerDatabaseId}` : ''}): delete them once you're happy with it.`)
+}
+
+// What the check of a restored history covered, and what it can't
+function reportHistoryCheck(check: HistoryCheck, witnessed: boolean) {
+  const rows = (n: number) => `${n} row${n === 1 ? '' : 's'}`
+  clack.log.info(
+    `Checked the signed history: ${rows(check.rows)} match their hashes and the Worker's signatures` +
+      (check.outside ? `, and ${rows(check.outside)} added around it are ignored` : '') +
+      '. Everything else, such as members, tokens and trust rules, is as it was in the backup, unchecked.',
+  )
+  if (check.unsigned > 0) {
+    clack.log.warn(`${check.unsigned} environment${check.unsigned === 1 ? ' has' : 's have'} changes but no signed history, so nothing checked them.`)
+  }
+  if (!witnessed) {
+    clack.log.info('~/.sigillo/audit.json has no `sigillo audit verify` of this instance, so nothing shows whether rows were removed from the end of a chain before the backup.')
+  } else if (check.sinceLastCheck.length > 0) {
+    clack.log.warn([
+      'Compared with what `sigillo audit verify` last saw on this machine:',
+      ...check.sinceLastCheck.map((line) => `  ${line}`),
+      'Fewer rows are expected from a backup older than that check, and `sigillo audit verify` reports those environments until you remove them from ~/.sigillo/audit.json. A row that differs means this history was rewritten.',
+    ].join('\n'))
+  } else {
+    clack.log.info('It matches what `sigillo audit verify` last saw on this machine.')
+  }
 }
 
 async function askPassphrase(): Promise<string> {

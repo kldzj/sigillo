@@ -4,10 +4,14 @@
  * the Worker's audit route does (app/src/audit.ts), and checks its hash and
  * the Worker's signature. The signing and digest keys come from
  * BETTER_AUTH_SECRET, and a set event's digest from its decrypted value, so
- * only a restore from the same deployment passes.
+ * only a restore from the same deployment passes. Nothing else in the
+ * database is checked.
  */
 
 import { webcrypto } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { openValue, type KeyRing, type Query } from './rotate.js'
 
 const subtle = webcrypto.subtle
@@ -70,14 +74,64 @@ function lostValue(chained: Row[]): number | undefined {
   return lost
 }
 
-export type HistoryCheck = { environments: number; rows: number; outside: number; problems: string[] }
+type Head = { seq: number; hash: string }
 
-/** Checks both chains of every environment: each row's hash and signature, and that only purges removed values */
-export async function verifyHistory({ query, betterAuthSecret, ring, baseKey }: {
+/** The heads of one environment's chains as `sigillo audit verify` last saw them */
+export type Witness = { project: string | null; environment: string; events: Head | null; reads: Head | null }
+
+/**
+ * What `sigillo audit verify` saw of this instance's environments on this
+ * machine, from ~/.sigillo/audit.json. It keys the file by '<api url>
+ * <project id> <environment id or slug>', and did by '<api url> <environment
+ * id>' before that (cli/zig/src/audit.zig).
+ */
+export function auditWitnesses(urls: string[], file = witnessFile()): Witness[] {
+  let witnesses: Record<string, { events?: Head | null; reads?: Head | null }>
+  try {
+    witnesses = JSON.parse(readFileSync(file, 'utf8')) ?? {}
+  } catch {
+    return []
+  }
+  const instance = new Set(urls.map((url) => url.replace(/\/+$/, '')))
+  return Object.entries(witnesses).flatMap(([key, seen]) => {
+    const [url, ...ids] = key.split(' ')
+    if (!instance.has(url!.replace(/\/+$/, '')) || ids.length < 1 || ids.length > 2) return []
+    return [{ project: ids.length === 2 ? ids[0]! : null, environment: ids.at(-1)!, events: seen?.events ?? null, reads: seen?.reads ?? null }]
+  })
+}
+
+// Where the CLI keeps its config (cli/zig/src/config.zig)
+function witnessFile(): string {
+  return process.platform === 'win32'
+    ? path.join(process.env.APPDATA ?? process.env.LOCALAPPDATA ?? os.homedir(), 'sigillo', 'audit.json')
+    : path.join(os.homedir(), '.sigillo', 'audit.json')
+}
+
+export type HistoryCheck = {
+  environments: number
+  /** Rows whose hash and signature checked out */
+  rows: number
+  /** Rows added around a chain, which the Worker ignores */
+  outside: number
+  /** Environments with changes but no chain, so nothing checked */
+  unsigned: number
+  /** Where a chain is shorter than, or differs from, what `sigillo audit verify` saw */
+  sinceLastCheck: string[]
+  problems: string[]
+}
+
+/**
+ * Checks both chains of every environment: each row's hash and signature,
+ * that only purges removed values, and the heads against what `sigillo audit
+ * verify` saw. A chain can't show rows removed from its end; only a witness
+ * that saw them can.
+ */
+export async function verifyHistory({ query, betterAuthSecret, ring, baseKey, witnesses = [] }: {
   query: Query
   betterAuthSecret: string
   ring: KeyRing | undefined
   baseKey: Buffer
+  witnesses?: Witness[]
 }): Promise<HistoryCheck> {
   const keys = await historyKeys(betterAuthSecret)
   const digestOf = async (row: Row): Promise<string> => {
@@ -91,16 +145,27 @@ export async function verifyHistory({ query, betterAuthSecret, ring, baseKey }: 
       return 'undecryptable'
     }
   }
-  const environments = await query('SELECT id FROM environment ORDER BY id')
+  const environments = await query('SELECT id, project_id, slug FROM environment ORDER BY id')
   const events = await query('SELECT * FROM secret_event ORDER BY environment_id, seq')
   const reads = await query('SELECT * FROM secret_read ORDER BY environment_id, seq')
-  const check: HistoryCheck = { environments: environments.length, rows: 0, outside: 0, problems: [] }
-  for (const { id } of environments) {
+  const check: HistoryCheck = { environments: environments.length, rows: 0, outside: 0, unsigned: 0, sinceLastCheck: [], problems: [] }
+  const witnessed = new Set<Witness>()
+  for (const { id, project_id: project, slug } of environments) {
     const changes = events.filter((row) => row.environment_id === id)
     const chains = { changes: changes.filter((row) => row.seq !== null), reads: reads.filter((row) => row.environment_id === id) }
     // Rows without seq in an environment with a chain were added around it;
     // without a chain, they join it on the next change
     if (chains.changes.length > 0) check.outside += changes.length - chains.changes.length
+    else if (changes.length > 0) check.unsigned++
+    for (const witness of witnesses.filter((w) => w.environment === id || (w.project === project && w.environment === slug))) {
+      witnessed.add(witness)
+      for (const [chain, seen] of [['changes', witness.events], ['reads', witness.reads]] as const) {
+        if (!seen) continue
+        const row = chains[chain].find((r) => Number(r.seq) === seen.seq)
+        if (!row) check.sinceLastCheck.push(`environment ${String(id)}: its ${chain} have ${chains[chain].length} rows, but had ${seen.seq} when sigillo audit verify last checked them`)
+        else if (row.hash !== seen.hash) check.sinceLastCheck.push(`environment ${String(id)}: ${chain} row ${seen.seq} differs from the one sigillo audit verify last checked`)
+      }
+    }
     for (const [chain, rows] of Object.entries(chains)) {
       let head = { seq: 0, hash: ZERO_HASH }
       for (const row of rows) {
@@ -125,6 +190,9 @@ export async function verifyHistory({ query, betterAuthSecret, ring, baseKey }: 
       const lost = chain === 'changes' && head.seq === rows.length ? lostValue(rows) : undefined
       if (lost !== undefined) check.problems.push(`environment ${String(id)}, changes row ${lost} lost its value without a purge`)
     }
+  }
+  for (const witness of witnesses.filter((w) => !witnessed.has(w))) {
+    check.sinceLastCheck.push(`environment ${witness.environment}${witness.project ? ` of project ${witness.project}` : ''}: not in the backup, but sigillo audit verify checked it`)
   }
   return check
 }
