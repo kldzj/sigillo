@@ -191,7 +191,7 @@ function saveDeployment(key: string, deployment: DeploymentState) {
 // ring, so new values use it; then every stored value is re-encrypted here
 // (rotate.ts); and once none uses them, the older keys leave the Worker and
 // selfhost.json. Stopped halfway, the next run finishes the same rotation.
-async function rotateKey(options: SelfHostOptions) {
+export async function rotateKey(options: SelfHostOptions) {
   const { key, deployment } = savedDeployment(options)
   const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
   const worker = { accountId: deployment.accountId, scriptName: deployment.workerName }
@@ -202,6 +202,9 @@ async function rotateKey(options: SelfHostOptions) {
   const unfinished = ring ? await countNotUnder(query, ring.current) : 0
   if (ring && unfinished > 0) {
     clack.log.info(`The rotation to key ${ring.current} is unfinished: ${unfinished} value${unfinished === 1 ? '' : 's'} still use an older key. Finishing it.`)
+    // The run that saved the ring may have stopped before the Worker got it,
+    // and the Worker can't read a value under a key it doesn't have
+    await client.putWorkerSecret({ ...worker, name: 'ENCRYPTION_KEYS', text: JSON.stringify(ring) })
   } else {
     if (interactive() && !options.yes) {
       const sure = await clack.confirm({ message: `Give ${deployment.workerName} a new encryption key and re-encrypt every stored value with it?` })
@@ -379,7 +382,7 @@ async function askNewPassphrase(): Promise<string> {
   }
 }
 
-interface SelfHostOptions {
+export interface SelfHostOptions {
   name?: string
   account?: string
   apiToken?: string
