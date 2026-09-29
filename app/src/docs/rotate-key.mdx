@@ -17,3 +17,12 @@ It saves a new key in `~/.sigillo/selfhost.json` and makes it the worker's curre
 The worker keeps its keys in the `ENCRYPTION_KEYS` secret. Every value names the key it was encrypted with, and is bound to its environment and name, so a copy elsewhere in the database doesn't decrypt. `BETTER_AUTH_SECRET` can't be rotated this way, since it signs sessions and the history.
 
 Backups made before a rotation can't be restored after it, since they need the old key: [make a new one](./backups.mdx) right after.
+
+## If selfhost.json leaked
+
+A new key isn't enough when someone has `~/.sigillo/selfhost.json` and its passphrase. Besides the encryption keys, the file holds `BETTER_AUTH_SECRET`, which signs sessions and the history, and `self-host` can't rotate it: whoever has it can sign both as your worker does. The file may hold your Cloudflare login too. So a leak needs a new instance:
+
+1. Revoke the Cloudflare login or API token the file held.
+2. Choose a new passphrase (`self-host --change-passphrase`) and deploy a new instance under another name (`self-host --name sigillo-2`).
+3. Change every secret the old instance stored where it comes from, and set the new values in the new instance: the old keys decrypt every value of the old database, and every backup of it.
+4. Delete the old workers and databases.

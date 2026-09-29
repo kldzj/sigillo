@@ -14,7 +14,13 @@ There are two ways back to an earlier state: backups of your own, which you keep
 npx @kldzj/sigillo self-host --backup
 ```
 
-It exports both databases, the app's and the login provider's, into one file, `sigillo-<time>.backup.age` in the current directory, or the file you name (`--backup /backups/sigillo.backup.age`). The file is encrypted with [age](https://age-encryption.org) to a backup key that the first backup adds to `~/.sigillo/selfhost.json`. The values in it stay encrypted with the instance's keys, which aren't in the file, so restoring it needs `selfhost.json` too. Sessions, sign-in codes, passkey approvals and rate limits are left out.
+It exports both databases, the app's and the login provider's, into one file, `sigillo-<time>.backup.age` in the current directory, or the file you name (`--backup /backups/sigillo.backup.age`). The file is encrypted with [age](https://age-encryption.org) to a backup key that the first backup adds to `~/.sigillo/selfhost.json`. The values in it stay encrypted with the instance's keys, which aren't in the file, so restoring it needs `selfhost.json` too. Sessions, sign-in codes, passkey approvals and rate limits are left out, and so are the ID tokens that sign-ins leave in the databases.
+
+## What a backup holds
+
+Once opened, a backup shows in plain text everything in the databases except the values: the names of users, organizations, projects, environments and secrets, email addresses, the IP addresses in the logs and those tokens were last used from, the hashes of API tokens, the public keys of passkeys, and the trust rules with the claims of the jobs and pods that used them. Secret values stay encrypted, and the file holds no key to them. Keep backups where only people allowed to see all that can read them.
+
+The export and the import go through Cloudflare's D1 API. The file is encrypted on your machine after the export, and decrypted there before the import.
 
 ## Restore a backup
 
@@ -22,7 +28,20 @@ It exports both databases, the app's and the login provider's, into one file, `s
 npx @kldzj/sigillo self-host --restore sigillo-2026-09-29T10-04-05Z.backup.age
 ```
 
-It imports the backup into two new databases and checks their history like `sigillo audit verify`: every row's hash and signature. Only then does it update both workers to use the new databases. Everything changed since the backup is gone and everyone signs in again, while API tokens keep working. An `audit verify` that saw newer rows reports the history as shorter. If a step fails, the instance keeps its databases and the new ones are deleted again. After a restore the old databases stay on the account, for you to delete once you're happy.
+It imports the backup into two new databases and checks their signed history like `sigillo audit verify`: every row's hash and signature, and that only a purge removed a value. Only then does it update both workers to use the new databases. Everything changed since the backup is gone and everyone signs in again, while API tokens keep working.
+
+The check covers the signed history, nothing else. Everything else comes back as it was in the backup, unchecked: API tokens deleted since work again, members removed since are back, and trust rules are as they were. Go through your tokens, members and trust rules after a restore. The restore also tells you:
+
+- how many environments have changes but no signed history. Nothing checked those changes; they join the history on the environment's next change.
+- how the history compares with what `sigillo audit verify` last saw of the instance on your machine, in `~/.sigillo/audit.json`. A backup older than that check has fewer rows, and `audit verify` reports those environments until you remove them from `audit.json`. A row that differs means the history was rewritten. Without an earlier check, nothing shows rows removed from the end of the history before the backup was made.
+
+If a step before the switch fails, the instance keeps its databases and the new ones are deleted again. If switching the workers fails, `selfhost.json` already names the new databases and the restore stays unfinished: run `self-host` to finish it. Until then `--backup`, `--rotate-key` and `--reset-passkeys` refuse to run. After a restore the old databases stay on the account, for you to delete once you're happy.
+
+A restore asks you to confirm, since it discards every change since the backup. Without a terminal, in a script or CI, pass `--yes` instead:
+
+```bash
+npx @kldzj/sigillo self-host --restore sigillo-2026-09-29T10-04-05Z.backup.age --yes
+```
 
 A restore goes to the deployment the backup came from, on the same account. A backup from a newer Sigillo needs that version's CLI. [Rotating the key](./rotate-key.mdx) also replaces the backup key, so older backups can't be opened any more.
 
