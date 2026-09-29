@@ -17,6 +17,7 @@ import {
 import { getDb, schema } from 'db'
 import { ForbiddenError, getOrgIdForProject, getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
 import { MACHINE_TOKEN_MAX_DAYS, formatUserCode } from './lib/utils.ts'
+import { securityEvent, userName } from './security-log.ts'
 
 // How long an approval lasts for the session, and how long a request waits
 const GRANT_MS = { access: 15 * 60 * 1000, admin: 5 * 60 * 1000, enroll: 15 * 60 * 1000 }
@@ -201,13 +202,13 @@ export async function requireProjectChange({ userId, sessionId, projectId }: { u
   await requireAdminForProtected({ userId, sessionId, environmentIds: environments.map((env) => env.id) })
 }
 
-// Deleting a token stops whatever uses it: up to its creator, or an org admin
-// (an admin action, with an admin approval once the org has a protected
-// environment)
+// Deleting or regenerating a token stops whatever uses it: up to its
+// creator, or an org admin (an admin action, with an admin approval once the
+// org has a protected environment)
 export async function requireTokenDeletion({ userId, sessionId, token }: { userId: string; sessionId: string; token: { createdBy: string; projectId: string } }) {
   if (token.createdBy === userId) return
   const access = await getProjectMemberAccess(userId, token.projectId)
-  if (access?.role !== 'admin') throw new ForbiddenError('Only its creator or an org admin deletes a token')
+  if (access?.role !== 'admin') throw new ForbiddenError('Only its creator or an org admin deletes or regenerates a token')
   const orgId = await getOrgIdForProject(token.projectId)
   if (orgId) await requireOrgAdmin({ userId, sessionId, orgId })
 }
@@ -605,6 +606,11 @@ export async function resetMemberPasskeys({ request, actor, userId }: {
   await db.batch([
     db.delete(schema.passkey).where(orm.eq(schema.passkey.userId, userId)),
     db.delete(schema.session).where(orm.eq(schema.session.userId, userId)),
+    // In each of their organizations' security logs
+    ...memberships.map(({ orgId }) => securityEvent({
+      request, author: { userId: actor.userId, apiTokenId: null }, kind: 'passkeys.reset', where: { orgId },
+      subject: { id: userId, name: userName(userId) }, details: { passkeys: passkeys.length },
+    })),
   ])
   for (const passkey of passkeys) {
     await logPasskeyEvent({ request, userId, actor: `user:${actor.userId}`, action: 'removed', passkeyName: passkey.name })

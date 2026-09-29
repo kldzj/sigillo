@@ -23,6 +23,7 @@ import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import { actorOf, encrypt, decrypt, deriveSecrets, getUserEnvironmentAccess, InvalidInputError } from './db.ts'
 import { requireStepUp, requireProtectedAccess, requireAdminApproval, StepUpRequiredError, type Reader } from './step-up.ts'
+import { securityEvent } from './security-log.ts'
 
 const ZERO_HASH = '0'.repeat(64)
 const encoder = new TextEncoder()
@@ -277,19 +278,27 @@ export async function countOldValues(environmentId: string): Promise<number> {
 // history row was signed with, so the chain still verifies. A purge row per
 // name records who removed them. The caller checks that it's an org admin's,
 // with their passkey (requireOldValuesPurge).
-export async function purgeOldValues({ environmentId, author }: { environmentId: string; author: Reader }): Promise<{ purged: number }> {
+export async function purgeOldValues({ environmentId, author, request = null }: { environmentId: string; author: Reader; request?: Request | null }): Promise<{ purged: number }> {
   const db = getDb()
   const old = await findOldValues(environmentId)
   if (old.length === 0) return { purged: 0 }
+  const environment = await db.query.environment.findFirst({ where: { id: environmentId }, columns: { id: true, name: true, projectId: true } })
+  if (!environment) throw new Error('Environment not found')
   const digests = await Promise.all(old.map((row) => storedValueDigest(row)))
   // Their digest couldn't be kept, and their rows would never verify again
   const unreadable = [...new Set(old.filter((_, i) => digests[i] === 'undecryptable').map((row) => row.name))]
   if (unreadable.length) throw new Error(`Old values of ${unreadable.join(', ')} can't be decrypted, so nothing was purged`)
   const prepared = [...new Set(old.map((row) => row.name))].map((name) => ({ ...newRow({ environmentId, name, operation: 'purge', author }), encrypted: null, digest: null }))
   // Each value goes only if it is still the one read above
-  await appendPrepared(prepared, old.map((row, i) => db.update(schema.secretEvent)
-    .set({ valueEncrypted: null, iv: null, valueDigest: digests[i] })
-    .where(orm.and(orm.eq(schema.secretEvent.id, row.id), orm.eq(schema.secretEvent.valueEncrypted, row.valueEncrypted!)))))
+  await appendPrepared(prepared, [
+    ...old.map((row, i) => db.update(schema.secretEvent)
+      .set({ valueEncrypted: null, iv: null, valueDigest: digests[i] })
+      .where(orm.and(orm.eq(schema.secretEvent.id, row.id), orm.eq(schema.secretEvent.valueEncrypted, row.valueEncrypted!)))),
+    securityEvent({
+      request, author, kind: 'values.purged', where: { projectId: environment.projectId },
+      subject: { id: environment.id, name: environment.name }, details: { values: old.length, names: prepared.length },
+    }),
+  ])
   return { purged: old.length }
 }
 
@@ -355,7 +364,7 @@ export async function setEnvironmentProtection({ request, environmentId, protect
   author: Reader
 }) {
   const db = getDb()
-  const env = await db.query.environment.findFirst({ where: { id: environmentId }, columns: { protected: true } })
+  const env = await db.query.environment.findFirst({ where: { id: environmentId }, columns: { name: true, projectId: true, protected: true } })
   if (!env) throw new Error('Environment not found')
   if (env.protected && !protect) {
     if (!author.userId || !author.sessionId) throw new StepUpRequiredError('admin')
@@ -363,7 +372,13 @@ export async function setEnvironmentProtection({ request, environmentId, protect
   }
   await appendRead(
     readRow({ request, environmentId, author, kind: protect ? 'protected' : 'unprotected', names: [] }),
-    [db.update(schema.environment).set({ protected: protect, updatedAt: Date.now() }).where(orm.eq(schema.environment.id, environmentId))],
+    [
+      db.update(schema.environment).set({ protected: protect, updatedAt: Date.now() }).where(orm.eq(schema.environment.id, environmentId)),
+      securityEvent({
+        request, author, kind: protect ? 'environment.protected' : 'environment.unprotected', where: { projectId: env.projectId },
+        subject: { id: environmentId, name: env.name },
+      }),
+    ],
   )
 }
 

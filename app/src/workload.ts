@@ -15,9 +15,10 @@ import * as jose from 'jose'
 import * as orm from 'drizzle-orm'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
-import { InvalidInputError, generateApiToken, getProjectMemberAccess, isAllowed, requireValidName } from './db.ts'
+import { ForbiddenError, InvalidInputError, generateApiToken, getProjectMemberAccess, isAllowed, requireValidName } from './db.ts'
 import { requireAdminWithPasskey } from './step-up.ts'
-import { MACHINE_TOKEN_MAX_DAYS, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
+import { securityEvent } from './security-log.ts'
+import { GITHUB_ISSUER, MACHINE_TOKEN_MAX_DAYS, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
 
 export const WORKLOAD_TOKEN_MS = 60 * 60 * 1000
 const ALGORITHMS = ['RS256', 'ES256']
@@ -35,6 +36,7 @@ const REFRESH_FLOOR_MS = 5 * 60 * 1000
 // And once a day anyway, so keys the issuer dropped stop working
 const KEYS_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const MAX_NAME_LENGTH = 100
+const DAY_MS = 86_400_000
 
 type Jwks = { keys: Array<Record<string, unknown>> }
 type Rule = typeof schema.trustRule.$inferSelect
@@ -212,7 +214,7 @@ export async function exchangeWorkloadToken({ jwt, project, ruleId, ownHost, ipA
   ruleId?: string
   ownHost: string
   ipAddress: string | null
-}): Promise<{ key: string; tokenId: string; expiresAt: number; projectId: string; environmentIds: string[] }> {
+}): Promise<{ key: string; tokenId: string; expiresAt: number; projectId: string; environmentIds: string[]; ruleId: string; ruleExpiresAt: number; ruleLifetimeStart: number }> {
   if (typeof jwt !== 'string' || jwt.length > MAX_JWT_LENGTH || jwt.split('.').length !== 3) throw new WorkloadError('Not a JWT', 400)
   let header: jose.ProtectedHeaderParameters
   let unverified: jose.JWTPayload
@@ -254,7 +256,7 @@ export async function exchangeWorkloadToken({ jwt, project, ruleId, ownHost, ipA
   // Its tokens act for its creator, while they are an org admin who may sign in
   const creator = await db.query.user.findFirst({ where: { id: rule.createdBy }, columns: { email: true, emailVerified: true } })
   const access = creator && isAllowed(creator) ? await getProjectMemberAccess(rule.createdBy, rule.projectId) : null
-  if (access?.role !== 'admin') throw new WorkloadError('The admin who made this trust rule no longer is one: another admin has to make it again')
+  if (access?.role !== 'admin') throw new WorkloadError('The admin who owns this trust rule no longer is one: another admin has to renew it on the project\'s Machines tab')
   const existing = await db.query.environment.findMany({ where: { projectId: rule.projectId }, columns: { id: true } })
   const environmentIds = rule.environmentIds.filter((id) => existing.some((env) => env.id === id))
   if (rule.environmentIds.length > 0 && environmentIds.length === 0) throw new WorkloadError("None of this trust rule's environments exists any more")
@@ -280,7 +282,7 @@ export async function exchangeWorkloadToken({ jwt, project, ruleId, ownHost, ipA
     ...environmentIds.map((environmentId) => db.insert(schema.apiTokenEnvironment).values({ tokenId, environmentId })),
     db.update(schema.trustRule).set({ lastUsedAt: now }).where(orm.eq(schema.trustRule.id, rule.id)),
   ])
-  return { key, tokenId, expiresAt, projectId: rule.projectId, environmentIds }
+  return { key, tokenId, expiresAt, projectId: rule.projectId, environmentIds, ruleId: rule.id, ruleExpiresAt: rule.expiresAt, ruleLifetimeStart: rule.renewedAt ?? rule.createdAt }
 }
 
 // ── Rules ───────────────────────────────────────────────────────────
@@ -299,9 +301,10 @@ export type TrustRuleInput = {
   expiresInDays: number
 }
 
-export async function createTrustRule({ userId, sessionId, ownHost, rule }: {
+export async function createTrustRule({ userId, sessionId, request = null, ownHost, rule }: {
   userId: string
   sessionId: string
+  request?: Request | null
   ownHost: string
   rule: TrustRuleInput
 }): Promise<{ id: string }> {
@@ -332,46 +335,185 @@ export async function createTrustRule({ userId, sessionId, ownHost, rule }: {
     ? { jwksUri: null, jwks: await parseJwks(parseJson(rule.jwks)), jwksFetchedAt: null }
     : { ...await discoverKeys(issuer, ownHost), jwksFetchedAt: Date.now() }
   const id = ulid()
-  await db.insert(schema.trustRule).values({
-    id,
-    projectId: rule.projectId,
-    name: rule.name,
-    issuer,
-    ...keys,
-    audience,
-    subject,
-    claims,
-    environmentIds,
-    protectedAccess: rule.protectedAccess,
-    createdBy: userId,
-    expiresAt: Date.now() + rule.expiresInDays * 86_400_000,
-  })
+  const expiresAt = Date.now() + rule.expiresInDays * DAY_MS
+  await db.batch([
+    db.insert(schema.trustRule).values({
+      id,
+      projectId: rule.projectId,
+      name: rule.name,
+      issuer,
+      ...keys,
+      audience,
+      subject,
+      claims,
+      environmentIds,
+      protectedAccess: rule.protectedAccess,
+      createdBy: userId,
+      expiresAt,
+    }),
+    ruleEvent({ userId, request, kind: 'rule.created', rule: { id, name: rule.name, projectId: rule.projectId }, details: { protected: rule.protectedAccess, expiresAt } }),
+  ])
   return { id }
 }
 
 async function findRule(ruleId: string) {
-  const rule = await getDb().query.trustRule.findFirst({ where: { id: ruleId }, columns: { projectId: true, jwksUri: true } })
+  const rule = await getDb().query.trustRule.findFirst({ where: { id: ruleId }, with: { creator: { columns: { id: true, name: true } } } })
   if (!rule) throw new InvalidInputError('Trust rule not found')
   return rule
 }
 
+function ruleEvent({ userId, request, kind, rule, details }: {
+  userId: string
+  request: Request | null
+  kind: 'rule.created' | 'rule.renewed' | 'rule.deleted' | 'rule.keys_replaced'
+  rule: { id: string; name: string; projectId: string }
+  details: Record<string, unknown>
+}) {
+  return securityEvent({ request, author: { userId, apiTokenId: null }, kind, where: { projectId: rule.projectId }, subject: { id: rule.id, name: rule.name }, details })
+}
+
 // Its tokens stop with it. Their rows stay, for the read log.
-export async function deleteTrustRule({ userId, sessionId, ruleId }: { userId: string; sessionId: string; ruleId: string }) {
-  const { projectId } = await findRule(ruleId)
-  await requireAdminWithPasskey({ userId, sessionId, projectId })
+export async function deleteTrustRule({ userId, sessionId, request = null, ruleId }: { userId: string; sessionId: string; request?: Request | null; ruleId: string }) {
+  const rule = await findRule(ruleId)
+  await requireAdminWithPasskey({ userId, sessionId, projectId: rule.projectId })
   const db = getDb()
   const now = Date.now()
   await db.batch([
     db.update(schema.apiToken).set({ expiresAt: now }).where(orm.and(orm.eq(schema.apiToken.trustRuleId, ruleId), orm.gt(schema.apiToken.expiresAt, now))),
+    ruleEvent({ userId, request, kind: 'rule.deleted', rule, details: { protected: rule.protectedAccess } }),
     db.delete(schema.trustRule).where(orm.eq(schema.trustRule.id, ruleId)),
   ])
 }
 
 // After a private cluster rotates its signing key, its admin pastes the new
 // key set. Rules with discovered keys refresh on their own.
-export async function replaceTrustRuleKeys({ userId, sessionId, ruleId, jwks }: { userId: string; sessionId: string; ruleId: string; jwks: string }) {
+export async function replaceTrustRuleKeys({ userId, sessionId, request = null, ruleId, jwks }: { userId: string; sessionId: string; request?: Request | null; ruleId: string; jwks: string }) {
   const rule = await findRule(ruleId)
   if (rule.jwksUri) throw new InvalidInputError('This rule gets its keys from its issuer')
   await requireAdminWithPasskey({ userId, sessionId, projectId: rule.projectId })
-  await getDb().update(schema.trustRule).set({ jwks: await parseJwks(parseJson(jwks)) }).where(orm.eq(schema.trustRule.id, ruleId))
+  const keys = await parseJwks(parseJson(jwks))
+  const db = getDb()
+  await db.batch([
+    db.update(schema.trustRule).set({ jwks: keys }).where(orm.eq(schema.trustRule.id, ruleId)),
+    ruleEvent({ userId, request, kind: 'rule.keys_replaced', rule, details: { keyIds: keyIdsOf(keys) } }),
+  ])
+}
+
+function keyIdsOf(jwks: Jwks): string[] {
+  return jwks.keys.map((key) => String(key.kid ?? '')).filter(Boolean)
+}
+
+// ── Renewal ─────────────────────────────────────────────────────────
+
+// A rule renewed in place keeps its id, the identity ESO names, and gets a
+// new expiry: nothing that uses it changes. The admin who renews it vouches
+// for its fields again and owns it from then on, so its tokens act for them.
+// An expired rule can be renewed too. Keys from discovery are fetched again,
+// and the renewal fails when the issuer no longer answers.
+export async function renewTrustRule({ userId, sessionId, request = null, ownHost, ruleId, expiresInDays }: {
+  userId: string
+  sessionId: string
+  request?: Request | null
+  ownHost: string
+  ruleId: string
+  expiresInDays: number
+}): Promise<{ id: string; expiresAt: number }> {
+  const rule = await findRule(ruleId)
+  if (!TOKEN_EXPIRY_DAYS.some((days) => days === expiresInDays)) throw new InvalidInputError(`Expiry must be one of ${TOKEN_EXPIRY_DAYS.join(', ')} days`)
+  if (rule.protectedAccess && expiresInDays > MACHINE_TOKEN_MAX_DAYS) {
+    throw new InvalidInputError(`A rule for protected environments expires after ${MACHINE_TOKEN_MAX_DAYS} days at most`)
+  }
+  await requireAdminWithPasskey({ userId, sessionId, projectId: rule.projectId })
+  const keys = rule.jwksUri ? { ...await discoverKeys(rule.issuer, ownHost), jwksFetchedAt: Date.now() } : {}
+  const now = Date.now()
+  const expiresAt = now + expiresInDays * DAY_MS
+  const db = getDb()
+  await db.batch([
+    db.update(schema.trustRule)
+      .set({ ...keys, expiresAt, renewedAt: now, renewals: orm.sql`${schema.trustRule.renewals} + 1`, createdBy: userId })
+      .where(orm.eq(schema.trustRule.id, ruleId)),
+    ruleEvent({
+      userId, request, kind: 'rule.renewed', rule,
+      details: { expiresAt, previousExpiresAt: rule.expiresAt, wasExpired: rule.expiresAt <= now, previousOwner: { id: rule.createdBy, name: rule.creator?.name ?? null } },
+    }),
+  ])
+  return { id: rule.id, expiresAt }
+}
+
+const MONTH_MS = 30 * DAY_MS
+
+// What the renewal dialog shows before an admin vouches for a rule again:
+// how it has been used, which workloads got its tokens, and what looks
+// stale. Drift, a renamed repository or a recreated service account, is
+// what expiry is there to catch.
+export async function trustRuleEvidence({ userId, ruleId, now = Date.now() }: { userId: string; ruleId: string; now?: number }) {
+  const db = getDb()
+  const rule = await findRule(ruleId)
+  const access = await getProjectMemberAccess(userId, rule.projectId)
+  if (access?.role !== 'admin') throw new ForbiddenError('Only admins can do this')
+  const [recent, [counts], owner] = await Promise.all([
+    db.query.apiToken.findMany({
+      where: { trustRuleId: ruleId },
+      columns: { id: true, name: true, createdAt: true, lastUsedIp: true, workload: true },
+      orderBy: { createdAt: 'desc' },
+      limit: 100,
+    }),
+    db.select({
+      total: orm.count(),
+      lastMonth: orm.sql<number>`coalesce(sum(case when ${schema.apiToken.createdAt} > ${now - MONTH_MS} then 1 else 0 end), 0)`,
+    }).from(schema.apiToken).where(orm.eq(schema.apiToken.trustRuleId, ruleId)),
+    db.query.user.findFirst({ where: { id: rule.createdBy }, columns: { email: true, emailVerified: true } })
+      .then((user) => user && isAllowed(user) ? getProjectMemberAccess(rule.createdBy, rule.projectId) : null),
+  ])
+  const github = rule.issuer === GITHUB_ISSUER
+  const warnings: string[] = []
+  if (rule.lastUsedAt === null) warnings.push('Never used: no workload has got a token under it. Delete it instead?')
+  else if (now - rule.lastUsedAt > 2 * MONTH_MS) warnings.push('Not used in 60 days. Delete it instead?')
+  if (owner?.role !== 'admin') warnings.push(`${rule.creator?.name ?? 'Its owner'} is no longer an admin: its tokens don't work until an admin renews it.`)
+  if (github && /^repo:[^@:/]+\/[^@:]+:/.test(rule.subject) && !rule.claims.repository_id) {
+    warnings.push('Its subject names the repository, not its ID: a repository that takes over the name after a rename would match.')
+  }
+  if (github && rule.protectedAccess && !rule.subject.includes(':environment:')) {
+    warnings.push('Without a GitHub environment, anyone who can push to the branch reads these environments. Name an environment with required reviewers.')
+  }
+  if (now - rule.createdAt > 365 * DAY_MS) warnings.push('Made over a year ago: consider making it again with today\'s IDs.')
+  return {
+    exchanges: {
+      total: counts?.total ?? 0,
+      lastMonth: Number(counts?.lastMonth ?? 0),
+      last: recent.slice(0, 5).map((token) => ({ id: token.id, name: token.name.replace(`${rule.name} · `, ''), createdAt: token.createdAt, ipAddress: token.lastUsedIp })),
+    },
+    seen: identitiesSeen(rule, recent.map((token) => token.workload?.claims ?? {})),
+    keys: { discovered: rule.jwksUri !== null, fetchedAt: rule.jwksFetchedAt, keyIds: keyIdsOf(rule.jwks) },
+    warnings,
+  }
+}
+
+// Who got tokens under a rule, from the verified JWTs of its last exchanges:
+// for GitHub its actors, refs, events, runners and repositories; for
+// Kubernetes its pods, by name without the random part, and their nodes;
+// otherwise their subjects
+function identitiesSeen(rule: Rule, claims: Record<string, unknown>[]): Array<{ label: string; values: string[] }> {
+  const distinct = (label: string, pick: (claims: Record<string, unknown>) => unknown) => ({
+    label,
+    values: [...new Set(claims.map(pick).filter((value) => typeof value === 'string' || typeof value === 'number').map(String))].sort(),
+  })
+  const found = (seen: Array<{ label: string; values: string[] }>) => seen.filter(({ values }) => values.length > 0)
+  if (rule.issuer === GITHUB_ISSUER || claims.some((c) => typeof c.repository === 'string')) {
+    return found([
+      distinct('actors', (c) => c.actor),
+      distinct('refs', (c) => c.ref),
+      distinct('events', (c) => c.event_name),
+      distinct('runners', (c) => c.runner_environment),
+      distinct('repositories', (c) => c.repository),
+    ])
+  }
+  if (claims.some((c) => c['kubernetes.io'])) {
+    const pod = (c: Record<string, unknown>) => claimAt(c, '/kubernetes.io/pod/name')
+    return found([
+      distinct('pods', (c) => typeof pod(c) === 'string' ? (pod(c) as string).replace(/(-[a-z0-9]{6,10})?-[a-z0-9]{5}$/, '') : undefined),
+      distinct('nodes', (c) => claimAt(c, '/kubernetes.io/node/name')),
+    ])
+  }
+  return found([distinct('subjects', (c) => c.sub)])
 }

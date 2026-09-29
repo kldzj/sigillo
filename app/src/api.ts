@@ -37,12 +37,17 @@ import {
   ForbiddenError,
   getClaimableAutoJoinDomain,
   requireValidName,
+  deriveRequest,
+  requestTokenExpiry,
+  deleteEnvironment,
+  deleteProject,
+  type CredentialExpiry,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
 import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected, requireProjectChange } from './step-up.ts'
 import { memoize } from './lib/memoize.ts'
 import { exchangeWorkloadToken } from './workload.ts'
-import { SECRET_NAME_REGEX, getEnvSlugError, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
+import { SECRET_NAME_REGEX, describeExpiry, getEnvSlugError, isRenderableSecretName, renderEnvFile } from './lib/utils.ts'
 
 // Latest GitHub release carrying a self-host bundle asset. Memoized via the
 // Cache API so the GitHub API is hit at most every few minutes.
@@ -269,6 +274,23 @@ const downloadedSecretsFormatSchema = z.enum(downloadedSecretsFormats)
 const downloadedSecretsSchema = z.record(z.string(), z.string())
 const errorResponseSchema = z.object({ error: z.string() })
 
+// When a token stops working, on every answer to a request made with one:
+// Sigillo-Token-Expires always, and Sigillo-Warning once it is expiring
+// (describeExpiry), or while a regenerated token's previous value is used.
+// The CLI prints the warning (cli/zig/src/client.zig). ASCII only, and no
+// names: header values are bytes, names free text.
+function expiryHeaders(expiry: CredentialExpiry, now = Date.now()): Record<string, string> {
+  if (expiry.expiresAt === null) return {}
+  const expires = new Date(expiry.expiresAt).toISOString().replace(/\.\d+Z$/, 'Z')
+  const headers: Record<string, string> = { 'Sigillo-Token-Expires': expires }
+  if (expiry.kind === 'regenerated' || describeExpiry({ ...expiry, now }).level === 'warning') {
+    const kind = { token: 'token-expiry', rule: 'rule-expiry', regenerated: 'token-regenerated' }[expiry.kind]
+    const days = Math.ceil((expiry.expiresAt - now) / 86_400_000)
+    headers['Sigillo-Warning'] = [kind, ...(expiry.ruleId ? [`rule=${expiry.ruleId}`] : []), `expires=${expires}`, `days=${days}`].join('; ')
+  }
+  return headers
+}
+
 // A workload's JWT for an API token of one hour (workload.ts)
 function exchangeForRequest(request: Request, { jwt, project, ruleId }: { jwt: unknown; project?: string; ruleId?: string }) {
   return exchangeWorkloadToken({ jwt, project, ruleId, ownHost: new URL(request.url).hostname, ipAddress: request.headers.get('cf-connecting-ip') })
@@ -285,7 +307,7 @@ function withBearer(request: Request): Request {
   } catch {}
   const headers = new Headers(request.headers)
   headers.set('authorization', `Bearer ${user}`)
-  return new Request(request, { headers })
+  return deriveRequest(request, { headers })
 }
 
 // Doppler's answer shape: success, and on errors the messages ESO shows
@@ -444,6 +466,17 @@ function renderDownloadedSecrets(
 
 export const apiApp = new Spiceflow()
   .use(openapi({ path: '/api/v0/openapi.json' }))
+
+  // Every answer to a request whose sig_ token was verified says when the
+  // token stops working, refusals too (expiryHeaders)
+  .use(async ({ request }, next) => {
+    const response = await next()
+    const expiry = requestTokenExpiry(request)
+    if (!expiry || !(response instanceof Response) || response.status === 401) return response
+    const headers = new Headers(response.headers)
+    for (const [name, value] of Object.entries(expiryHeaders(expiry))) headers.set(name, value)
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+  })
 
   // An error answers with a status and a message, never a stack or a query.
   // Reading or changing a protected environment without a passkey approval
@@ -678,10 +711,8 @@ export const apiApp = new Spiceflow()
       // getMemberProjectAccess also verifies org membership (single query),
       // so no separate requireApiOrgMember round-trip is needed.
       await requireProjectChange({ ...session, projectId: params.id })
-      const db = getDb()
-      const [deleted] = await db.delete(schema.project).where(orm.eq(schema.project.id, params.id)).returning({ id: schema.project.id })
-      if (!deleted) return json({ error: 'not found' }, { status: 404 })
-      return { ok: true, id: deleted.id }
+      if (!await deleteProject({ projectId: params.id, by: { userId: session.userId, request } })) return json({ error: 'not found' }, { status: 404 })
+      return { ok: true, id: params.id }
     },
   })
 
@@ -778,10 +809,8 @@ export const apiApp = new Spiceflow()
       const session = await requireApiSession(request)
       const environment = await requireApiEnvironmentAccess({ userId: session.userId, environmentRef: params.id, projectId: params.projectId })
       await requireAdminForProtected({ ...session, environmentIds: [environment.id] })
-      const db = getDb()
-      const [deleted] = await db.delete(schema.environment).where(orm.eq(schema.environment.id, environment.id)).returning({ id: schema.environment.id })
-      if (!deleted) return json({ error: 'not found' }, { status: 404 })
-      return { ok: true, id: deleted.id }
+      if (!await deleteEnvironment({ environmentId: environment.id, by: { userId: session.userId, request } })) return json({ error: 'not found' }, { status: 404 })
+      return { ok: true, id: environment.id }
     },
   })
 
@@ -1005,11 +1034,16 @@ export const apiApp = new Spiceflow()
     path: '/api/v0/workload/token',
     detail: { tags: ['Auth'], summary: 'Exchange a workload JWT for an API token' },
     request: z.object({ token: z.string(), project: z.string().optional(), rule: z.string().optional() }),
-    response: z.object({ token: z.string(), expiresAt: z.number(), projectId: z.string(), environmentIds: z.array(z.string()) }),
+    response: z.object({ token: z.string(), expiresAt: z.number(), projectId: z.string(), environmentIds: z.array(z.string()), ruleId: z.string(), ruleExpiresAt: z.number() }),
     async handler({ request }) {
       const body = await request.json()
       const exchanged = await exchangeForRequest(request, { jwt: body.token, project: body.project, ruleId: body.rule })
-      return { token: exchanged.key, expiresAt: exchanged.expiresAt, projectId: exchanged.projectId, environmentIds: exchanged.environmentIds }
+      // The CLI warns before its first request with the token when the rule expires soon
+      const { 'Sigillo-Warning': warning } = expiryHeaders({ kind: 'rule', expiresAt: exchanged.ruleExpiresAt, lifetimeStart: exchanged.ruleLifetimeStart, ruleId: exchanged.ruleId })
+      return json({
+        token: exchanged.key, expiresAt: exchanged.expiresAt, projectId: exchanged.projectId, environmentIds: exchanged.environmentIds,
+        ruleId: exchanged.ruleId, ruleExpiresAt: exchanged.ruleExpiresAt,
+      }, { headers: warning ? { 'Sigillo-Warning': warning } : {} })
     },
   })
 

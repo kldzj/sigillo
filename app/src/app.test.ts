@@ -25,9 +25,10 @@ import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAudi
 import { createSoftAuthenticator } from './soft-authenticator.js'
 import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
-import { createTrustRule, deleteTrustRule, replaceTrustRuleKeys, type TrustRuleInput } from './workload.js'
+import { createTrustRule, deleteTrustRule, renewTrustRule, replaceTrustRuleKeys, trustRuleEvidence, type TrustRuleInput } from './workload.js'
+import { createToken, deleteToken, regenerateToken, stopPreviousValue } from './tokens.js'
 import * as jose from 'jose'
-import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode } from './lib/utils.js'
+import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode, describeExpiry, GITHUB_ISSUER } from './lib/utils.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
 
@@ -702,7 +703,7 @@ describe('api tokens', () => {
       }
     }
     expect({ owner: await deletes(owner), colleague: await deletes(colleague), admin: await deletes(admin) })
-      .toEqual({ owner: 'ok', colleague: 'Only its creator or an org admin deletes a token', admin: 'ok' })
+      .toEqual({ owner: 'ok', colleague: 'Only its creator or an org admin deletes or regenerates a token', admin: 'ok' })
   })
 
   test('a token acts with its creator\'s current access to its project', async () => {
@@ -1354,7 +1355,7 @@ describe('removing a member', () => {
     const isMember = async () => !!await getDb().query.orgMember.findFirst({ where: { orgId, userId: leaver.user.id } })
     await autoJoinOrgsByDomain(session)
     const joined = await isMember()
-    await deleteOrgMember((await getDb().query.orgMember.findFirst({ where: { orgId, userId: leaver.user.id } }))!)
+    await deleteOrgMember((await getDb().query.orgMember.findFirst({ where: { orgId, userId: leaver.user.id } }))!, { userId: admin.user.id })
     // Their next page load, with the session they still have
     await autoJoinOrgsByDomain(session)
     expect({ joined, afterRemoval: await isMember() }).toEqual({ joined: true, afterRemoval: false })
@@ -1366,7 +1367,7 @@ describe('removing a member', () => {
     const orgId = assertOk(await authedFetch(admin.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Demote Org' } })).id
     const [member] = await getDb().insert(schema.orgMember).values({ orgId, userId: demoted.user.id, role: 'admin' }).returning()
     await getDb().insert(schema.orgInvitation).values({ orgId, createdBy: demoted.user.id, expiresAt: Date.now() + 60_000 })
-    await setOrgMemberRole({ member: member!, role: 'member' })
+    await setOrgMemberRole({ member: member!, role: 'member', by: { userId: admin.user.id } })
     expect(await getDb().query.orgInvitation.findMany({ where: { orgId } })).toEqual([])
   })
 
@@ -1382,7 +1383,7 @@ describe('removing a member', () => {
     const db = getDb()
     const [member] = await db.insert(schema.orgMember)
       .values({ orgId: org.id, userId: leaver.user.id, role: 'admin' })
-      .returning({ id: schema.orgMember.id, orgId: schema.orgMember.orgId, userId: schema.orgMember.userId })
+      .returning({ id: schema.orgMember.id, orgId: schema.orgMember.orgId, userId: schema.orgMember.userId, role: schema.orgMember.role })
     const leaverToken = await generateApiToken()
     await db.insert(schema.apiToken).values({
       name: 'leaver-ci', projectId: project.id, prefix: leaverToken.prefix, hashedKey: leaverToken.hashedKey, createdBy: leaver.user.id,
@@ -1397,7 +1398,7 @@ describe('removing a member', () => {
       method: 'POST', params: { pid: project.id, eid: devEnvId }, body: { name: 'BY_LEAVER_CI', value: 'v' },
     }))
 
-    await deleteOrgMember(member!)
+    await deleteOrgMember(member!, { userId: admin.user.id })
 
     const listWith = (key: string) => authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets', {
       params: { pid: project.id, eid: devEnvId },
@@ -3875,7 +3876,7 @@ describe('passkey enrollment', () => {
     const oldInvite = await invite(Date.now() - 1000)
     const joined = await outcomeOf(() => joinOrgByInvite({ invitationId: oldInvite, userId: member.user.id }))
     // Someone with the member's Google account leaves, adds a passkey, and comes back
-    await deleteOrgMember((await getDb().query.orgMember.findFirst({ where: { orgId, userId: member.user.id } }))!)
+    await deleteOrgMember((await getDb().query.orgMember.findFirst({ where: { orgId, userId: member.user.id } }))!, { userId: member.user.id })
     const approverOrgs = await passkeyApproverOrgs(member.user.id)
     const withoutApproval = await register(member.token)
     const backWithOldInvite = await outcomeOf(() => joinOrgByInvite({ invitationId: oldInvite, userId: member.user.id }))
@@ -4305,7 +4306,7 @@ describe('workload identity', () => {
     const before = (await call(key, download(dev))).status
     await getDb().update(schema.orgMember).set({ role: 'member' }).where(orm.eq(schema.orgMember.id, membership!.id))
     const demoted = await call(key, download(dev))
-    await deleteOrgMember({ id: membership!.id, orgId, userId: creator.user.id })
+    await deleteOrgMember({ id: membership!.id, orgId, userId: creator.user.id, role: 'member' }, { userId: admin.user.id })
     const row = await getDb().query.apiToken.findFirst({ where: { hashedKey: await hashTokenKey(key) }, columns: { expiresAt: true, trustRuleId: true } })
     expect({
       before,
@@ -4363,7 +4364,7 @@ describe('workload identity', () => {
       allowed: { status: 200, body: { DB_URL: 'prod-db' } },
       refused: 'MACHINE_TOKEN_REQUIRED',
       lastRead: { actor: `token:${token!.id}`, kind: 'download' },
-      afterDemotion: { read: 403, exchange: 'The admin who made this trust rule no longer is one: another admin has to make it again' },
+      afterDemotion: { read: 403, exchange: 'The admin who owns this trust rule no longer is one: another admin has to renew it on the project\'s Machines tab' },
     })
   })
 
@@ -4429,6 +4430,550 @@ describe('workload identity', () => {
       nameTransformer: { status: 400, body: { success: false, messages: ['Sigillo keeps secret names as they are: remove nameTransformer'] } },
       otherProject: { status: 403, body: { success: false, messages: ['This token belongs to another project'] } },
       noToken: { status: 401, body: { success: false, messages: ['Pass a Sigillo API token'] } },
+    })
+  })
+})
+
+// ── Renewals ────────────────────────────────────────────────────────
+// Tokens regenerated and trust rules renewed in place (tokens.ts,
+// workload.ts), the API's expiry headers and the security log
+
+describe('renewals', () => {
+  const ISSUER = 'https://issuer.test'
+  const AUDIENCE = 'https://secrets.test'
+  const DAY = 86_400_000
+  type Login = { userId: string; sessionId: string }
+  let admin: Awaited<ReturnType<typeof createTestUser>>
+  let member: Awaited<ReturnType<typeof createTestUser>>
+  let adminLogin: Login
+  let memberLogin: Login
+  let orgId: string
+  let projectId: string
+  let dev: string
+  let prod: string
+
+  beforeAll(async () => {
+    admin = await createTestUser({ name: 'Renewal Admin' })
+    member = await createTestUser({ name: 'Renewal Member' })
+    const af = authedFetch(admin.token)
+    orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Renewal Org' } })).id
+    projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Renewals', orgId } })).id
+    dev = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'dev' } })).id
+    prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
+    await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
+    adminLogin = { userId: admin.user.id, sessionId: await sessionIdOf(admin.token) }
+    memberLogin = { userId: member.user.id, sessionId: await sessionIdOf(member.token) }
+    await appendSecretEvents({
+      author: { ...adminLogin, apiTokenId: null },
+      events: [
+        { environmentId: dev, name: 'DB_URL', operation: 'set', value: 'dev-db' },
+        { environmentId: prod, name: 'DB_URL', operation: 'set', value: 'prod-db' },
+      ],
+    })
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: prod, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    await grantAdmin(admin.token, Date.now() + 10 * 60_000)
+  })
+
+  const rfc3339 = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z')
+  const download = (environmentId: string) => `/api/v0/projects/${projectId}/environments/${environmentId}/secrets/download`
+  async function read(key: string, { environmentId = dev, ip }: { environmentId?: string; ip?: string } = {}) {
+    const res = await app.handle(new Request(`http://e.ly${download(environmentId)}`, { headers: { authorization: `Bearer ${key}`, ...(ip ? { 'cf-connecting-ip': ip } : {}) } }))
+    return { status: res.status, body: await res.json() as Record<string, unknown>, expires: res.headers.get('sigillo-token-expires'), warning: res.headers.get('sigillo-warning') }
+  }
+  const tokenRow = async (id: string) => (await getDb().query.apiToken.findFirst({ where: { id } }))!
+  const eventsOf = (subjectId: string) => getDb().query.securityEvent.findMany({ where: { subjectId }, orderBy: { createdAt: 'asc' } })
+  async function regenerate(tokenId: string, { by = adminLogin, expiresInDays = 90, graceDays = 7 }: { by?: Login; expiresInDays?: number; graceDays?: number } = {}) {
+    return regenerateToken({ ...by, tokenId, prefix: (await tokenRow(tokenId)).prefix, expiresInDays, graceDays })
+  }
+  // A token made daysAgo days ago that expires in daysLeft days
+  async function tokenAged({ name, createdBy = admin.user.id, daysAgo, daysLeft, environmentIds }: { name: string; createdBy?: string; daysAgo: number; daysLeft: number; environmentIds?: string[] }) {
+    const now = Date.now()
+    const token = await insertApiToken({ name, projectId, createdBy, expiresAt: now + daysLeft * DAY, environmentIds })
+    await getDb().update(schema.apiToken).set({ createdAt: now - daysAgo * DAY }).where(orm.eq(schema.apiToken.id, token.tokenId))
+    return { ...token, expiresAt: now + daysLeft * DAY }
+  }
+  const outcome = (run: Promise<unknown>) => run.then(() => 'ok', (error) => error instanceof StepUpRequiredError ? `step-up:${error.purpose}` : (error as Error).message)
+
+  const now = () => Math.floor(Date.now() / 1000)
+  const publicOf = ({ d: _d, p: _p, q: _q, dp: _dp, dq: _dq, qi: _qi, key_ops: _ops, ext: _ext, ...key }: JsonWebKey & { kid: string; alg: string }) => key
+  async function signed(claims: Record<string, unknown>) {
+    const jwk = workerEnv.TEST_ISSUER_KEYS.rsa
+    return new jose.SignJWT({ iss: ISSUER, aud: AUDIENCE, iat: now(), exp: now() + 300, ...claims })
+      .setProtectedHeader({ alg: jwk.alg, kid: jwk.kid })
+      .sign(await jose.importJWK(jwk, jwk.alg))
+  }
+  function rule(overrides: Partial<TrustRuleInput> = {}, by: Login = adminLogin) {
+    return createTrustRule({
+      ...by,
+      ownHost: 'e.ly',
+      rule: { projectId, name: 'Renewal deploy', issuer: ISSUER, audience: AUDIENCE, subject: 'renewal', claims: {}, environmentIds: [dev], protectedAccess: false, expiresInDays: 30, ...overrides },
+    })
+  }
+  async function exchange(body: Record<string, unknown>) {
+    const res = await app.handle(new Request('http://e.ly/api/v0/workload/token', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }))
+    return { status: res.status, warning: res.headers.get('sigillo-warning'), body: await res.json() as { token?: string; error?: string; expiresAt?: number; ruleId?: string; ruleExpiresAt?: number } }
+  }
+  const fetches = async () => (await (await fetch('https://issuer.test/fetches')).json() as { fetches: number }).fetches
+
+  test('a regenerated token\'s previous value works until its grace ends, each value with its own last use', async () => {
+    const { key: old, tokenId } = await insertApiToken({ name: 'Member CI', projectId, createdBy: member.user.id, expiresAt: Date.now() + 90 * DAY })
+    const { key: fresh, id, previousExpiresAt } = await regenerate(tokenId, { by: memberLogin })
+    const both = { old: (await read(old, { ip: '203.0.113.1' })).status, fresh: (await read(fresh, { ip: '203.0.113.2' })).status }
+    const row = await tokenRow(tokenId)
+    await getDb().update(schema.apiToken).set({ previousExpiresAt: Date.now() - 1000 }).where(orm.eq(schema.apiToken.id, tokenId))
+    const afterGrace = await read(old)
+    expect({
+      sameToken: id === tokenId,
+      both,
+      graceDays: Math.round((previousExpiresAt! - Date.now()) / DAY),
+      lastUse: { current: row.lastUsedIp, previous: row.previousLastUsedIp },
+      regeneratedBy: row.regeneratedBy === member.user.id && row.createdBy === member.user.id,
+      afterGrace: { old: { status: afterGrace.status, body: afterGrace.body }, fresh: (await read(fresh)).status },
+    }).toEqual({
+      sameToken: true,
+      both: { old: 200, fresh: 200 },
+      graceDays: 7,
+      lastUse: { current: '203.0.113.2', previous: '203.0.113.1' },
+      regeneratedBy: true,
+      afterGrace: { old: { status: 401, body: { error: 'API token expired: it was regenerated, use the new value' } }, fresh: 200 },
+    })
+  })
+
+  test('the grace never outlasts the old value\'s own expiry, and a token that never expired gets an expiry', async () => {
+    const soon = await insertApiToken({ name: 'Soon', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 2 * DAY })
+    const soonExpiresAt = (await tokenRow(soon.tokenId)).expiresAt
+    const soonRegenerated = await regenerate(soon.tokenId)
+    const never = await insertApiToken({ name: 'Never', projectId, createdBy: admin.user.id })
+    const neverRegenerated = await regenerate(never.tokenId, { expiresInDays: 30 })
+    const expired = await insertApiToken({ name: 'Gone', projectId, createdBy: admin.user.id, expiresAt: Date.now() - 1000 })
+    const expiredRegenerated = await regenerate(expired.tokenId)
+    const noGrace = await insertApiToken({ name: 'No grace', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 30 * DAY })
+    await regenerate(noGrace.tokenId, { graceDays: 0 })
+    expect({
+      soon: soonRegenerated.previousExpiresAt === soonExpiresAt,
+      never: {
+        grace: Math.round((neverRegenerated.previousExpiresAt! - Date.now()) / DAY),
+        expiresIn: Math.round(((await tokenRow(never.tokenId)).expiresAt! - Date.now()) / DAY),
+        old: (await read(never.key)).status,
+      },
+      expired: { previousExpiresAt: expiredRegenerated.previousExpiresAt, previousHashedKey: (await tokenRow(expired.tokenId)).previousHashedKey, old: (await read(expired.key)).body },
+      noGrace: (await read(noGrace.key)).body,
+      oneOfThree: await outcome(regenerate(noGrace.tokenId, { graceDays: 3 })),
+    }).toEqual({
+      soon: true,
+      never: { grace: 7, expiresIn: 30, old: 200 },
+      expired: { previousExpiresAt: null, previousHashedKey: null, old: { error: 'invalid or revoked API token' } },
+      noGrace: { error: 'API token expired: it was regenerated, use the new value' },
+      oneOfThree: 'The previous value keeps working for 0, 1 or 7 days',
+    })
+  })
+
+  test('regenerating again stops the value that was previous, and a page showing an older value is refused', async () => {
+    const first = await insertApiToken({ name: 'Twice', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 90 * DAY })
+    const firstPrefix = (await tokenRow(first.tokenId)).prefix
+    const second = await regenerate(first.tokenId)
+    const third = await regenerate(first.tokenId)
+    const stale = await outcome(regenerateToken({ ...adminLogin, tokenId: first.tokenId, prefix: firstPrefix, expiresInDays: 90, graceDays: 7 }))
+    // Another admin's regeneration lands between reading the token and writing it
+    const race = await insertApiToken({ name: 'Race', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 90 * DAY })
+    const prefix = (await tokenRow(race.tokenId)).prefix
+    const theirs = await hashTokenKey('sig_regenerated_meanwhile')
+    const [raced] = await Promise.all([
+      outcome(regenerateToken({ ...adminLogin, tokenId: race.tokenId, prefix, expiresInDays: 90, graceDays: 7 })),
+      getDb().update(schema.apiToken).set({ hashedKey: theirs }).where(orm.eq(schema.apiToken.id, race.tokenId)),
+    ])
+    expect({
+      first: (await read(first.key)).status,
+      second: (await read(second.key)).status,
+      third: (await read(third.key)).status,
+      stale,
+      raced,
+      theirsKept: (await tokenRow(race.tokenId)).hashedKey === theirs,
+      logged: (await eventsOf(race.tokenId)).length,
+    }).toEqual({
+      first: 401,
+      second: 200,
+      third: 200,
+      stale: 'Someone regenerated this token meanwhile: reload the page to see its new value\'s expiry',
+      raced: 'Someone regenerated this token meanwhile: reload the page to see its new value\'s expiry',
+      theirsKept: true,
+      logged: 0,
+    })
+  })
+
+  test('stopping the previous value ends it at once, into the security log', async () => {
+    const token = await insertApiToken({ name: 'Stop CI', projectId, createdBy: member.user.id, expiresAt: Date.now() + 90 * DAY })
+    const regenerated = await regenerate(token.tokenId, { by: memberLogin })
+    await stopPreviousValue({ ...memberLogin, tokenId: token.tokenId })
+    const row = await tokenRow(token.tokenId)
+    expect({
+      row: { previousHashedKey: row.previousHashedKey, previousExpiresAt: row.previousExpiresAt },
+      old: (await read(token.key)).status,
+      fresh: (await read(regenerated.key)).status,
+      again: await outcome(stopPreviousValue({ ...memberLogin, tokenId: token.tokenId })),
+      kinds: (await eventsOf(token.tokenId)).map((event) => event.kind).sort(),
+    }).toEqual({
+      row: { previousHashedKey: null, previousExpiresAt: null },
+      old: 401,
+      fresh: 200,
+      again: 'Its previous value has already stopped working',
+      kinds: ['token.previous_stopped', 'token.regenerated'],
+    })
+  })
+
+  test('its creator or an org admin regenerates a token, a machine token an admin with a passkey for 90 days at most, and only while its creator can use it', async () => {
+    const colleague = await createTestUser({ name: 'Renewal Colleague' })
+    const otherAdmin = await createTestUser({ name: 'Renewal Admin Without Passkey' })
+    const leaving = await createTestUser({ name: 'Renewal Restricted' })
+    const demoted = await createTestUser({ name: 'Renewal Demoted' })
+    await getDb().insert(schema.orgMember).values([
+      { orgId, userId: colleague.user.id, role: 'member' },
+      { orgId, userId: otherAdmin.user.id, role: 'admin' },
+      { orgId, userId: leaving.user.id, role: 'member' },
+      { orgId, userId: demoted.user.id, role: 'admin' },
+    ])
+    const plain = await insertApiToken({ name: 'Plain', projectId, createdBy: member.user.id, expiresAt: Date.now() + 90 * DAY })
+    const machine = await insertApiToken({ name: 'Deploy', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 90 * DAY, protectedAccess: true })
+    const restricted = await insertApiToken({ name: 'Restricted', projectId, createdBy: leaving.user.id, expiresAt: Date.now() + 90 * DAY })
+    const demotedMachine = await insertApiToken({ name: 'Demoted deploy', projectId, createdBy: demoted.user.id, expiresAt: Date.now() + 90 * DAY, protectedAccess: true })
+    // An admin limits one member to no projects, and demotes the other admin
+    await getDb().update(schema.orgMember).set({ projectAccess: 'selected' })
+      .where(orm.and(orm.eq(schema.orgMember.orgId, orgId), orm.eq(schema.orgMember.userId, leaving.user.id)))
+    await getDb().update(schema.orgMember).set({ role: 'member' })
+      .where(orm.and(orm.eq(schema.orgMember.orgId, orgId), orm.eq(schema.orgMember.userId, demoted.user.id)))
+    const asColleague = { userId: colleague.user.id, sessionId: await sessionIdOf(colleague.token) }
+    const asOtherAdmin = { userId: otherAdmin.user.id, sessionId: await sessionIdOf(otherAdmin.token) }
+    const before = {
+      colleague: await outcome(regenerate(plain.tokenId, { by: asColleague })),
+      adminWithoutPasskey: await outcome(regenerate(machine.tokenId, { by: asOtherAdmin })),
+      machineForAYear: await outcome(regenerate(machine.tokenId, { expiresInDays: 365 })),
+      creatorLostTheProject: await outcome(regenerate(restricted.tokenId)),
+      creatorNoLongerAdmin: await outcome(regenerate(demotedMachine.tokenId)),
+      plainForAYear: await outcome(regenerate(plain.tokenId, { expiresInDays: 365 })),
+    }
+    const regenerated = await regenerate(machine.tokenId, { expiresInDays: 90 })
+    const [event] = (await eventsOf(machine.tokenId)).filter((row) => row.kind === 'token.regenerated')
+    expect({
+      ...before,
+      machineReadsProtected: (await read(regenerated.key, { environmentId: prod })).status,
+      event: event && { ...event, id: typeof event.id, createdAt: typeof event.createdAt, details: { ...event.details, expiresAt: typeof event.details.expiresAt, previousExpiresAt: typeof event.details.previousExpiresAt } },
+    }).toEqual({
+      colleague: 'Only its creator or an org admin deletes or regenerates a token',
+      adminWithoutPasskey: 'step-up:admin',
+      machineForAYear: 'A machine token expires after 90 days at most',
+      creatorLostTheProject: 'Its creator can no longer use this token: make a new one',
+      creatorNoLongerAdmin: 'Its creator can no longer use this token: make a new one',
+      plainForAYear: 'ok',
+      machineReadsProtected: 200,
+      event: {
+        id: 'string', orgId, projectId, projectName: 'Renewals', kind: 'token.regenerated', subjectId: machine.tokenId, subjectName: 'Deploy',
+        actor: `user:${admin.user.id}`, actorName: 'Renewal Admin', ipAddress: null, createdAt: 'number',
+        details: { machine: true, expiresAt: 'number', previousExpiresAt: 'number', graceDays: 7 },
+      },
+    })
+  })
+
+  test('a regenerated token keeps its place in the history', async () => {
+    const token = await insertApiToken({ name: 'History CI', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 90 * DAY })
+    const set = (key: string, name: string) => authedFetch(key)('/api/v0/projects/:pid/environments/:eid/secrets', { method: 'POST', params: { pid: projectId, eid: dev }, body: { name, value: 'v' } })
+    assertOk(await set(token.key, 'SET_BY_OLD_VALUE'))
+    const { key } = await regenerate(token.tokenId)
+    assertOk(await set(key, 'SET_BY_NEW_VALUE'))
+    assertOk(await set(token.key, 'SET_BY_OLD_VALUE_AGAIN'))
+    const rows = await getDb().query.secretEvent.findMany({ where: { environmentId: dev, name: { like: 'SET_BY_%' } }, columns: { name: true, actor: true, apiTokenId: true }, orderBy: { createdAt: 'asc' } })
+    const chains = await getAuditChains(dev)
+    expect({ rows, chain: (await verifyChain(chains.publicKey, chains.events.rows)).ok }).toEqual({
+      rows: ['SET_BY_OLD_VALUE', 'SET_BY_NEW_VALUE', 'SET_BY_OLD_VALUE_AGAIN'].map((name) => ({ name, actor: `token:${token.tokenId}`, apiTokenId: token.tokenId })),
+      chain: true,
+    })
+  })
+
+  test('renewing a rule keeps its id, moves its expiry, fetches its keys again and makes it the renewing admin\'s', async () => {
+    const owner = await createTestUser({ name: 'Rule Owner' })
+    const [membership] = await getDb().insert(schema.orgMember).values({ orgId, userId: owner.user.id, role: 'admin' }).returning({ id: schema.orgMember.id })
+    await grantAdmin(owner.token, Date.now() + 10 * 60_000)
+    const { id } = await rule({ name: 'Renewed', subject: 'renewed' }, { userId: owner.user.id, sessionId: await sessionIdOf(owner.token) })
+    await getDb().update(schema.trustRule).set({ expiresAt: Date.now() + DAY }).where(orm.eq(schema.trustRule.id, id))
+    await getDb().update(schema.orgMember).set({ role: 'member' }).where(orm.eq(schema.orgMember.id, membership!.id))
+    const ownerDemoted = await exchange({ token: await signed({ sub: 'renewed' }) })
+    const beforeRenewal = await fetches()
+    await renewTrustRule({ ...adminLogin, ownHost: 'e.ly', ruleId: id, expiresInDays: 30 })
+    const fetched = await fetches() - beforeRenewal
+    const renewed = await exchange({ token: await signed({ sub: 'renewed' }) })
+    const afterFirst = (await getDb().query.trustRule.findFirst({ where: { id } }))!
+    // Expired: renewed all the same, and the log says so
+    await getDb().update(schema.trustRule).set({ expiresAt: Date.now() - 1000 }).where(orm.eq(schema.trustRule.id, id))
+    const whileExpired = (await exchange({ token: await signed({ sub: 'renewed' }) })).status
+    await renewTrustRule({ ...adminLogin, ownHost: 'e.ly', ruleId: id, expiresInDays: 90 })
+    const events = (await eventsOf(id)).filter((event) => event.kind === 'rule.renewed')
+    expect({
+      ownerDemoted: ownerDemoted.body.error,
+      fetched,
+      renewed: { status: renewed.status, minutes: Math.round((renewed.body.expiresAt! - Date.now()) / 60_000), ruleId: renewed.body.ruleId },
+      afterFirst: { createdBy: afterFirst.createdBy, renewals: afterFirst.renewals, days: Math.round((afterFirst.expiresAt - Date.now()) / DAY), renewedAt: afterFirst.renewedAt !== null },
+      whileExpired,
+      afterExpired: (await exchange({ token: await signed({ sub: 'renewed' }) })).status,
+      renewals: (await getDb().query.trustRule.findFirst({ where: { id }, columns: { renewals: true } }))!.renewals,
+      details: events.map((event) => ({ wasExpired: event.details.wasExpired, previousOwner: event.details.previousOwner, actor: event.actor })),
+    }).toEqual({
+      ownerDemoted: 'The admin who owns this trust rule no longer is one: another admin has to renew it on the project\'s Machines tab',
+      fetched: 1,
+      renewed: { status: 200, minutes: 60, ruleId: id },
+      afterFirst: { createdBy: admin.user.id, renewals: 1, days: 30, renewedAt: true },
+      whileExpired: 403,
+      afterExpired: 200,
+      renewals: 2,
+      details: [
+        { wasExpired: false, previousOwner: { id: owner.user.id, name: 'Rule Owner' }, actor: `user:${admin.user.id}` },
+        { wasExpired: true, previousOwner: { id: admin.user.id, name: 'Renewal Admin' }, actor: `user:${admin.user.id}` },
+      ],
+    })
+  })
+
+  test('only an org admin with their passkey renews a rule, a protected one for 90 days at most, and not while its issuer names another', async () => {
+    const newAdmin = await createTestUser({ name: 'Renewal Admin Too' })
+    await getDb().insert(schema.orgMember).values({ orgId, userId: newAdmin.user.id, role: 'admin' })
+    const { id } = await rule({ name: 'Protected deploy', subject: 'protected-renewal', environmentIds: [prod], protectedAccess: true, expiresInDays: 90 })
+    const expiresAt = Date.now() + 5 * DAY
+    const [liar] = await getDb().insert(schema.trustRule).values({
+      projectId, name: 'Liar', issuer: 'https://liar.test', jwksUri: 'https://issuer.test/jwks', jwks: { keys: [] }, audience: AUDIENCE,
+      subject: 'liar', claims: {}, environmentIds: [dev], createdBy: admin.user.id, expiresAt,
+    }).returning({ id: schema.trustRule.id })
+    const renew = (ruleId: string, expiresInDays: number, by: Login = adminLogin) => outcome(renewTrustRule({ ...by, ownHost: 'e.ly', ruleId, expiresInDays }))
+    expect({
+      member: await renew(id, 30, memberLogin),
+      adminWithoutPasskey: await renew(id, 30, { userId: newAdmin.user.id, sessionId: await sessionIdOf(newAdmin.token) }),
+      protectedForAYear: await renew(id, 365),
+      protectedFor90Days: await renew(id, 90),
+      liar: await renew(liar!.id, 30),
+      liarUnchanged: await getDb().query.trustRule.findFirst({ where: { id: liar!.id }, columns: { expiresAt: true, renewals: true } }),
+      deleted: await renew('01NOTARULE', 30),
+    }).toEqual({
+      member: 'Only admins can do this',
+      adminWithoutPasskey: 'step-up:admin',
+      protectedForAYear: 'A rule for protected environments expires after 90 days at most',
+      protectedFor90Days: 'ok',
+      liar: 'The discovery document of https://liar.test names another issuer: https://issuer.test',
+      liarUnchanged: { expiresAt, renewals: 0 },
+      deleted: 'Trust rule not found',
+    })
+  })
+
+  test('the renewal dialog shows how a rule was used, which workloads used it, and what looks stale', async () => {
+    const { id } = await rule({ name: 'Evidence', subject: 'evidence' })
+    for (const [actor, ref] of [['alice', 'refs/heads/main'], ['bob', 'refs/heads/main'], ['alice', 'refs/tags/v1']]) {
+      expect((await exchange({ token: await signed({ sub: 'evidence', repository: 'acme/api', actor, ref, event_name: 'push', runner_environment: 'github-hosted', run_id: '1', run_attempt: '1' }) })).status).toBe(200)
+    }
+    const insertRule = (values: Partial<typeof schema.trustRule.$inferInsert>) => getDb().insert(schema.trustRule).values({
+      projectId, name: 'Stale', issuer: ISSUER, jwks: { keys: [{ kid: 'k1' }] }, audience: AUDIENCE, subject: 'stale', claims: {}, environmentIds: [dev],
+      createdBy: admin.user.id, expiresAt: Date.now() + DAY, ...values,
+    }).returning({ id: schema.trustRule.id })
+    const [old] = await insertRule({ createdAt: Date.now() - 400 * DAY })
+    const [idle] = await insertRule({ lastUsedAt: Date.now() - 90 * DAY })
+    const [github] = await insertRule({ issuer: GITHUB_ISSUER, subject: 'repo:acme/api:ref:refs/heads/main', protectedAccess: true, lastUsedAt: Date.now() })
+    const evidence = await trustRuleEvidence({ userId: admin.user.id, ruleId: id })
+    const warnings = async (ruleId: string) => (await trustRuleEvidence({ userId: admin.user.id, ruleId })).warnings
+    expect({
+      exchanges: { ...evidence.exchanges, last: evidence.exchanges.last.map((token) => token.name) },
+      seen: evidence.seen,
+      keys: evidence.keys.discovered,
+      warnings: evidence.warnings,
+      old: await warnings(old!.id),
+      idle: await warnings(idle!.id),
+      github: await warnings(github!.id),
+      member: await outcome(trustRuleEvidence({ userId: member.user.id, ruleId: id })),
+    }).toEqual({
+      exchanges: { total: 3, lastMonth: 3, last: ['acme/api refs/tags/v1 run 1.1', 'acme/api refs/heads/main run 1.1', 'acme/api refs/heads/main run 1.1'] },
+      seen: [
+        { label: 'actors', values: ['alice', 'bob'] },
+        { label: 'refs', values: ['refs/heads/main', 'refs/tags/v1'] },
+        { label: 'events', values: ['push'] },
+        { label: 'runners', values: ['github-hosted'] },
+        { label: 'repositories', values: ['acme/api'] },
+      ],
+      keys: true,
+      warnings: [],
+      old: ['Never used: no workload has got a token under it. Delete it instead?', 'Made over a year ago: consider making it again with today\'s IDs.'],
+      idle: ['Not used in 60 days. Delete it instead?'],
+      github: [
+        'Its subject names the repository, not its ID: a repository that takes over the name after a rename would match.',
+        'Without a GitHub environment, anyone who can push to the branch reads these environments. Name an environment with required reviewers.',
+      ],
+      member: 'Only admins can do this',
+    })
+  })
+
+  test('the API says when a token stops working, and warns in the last quarter of its life, 14 days at most', async () => {
+    const fresh = await tokenAged({ name: 'Fresh', daysAgo: 0, daysLeft: 90 })
+    const threeDays = await tokenAged({ name: 'Three days', daysAgo: 87, daysLeft: 3 })
+    const halfDays = await tokenAged({ name: 'Half days', daysAgo: 87.5, daysLeft: 2.5 })
+    const weekly = await tokenAged({ name: 'Weekly', daysAgo: 4, daysLeft: 3 })
+    const scoped = await tokenAged({ name: 'Scoped', daysAgo: 87, daysLeft: 3, environmentIds: [dev] })
+    const regenerated = await insertApiToken({ name: 'Regenerated', projectId, createdBy: admin.user.id, expiresAt: Date.now() + 90 * DAY })
+    const { previousExpiresAt } = await regenerate(regenerated.tokenId)
+    const expired = await insertApiToken({ name: 'Expired', projectId, createdBy: admin.user.id, expiresAt: Date.now() - 1000 })
+    // A workload's token under a 30-day rule with 5 days left
+    const { id } = await rule({ name: 'Header rule', subject: 'header-rule' })
+    const ruleExpiresAt = Date.now() + 5 * DAY
+    await getDb().update(schema.trustRule).set({ createdAt: Date.now() - 25 * DAY, expiresAt: ruleExpiresAt }).where(orm.eq(schema.trustRule.id, id))
+    const exchanged = await exchange({ token: await signed({ sub: 'header-rule' }) })
+    const headers = async (key: string, environmentId = dev) => {
+      const { status, expires, warning } = await read(key, { environmentId })
+      return { status, expires, warning }
+    }
+    // ESO's routes, with the token as Basic auth user name
+    const doppler = await app.handle(new Request('http://e.ly/v3/projects', { headers: { authorization: `Basic ${btoa(`${threeDays.key}:`)}` } }))
+    expect({
+      fresh: await headers(fresh.key),
+      threeDays: await headers(threeDays.key),
+      halfDays: (await headers(halfDays.key)).warning,
+      weekly: (await headers(weekly.key)).warning,
+      workload: await headers(exchanged.body.token!),
+      exchange: exchanged.warning,
+      previous: await headers(regenerated.key),
+      refused: await headers(scoped.key, prod),
+      expired: await headers(expired.key),
+      invalid: await headers('sig_nothing'),
+      doppler: { status: doppler.status, warning: doppler.headers.get('sigillo-warning') },
+    }).toEqual({
+      fresh: { status: 200, expires: rfc3339(fresh.expiresAt), warning: null },
+      threeDays: { status: 200, expires: rfc3339(threeDays.expiresAt), warning: `token-expiry; expires=${rfc3339(threeDays.expiresAt)}; days=3` },
+      halfDays: `token-expiry; expires=${rfc3339(halfDays.expiresAt)}; days=3`,
+      // 7 days warn for their last 42 hours
+      weekly: null,
+      workload: { status: 200, expires: rfc3339(ruleExpiresAt), warning: `rule-expiry; rule=${id}; expires=${rfc3339(ruleExpiresAt)}; days=5` },
+      exchange: `rule-expiry; rule=${id}; expires=${rfc3339(ruleExpiresAt)}; days=5`,
+      previous: { status: 200, expires: rfc3339(previousExpiresAt!), warning: `token-regenerated; expires=${rfc3339(previousExpiresAt!)}; days=7` },
+      refused: { status: 403, expires: rfc3339(scoped.expiresAt), warning: `token-expiry; expires=${rfc3339(scoped.expiresAt)}; days=3` },
+      expired: { status: 401, expires: null, warning: null },
+      invalid: { status: 401, expires: null, warning: null },
+      doppler: { status: 200, warning: `token-expiry; expires=${rfc3339(threeDays.expiresAt)}; days=3` },
+    })
+  })
+
+  test('the exchange answers with its rule\'s id and expiry, and ESO\'s login stays as it was', async () => {
+    const { id } = await rule({ name: 'Exchange fields', subject: 'exchange-fields' })
+    const { expiresAt } = (await getDb().query.trustRule.findFirst({ where: { id }, columns: { expiresAt: true } }))!
+    const exchanged = await exchange({ token: await signed({ sub: 'exchange-fields' }) })
+    const oidc = await app.handle(new Request('http://e.ly/v3/auth/oidc', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identity: id, token: await signed({ sub: 'exchange-fields' }) }),
+    }))
+    expect({
+      exchange: { ruleId: exchanged.body.ruleId, ruleExpiresAt: exchanged.body.ruleExpiresAt, keys: Object.keys(exchanged.body).sort(), warning: exchanged.warning },
+      oidc: Object.keys(await oidc.json() as object).sort(),
+    }).toEqual({
+      exchange: { ruleId: id, ruleExpiresAt: expiresAt, keys: ['environmentIds', 'expiresAt', 'projectId', 'ruleExpiresAt', 'ruleId', 'token'], warning: null },
+      oidc: ['expires_at', 'success', 'token'],
+    })
+  })
+
+  test('a token\'s expiry reads the same everywhere: a quarter of its lifetime, 14 days at most', () => {
+    const at = Date.UTC(2026, 9, 1)
+    const expiry = (lifetimeDays: number, leftHours: number) => describeExpiry({ expiresAt: at + leftHours * 3_600_000, lifetimeStart: at + leftHours * 3_600_000 - lifetimeDays * DAY, now: at })
+    expect({
+      weekOutside: expiry(7, 43),
+      weekInside: expiry(7, 41),
+      monthInside: expiry(30, 7 * 24),
+      yearOutside: expiry(365, 15 * 24),
+      yearInside: expiry(365, 13 * 24),
+      lastMinutes: expiry(90, 0.5),
+      expired: expiry(90, -1),
+      never: describeExpiry({ expiresAt: null, lifetimeStart: at, now: at }),
+    }).toEqual({
+      weekOutside: { text: 'in 43 hours', level: 'ok' },
+      weekInside: { text: 'in 41 hours', level: 'warning' },
+      monthInside: { text: 'in 7 days', level: 'warning' },
+      yearOutside: { text: 'in 15 days', level: 'ok' },
+      yearInside: { text: 'in 13 days', level: 'warning' },
+      lastMinutes: { text: 'in 30 minutes', level: 'warning' },
+      expired: { text: 'expired', level: 'expired' },
+      never: { text: 'never expires', level: 'warning' },
+    })
+  })
+
+  test('a token\'s name can\'t carry terminal control characters', async () => {
+    expect(await outcome(createToken({ ...adminLogin, name: 'CI\u001b[2J', projectId, expiresInDays: 30 }))).toBe('Names can\'t contain control characters')
+  })
+
+  test('every change to what reaches secrets writes its security log row, never a value or a token', async () => {
+    const logAdmin = await createTestUser({ name: 'Log Admin' })
+    const logMember = await createTestUser({ name: 'Log Member' })
+    const af = authedFetch(logAdmin.token)
+    const logOrg = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Log Org' } })).id
+    const logProject = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Logged', orgId: logOrg } })).id
+    const doomedProject = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Doomed', orgId: logOrg } })).id
+    const env = (id: string) => af('/api/v0/projects/:projectId/environments/:id', { params: { projectId: logProject, id } }).then(assertOk)
+    const [logDev, logPreview] = [(await env('dev')).id, (await env('preview')).id]
+    const [membership] = await getDb().insert(schema.orgMember).values({ orgId: logOrg, userId: logMember.user.id, role: 'member' }).returning()
+    await grantAdmin(logAdmin.token, Date.now() + 10 * 60_000)
+    const by = { userId: logAdmin.user.id, sessionId: await sessionIdOf(logAdmin.token), request: new Request('http://e.ly', { headers: { 'cf-connecting-ip': '203.0.113.9' } }) }
+
+    const made = await createToken({ ...by, name: 'Logged CI', projectId: logProject, expiresInDays: 30 })
+    await regenerateToken({ ...by, tokenId: made.id, prefix: (await tokenRow(made.id)).prefix, expiresInDays: 30, graceDays: 1 })
+    await stopPreviousValue({ ...by, tokenId: made.id })
+    await deleteToken({ ...by, tokenId: made.id })
+    const { id: ruleId } = await createTrustRule({ ...by, ownHost: 'e.ly', rule: {
+      projectId: logProject, name: 'Logged rule', issuer: 'https://k8s.test', jwks: JSON.stringify({ keys: [publicOf(workerEnv.TEST_ISSUER_KEYS.ec)] }),
+      audience: AUDIENCE, subject: 'logged', claims: {}, environmentIds: [], protectedAccess: false, expiresInDays: 30,
+    } })
+    await replaceTrustRuleKeys({ ...by, ruleId, jwks: JSON.stringify({ keys: [publicOf(workerEnv.TEST_ISSUER_KEYS.rsa)] }) })
+    await renewTrustRule({ ...by, ownHost: 'e.ly', ruleId, expiresInDays: 90 })
+    // Refused: nothing is logged
+    const refused = await outcome(deleteTrustRule({ userId: logMember.user.id, sessionId: await sessionIdOf(logMember.token), ruleId }))
+    await deleteTrustRule({ ...by, ruleId })
+    await appendSecretEvents({ author: { ...by, apiTokenId: null }, events: [{ environmentId: logDev, name: 'PASSWORD', operation: 'set', value: 'first-value' }] })
+    await appendSecretEvents({ author: { ...by, apiTokenId: null }, events: [{ environmentId: logDev, name: 'PASSWORD', operation: 'set', value: 'second-value' }] })
+    await purgeOldValues({ environmentId: logDev, author: { ...by, apiTokenId: null }, request: by.request })
+    await setEnvironmentProtection({ request: by.request, environmentId: logDev, protect: true, author: { ...by, apiTokenId: null } })
+    await setEnvironmentProtection({ request: by.request, environmentId: logDev, protect: false, author: { ...by, apiTokenId: null } })
+    const call = (path: string) => app.handle(new Request(`http://e.ly${path}`, { method: 'DELETE', headers: { authorization: `Bearer ${logAdmin.token}`, 'cf-connecting-ip': '203.0.113.9' } }))
+    expect((await call(`/api/v0/projects/${logProject}/environments/${logPreview}`)).status).toBe(200)
+    expect((await call(`/api/v0/projects/${doomedProject}`)).status).toBe(200)
+    await setOrgMemberRole({ member: membership!, role: 'admin', by })
+    await resetMemberPasskeys({ request: by.request, actor: by, userId: logMember.user.id })
+    await deleteOrgMember({ ...membership!, role: 'admin' }, by)
+
+    const rows = await getDb().query.securityEvent.findMany({ where: { orgId: logOrg } })
+    const text = JSON.stringify(rows)
+    expect({
+      refused,
+      kinds: rows.map((row) => row.kind).sort(),
+      subjects: [...new Set(rows.map((row) => `${row.kind} ${row.projectName ?? '-'} ${row.subjectName}`))].sort(),
+      everyRow: [...new Set(rows.map((row) => `${row.actor} ${row.actorName} ${row.ipAddress}`))],
+      details: Object.fromEntries(rows.filter((row) => ['environment.deleted', 'member.removed', 'member.role_changed', 'values.purged', 'passkeys.reset', 'rule.keys_replaced'].includes(row.kind))
+        .map((row) => [`${row.kind} ${row.projectName ?? '-'} ${row.subjectName}`, row.details])),
+      noSecrets: ['first-value', 'second-value', 'sig_', 'eyJ'].filter((secret) => text.includes(secret)),
+    }).toEqual({
+      refused: 'Only admins can do this',
+      kinds: [
+        'environment.deleted', 'environment.deleted', 'environment.deleted', 'environment.deleted',
+        'environment.protected', 'environment.unprotected',
+        'member.removed', 'member.role_changed', 'passkeys.reset',
+        'rule.created', 'rule.deleted', 'rule.keys_replaced', 'rule.renewed',
+        'token.created', 'token.deleted', 'token.previous_stopped', 'token.regenerated',
+        'values.purged',
+      ],
+      subjects: [
+        'environment.deleted Doomed Dev', 'environment.deleted Doomed Preview', 'environment.deleted Doomed Prod', 'environment.deleted Logged Preview',
+        'environment.protected Logged Dev', 'environment.unprotected Logged Dev',
+        'member.removed - Log Member', 'member.role_changed - Log Member', 'passkeys.reset - Log Member',
+        'rule.created Logged Logged rule', 'rule.deleted Logged Logged rule', 'rule.keys_replaced Logged Logged rule', 'rule.renewed Logged Logged rule',
+        'token.created Logged Logged CI', 'token.deleted Logged Logged CI', 'token.previous_stopped Logged Logged CI', 'token.regenerated Logged Logged CI',
+        'values.purged Logged Dev',
+      ],
+      everyRow: [`user:${logAdmin.user.id} Log Admin 203.0.113.9`],
+      details: {
+        'environment.deleted Doomed Dev': { protected: false, withProject: true },
+        'environment.deleted Doomed Preview': { protected: false, withProject: true },
+        'environment.deleted Doomed Prod': { protected: false, withProject: true },
+        'environment.deleted Logged Preview': { protected: false, withProject: false },
+        'member.removed - Log Member': { role: 'admin', left: false },
+        'member.role_changed - Log Member': { role: 'admin', previousRole: 'member' },
+        'passkeys.reset - Log Member': { passkeys: 0 },
+        'rule.keys_replaced Logged Logged rule': { keyIds: ['rsa-1'] },
+        'values.purged Logged Dev': { values: 1, names: 1 },
+      },
+      noSecrets: [],
     })
   })
 })

@@ -9,6 +9,7 @@
 
 import { env } from 'cloudflare:workers'
 import * as orm from 'drizzle-orm'
+import type { BatchItem } from 'drizzle-orm/batch'
 import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
@@ -22,6 +23,7 @@ import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 import { redirect } from 'spiceflow'
 import { memoize } from './lib/memoize.ts'
 import { COMMON_EMAIL_DOMAINS, getEmailDomain, getNameError, isUserAllowed } from './lib/utils.ts'
+import { securityEvent, userName, type ChangedBy } from './security-log.ts'
 export { COMMON_EMAIL_DOMAINS, getEmailDomain }
 
 // ── Drizzle client via D1 ───────────────────────────────────────────
@@ -665,13 +667,17 @@ async function lookupOrgMember(userId: string, orgId: string): Promise<{ role: s
 // and the invite links they created. Tokens and invites used to outlive their creator, so a
 // departed member's CI token kept reading secrets. The secrets those tokens
 // wrote stay (secret_event.api_token_id is SET NULL).
-export async function deleteOrgMember(member: { id: string; orgId: string; userId: string }) {
+export async function deleteOrgMember(member: { id: string; orgId: string; userId: string; role: 'admin' | 'member' }, by: ChangedBy) {
   const db = getDb()
   const now = Date.now()
   const orgProjectIds = db.select({ id: schema.project.id }).from(schema.project).where(orm.eq(schema.project.orgId, member.orgId))
   const theirs = <T extends typeof schema.apiToken | typeof schema.trustRule>(table: T) =>
     orm.and(orm.eq(table.createdBy, member.userId), orm.inArray(table.projectId, orgProjectIds))
   await db.batch([
+    securityEvent({
+      request: by.request, author: { userId: by.userId, apiTokenId: null }, kind: 'member.removed', where: { orgId: member.orgId },
+      subject: { id: member.userId, name: userName(member.userId) }, details: { role: member.role, left: by.userId === member.userId },
+    }),
     // Tokens workloads got under their trust rules stay, expired, for the read log
     db.update(schema.apiToken).set({ expiresAt: now })
       .where(orm.and(theirs(schema.apiToken), orm.isNotNull(schema.apiToken.workload), orm.gt(schema.apiToken.expiresAt, now))),
@@ -736,10 +742,14 @@ export async function joinOrgByInvite({ invitationId, userId }: { invitationId: 
 
 // Inviting is up to admins: a demoted admin's invite links stop working, as
 // a removed member's do
-export async function setOrgMemberRole({ member, role }: { member: { id: string; orgId: string; userId: string }; role: 'admin' | 'member' }) {
+export async function setOrgMemberRole({ member, role, by }: { member: { id: string; orgId: string; userId: string; role: 'admin' | 'member' }; role: 'admin' | 'member'; by: ChangedBy }) {
   const db = getDb()
   await db.batch([
     db.update(schema.orgMember).set({ role }).where(orm.eq(schema.orgMember.id, member.id)),
+    securityEvent({
+      request: by.request, author: { userId: by.userId, apiTokenId: null }, kind: 'member.role_changed', where: { orgId: member.orgId },
+      subject: { id: member.userId, name: userName(member.userId) }, details: { role, previousRole: member.role },
+    }),
     ...(role === 'admin' ? [] : [db.delete(schema.orgInvitation).where(orm.and(
       orm.eq(schema.orgInvitation.orgId, member.orgId),
       orm.eq(schema.orgInvitation.createdBy, member.userId),
@@ -1080,6 +1090,38 @@ export async function requireEnvironmentDeletionTyped({ environmentId, typed }: 
   if (count > 0 && typed !== environment.slug) throw new Error(`Type the environment's slug to delete it and its ${count} ${count === 1 ? 'secret' : 'secrets'}`)
 }
 
+// Deletes an environment with its secrets and read log, and says so in the
+// security log. The caller checks who may.
+export async function deleteEnvironment({ environmentId, by }: { environmentId: string; by: ChangedBy }): Promise<boolean> {
+  const db = getDb()
+  const environment = await db.query.environment.findFirst({ where: { id: environmentId }, columns: { id: true, name: true, projectId: true, protected: true } })
+  if (!environment) return false
+  await db.batch([
+    environmentDeleted(environment, by, false),
+    db.delete(schema.environment).where(orm.eq(schema.environment.id, environmentId)),
+  ])
+  return true
+}
+
+// Deletes a project with its environments, each of them in the security log
+export async function deleteProject({ projectId, by }: { projectId: string; by: ChangedBy }): Promise<boolean> {
+  const db = getDb()
+  const environments = await db.query.environment.findMany({ where: { projectId }, columns: { id: true, name: true, projectId: true, protected: true } })
+  const [first, ...rest]: BatchItem<'sqlite'>[] = [
+    ...environments.map((environment) => environmentDeleted(environment, by, true)),
+    db.delete(schema.project).where(orm.eq(schema.project.id, projectId)).returning({ id: schema.project.id }),
+  ]
+  const results = await db.batch([first!, ...rest])
+  return (results.at(-1) as { id: string }[]).length > 0
+}
+
+function environmentDeleted(environment: { id: string; name: string; projectId: string; protected: boolean }, by: ChangedBy, withProject: boolean) {
+  return securityEvent({
+    request: by.request, author: { userId: by.userId, apiTokenId: null }, kind: 'environment.deleted', where: { projectId: environment.projectId },
+    subject: { id: environment.id, name: environment.name }, details: { protected: environment.protected, withProject },
+  })
+}
+
 // ── Secrets API auth (session OR bearer token) ─────────────────────
 // Unified auth for secrets API routes. Accepts either:
 // 1. Session cookie → verifies org membership, returns { userId }
@@ -1201,30 +1243,57 @@ export async function generateApiToken(): Promise<{ key: string; hashedKey: stri
   return { key, hashedKey, prefix }
 }
 
+// What stops a request's token working, for the API's Sigillo-Token-Expires
+// and Sigillo-Warning headers: its own expiry; for a workload's token of an
+// hour its trust rule's, which is what someone renews; for a previous value
+// the end of its grace. lifetimeStart is when that lifetime began.
+export type CredentialExpiry = {
+  kind: 'token' | 'rule' | 'regenerated'
+  expiresAt: number | null
+  lifetimeStart: number
+  ruleId: string | null
+}
+
+// A token matches by its current value, or by its value before a
+// regeneration until that one's grace ends. Each value has its own expiry
+// and last use.
 export async function verifyApiToken(key: string, ipAddress: string | null = null): Promise<{
   tokenId: string
   projectId: string
   createdBy: string
   environmentIds: string[] | null
   workload: boolean
+  expiry: CredentialExpiry
 } | null> {
   const hashedKey = await hashTokenKey(key)
   const db = getDb()
   const token = await db.query.apiToken.findFirst({
-    where: { hashedKey },
-    columns: { id: true, projectId: true, createdBy: true, expiresAt: true, lastUsedAt: true, trustRuleId: true, workload: true },
-    with: { environments: { columns: { environmentId: true } } },
+    where: { OR: [{ hashedKey }, { previousHashedKey: hashedKey }] },
+    columns: {
+      id: true, projectId: true, createdBy: true, createdAt: true, expiresAt: true, lastUsedAt: true, workload: true,
+      previousHashedKey: true, previousExpiresAt: true, previousLastUsedAt: true, regeneratedAt: true,
+    },
+    with: {
+      environments: { columns: { environmentId: true } },
+      trustRule: { columns: { id: true, expiresAt: true, renewedAt: true, createdAt: true } },
+    },
   })
   if (!token) return null
   const now = Date.now()
-  if (token.expiresAt !== null && token.expiresAt <= now) {
-    throw new Response(JSON.stringify({ error: 'API token expired' }), {
+  const viaPrevious = token.previousHashedKey === hashedKey
+  const expiresAt = viaPrevious ? token.previousExpiresAt : token.expiresAt
+  if (expiresAt !== null && expiresAt <= now) {
+    throw new Response(JSON.stringify({ error: viaPrevious ? 'API token expired: it was regenerated, use the new value' : 'API token expired' }), {
       status: 401, headers: { 'content-type': 'application/json' },
     })
   }
-  if (token.lastUsedAt === null || now - token.lastUsedAt > 3_600_000) {
-    await db.update(schema.apiToken).set({ lastUsedAt: now, lastUsedIp: ipAddress }).where(orm.eq(schema.apiToken.id, token.id))
+  const lastUsedAt = viaPrevious ? token.previousLastUsedAt : token.lastUsedAt
+  if (lastUsedAt === null || now - lastUsedAt > 3_600_000) {
+    await db.update(schema.apiToken)
+      .set(viaPrevious ? { previousLastUsedAt: now, previousLastUsedIp: ipAddress } : { lastUsedAt: now, lastUsedIp: ipAddress })
+      .where(orm.eq(schema.apiToken.id, token.id))
   }
+  const lifetimeStart = token.regeneratedAt ?? token.createdAt
   return {
     tokenId: token.id,
     projectId: token.projectId,
@@ -1233,7 +1302,42 @@ export async function verifyApiToken(key: string, ipAddress: string | null = nul
       ? null
       : token.environments.map((row) => row.environmentId),
     workload: token.workload !== null,
+    expiry: viaPrevious ? { kind: 'regenerated', expiresAt, lifetimeStart, ruleId: null }
+      : token.trustRule ? { kind: 'rule', expiresAt: token.trustRule.expiresAt, lifetimeStart: token.trustRule.renewedAt ?? token.trustRule.createdAt, ruleId: token.trustRule.id }
+      : { kind: 'token', expiresAt, lifetimeStart, ruleId: null },
   }
+}
+
+// Why a token's creator can no longer use it, or null. A token acts for its
+// creator: it stops working with their sign-in (the allowlist) and with their
+// access to its project, and a workload's token when its rule's creator is
+// no longer an admin.
+export async function tokenCreatorError({ createdBy, projectId, needsAdmin }: { createdBy: string; projectId: string; needsAdmin: boolean }) {
+  const creator = await getDb().query.user.findFirst({ where: { id: createdBy }, columns: { email: true, emailVerified: true } })
+  if (!creator || !isAllowed(creator)) return { status: 401, error: 'the creator of this API token may no longer sign in' }
+  const access = await getProjectMemberAccess(createdBy, projectId)
+  if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(projectId))) {
+    return { status: 403, error: 'the creator of this API token can no longer open its project' }
+  }
+  if (needsAdmin && access.role !== 'admin') return { status: 403, error: 'the admin who made this trust rule no longer is one' }
+  return null
+}
+
+// The expiry of the token each API request was made with, once it was
+// verified, for the API's headers (api.ts). By the request Spiceflow hands
+// every middleware and handler, also when a handler reads the token from a
+// request it made from that one (deriveRequest).
+const verifiedExpiry = new WeakMap<Request, CredentialExpiry>()
+const derivedFrom = new WeakMap<Request, Request>()
+
+export function deriveRequest(request: Request, init: RequestInit): Request {
+  const derived = new Request(request, init)
+  derivedFrom.set(derived, derivedFrom.get(request) ?? request)
+  return derived
+}
+
+export function requestTokenExpiry(request: Request): CredentialExpiry | null {
+  return verifiedExpiry.get(request) ?? null
 }
 
 // Reads a sig_ bearer token from the request. Returns null when the request
@@ -1251,17 +1355,13 @@ export async function getRequestApiToken(request: Request): Promise<{
   if (!bearer?.startsWith('sig_')) return null
   const token = await verifyApiToken(bearer, request.headers.get('cf-connecting-ip'))
   if (!token) throw unauthorizedResponse('invalid or revoked API token')
-  // A token acts for its creator: it stops working with their sign-in (the
-  // allowlist) and with their access to its project
-  const creator = await getDb().query.user.findFirst({ where: { id: token.createdBy }, columns: { email: true, emailVerified: true } })
-  if (!creator || !isAllowed(creator)) throw unauthorizedResponse('the creator of this API token may no longer sign in')
-  const access = await getProjectMemberAccess(token.createdBy, token.projectId)
-  if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(token.projectId))) {
-    throw forbiddenResponse('the creator of this API token can no longer open its project')
-  }
-  // A workload's token acts for the admin who made its trust rule, only while they are one
-  if (token.workload && access.role !== 'admin') throw forbiddenResponse('the admin who made this trust rule no longer is one')
-  return token
+  const { expiry, ...verified } = token
+  const creatorError = await tokenCreatorError({ createdBy: token.createdBy, projectId: token.projectId, needsAdmin: token.workload })
+  if (creatorError?.status === 401) throw unauthorizedResponse(creatorError.error)
+  // Past its 401s, the answer tells when the token expires, also when it is a refusal
+  verifiedExpiry.set(derivedFrom.get(request) ?? request, expiry)
+  if (creatorError) throw forbiddenResponse(creatorError.error)
+  return verified
 }
 
 // ── Encryption (AES-256-GCM) ────────────────────────────────────────

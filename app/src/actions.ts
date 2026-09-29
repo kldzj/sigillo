@@ -11,7 +11,7 @@
 'use server'
 
 import { ulid } from 'ulid'
-import { getEnvSlugError, getSecretNameError, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
+import { getEnvSlugError, getSecretNameError } from './lib/utils.ts'
 import * as orm from 'drizzle-orm'
 import { schema } from 'db'
 import { getActionRequest, redirect } from 'spiceflow'
@@ -21,24 +21,23 @@ import {
   requireOrgMember,
   getOrgIdForProject, getOrgIdForEnvironment,
   decrypt,
-  generateApiToken,
   deriveSecrets,
   getMemberProjectAccess,
-  getMemberAccess,
   getUserEnvironmentAccess,
-  getEnvironmentAccessError,
   getClaimableAutoJoinDomain,
   deleteOrgMember, joinOrgByInvite, setOrgMemberRole, requireValidName, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped,
+  deleteEnvironment, deleteProject,
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
 import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, purgeOldValues, type NewSecretEvent } from './audit.ts'
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
-  requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
-  requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
+  requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, resetMemberPasskeys, type Purpose,
+  requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus,
 } from './step-up.ts'
-import { createTrustRule, deleteTrustRule, replaceTrustRuleKeys, type TrustRuleInput } from './workload.ts'
+import { createTrustRule, deleteTrustRule, renewTrustRule, replaceTrustRuleKeys, trustRuleEvidence, type TrustRuleInput } from './workload.ts'
+import { createToken, deleteToken, regenerateToken, stopPreviousValue } from './tokens.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 
 async function requireSession() {
@@ -67,30 +66,6 @@ async function requireProjectAccess(userId: string, projectId: string) {
     throw new Error('You do not have access to this project')
   }
   return orgId
-}
-
-// A token reads every secret in its scope, so creating or revoking one needs
-// access to that whole scope: the listed envs, or every env of the project
-// for a project-wide token (no env ids). Admin-only envs added later stay
-// safe: token use re-checks that the creator is still an admin.
-async function requireTokenScopeAccess({ userId, projectId, environmentIds }: {
-  userId: string
-  projectId: string
-  environmentIds: string[]
-}) {
-  const orgId = await requireProjectAccess(userId, projectId)
-  const [access, envs] = await Promise.all([
-    getMemberAccess({ userId, orgId }),
-    getDb().query.environment.findMany({
-      where: environmentIds.length > 0 ? { projectId, id: { in: environmentIds } } : { projectId },
-      columns: { projectId: true, accessRole: true },
-    }),
-  ])
-  if (envs.length < environmentIds.length) throw new Error('Environment not found in this project')
-  for (const env of envs) {
-    const error = getEnvironmentAccessError(access, env)
-    if (error) throw new Error(error)
-  }
 }
 
 async function ensureAnotherAdminExists(orgId: string, userId: string) {
@@ -178,7 +153,7 @@ export async function purgeOldValuesAction({ environmentId }: { environmentId: s
   const session = await requireSession()
   return stepUpOr(async () => {
     await requireOldValuesPurge({ ...session, environmentId })
-    return purgeOldValues({ environmentId, author: authorOf(session) })
+    return purgeOldValues({ environmentId, author: authorOf(session), request: getActionRequest() })
   })
 }
 
@@ -366,8 +341,7 @@ export async function deleteEnvAction({ id, typedSlug }: { id: string; typedSlug
     await requireEnvironmentAccess(session.userId, id)
     await requireEnvironmentDeletionTyped({ environmentId: id, typed: typedSlug })
     await requireAdminForProtected({ ...session, environmentIds: [id] })
-    const db = getDb()
-    await db.delete(schema.environment).where(orm.eq(schema.environment.id, id))
+    await deleteEnvironment({ environmentId: id, by: { userId: session.userId, request: getActionRequest() } })
     return { ok: true }
   })
 }
@@ -473,7 +447,7 @@ export async function updateOrgMemberRoleAction({ memberId, role }: {
       await ensureAnotherAdminExists(member.orgId, member.userId)
     }
 
-    await setOrgMemberRole({ member, role })
+    await setOrgMemberRole({ member, role, by: { userId: session.userId, request: getActionRequest() } })
 
     return { id: member.id, role }
   })
@@ -495,7 +469,7 @@ export async function removeOrgMemberAction({ memberId }: { memberId: string }) 
       await ensureAnotherAdminExists(member.orgId, member.userId)
     }
 
-    await deleteOrgMember(member)
+    await deleteOrgMember(member, { userId: session.userId, request: getActionRequest() })
     return { id: member.id }
   })
 }
@@ -514,8 +488,15 @@ export async function endOtherSessionsAction() {
 }
 
 // ── API Token actions ───────────────────────────────────────────────
+// Through tokens.ts, which checks who may
 
-export async function createTokenAction(args: {
+// The signed-in person changing a token, and their request
+async function tokenLogin() {
+  const { userId, sessionId } = await requireSession()
+  return { userId, sessionId, request: getActionRequest() }
+}
+
+export async function createTokenAction({ name, projectId, environmentIds, expiresInDays, protectedAccess }: {
   name: string
   projectId: string
   environmentIds?: string[]
@@ -523,74 +504,26 @@ export async function createTokenAction(args: {
   // A machine token, which reads protected environments without a passkey
   protectedAccess?: boolean
 }) {
-  return stepUpOr(() => createToken(args))
-}
-
-async function createToken({ name, projectId, environmentIds, expiresInDays, protectedAccess = false }: {
-  name: string
-  projectId: string
-  environmentIds?: string[]
-  expiresInDays: number
-  protectedAccess?: boolean
-}) {
-  if (!name) throw new Error('Name is required')
-  if (!projectId) throw new Error('Project is required')
-  if (!TOKEN_EXPIRY_DAYS.some((days) => days === expiresInDays)) {
-    throw new Error(`Expiry must be one of ${TOKEN_EXPIRY_DAYS.join(', ')} days`)
-  }
-  const session = await requireSession()
-  const uniqueEnvIds = Array.from(new Set(environmentIds ?? []))
-  await requireTokenScopeAccess({ userId: session.userId, projectId, environmentIds: uniqueEnvIds })
-  const db = getDb()
-
-  // A token outlives the session that makes it
-  await requirePasskeyOnceEnrolled({ userId: session.userId, sessionId: session.sessionId })
-  if (protectedAccess) {
-    await requireMachineTokenApproval({ userId: session.userId, sessionId: session.sessionId, projectId, expiresInDays })
-  }
-
-  const { key, hashedKey, prefix } = await generateApiToken()
-  const tokenId = ulid()
-  await db.batch([
-    db.insert(schema.apiToken).values({
-      id: tokenId,
-      name,
-      projectId,
-      prefix,
-      hashedKey,
-      createdBy: session.userId,
-      expiresAt: Date.now() + expiresInDays * 86_400_000,
-      protectedAccess,
-    }),
-    ...uniqueEnvIds.map((environmentId) =>
-      db.insert(schema.apiTokenEnvironment).values({ tokenId, environmentId }),
-    ),
-  ] as [any, ...any[]])
-
-  // Return the full key — this is the only time it's ever available
-  return { id: tokenId, key }
+  return stepUpOr(async () => createToken({ ...await tokenLogin(), name, projectId, environmentIds, expiresInDays, protectedAccess }))
 }
 
 export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
   return stepUpOr(async () => {
     if (!tokenId) throw new Error('Token ID is required')
-    const session = await requireSession()
-    const db = getDb()
-    const token = await db.query.apiToken.findFirst({
-      where: { id: tokenId },
-      columns: { projectId: true, protectedAccess: true, createdBy: true },
-      with: { environments: { columns: { environmentId: true } } },
-    })
-    if (!token) throw new Error('Token not found')
-    await requireTokenDeletion({ ...session, token })
-    await requireTokenScopeAccess({
-      userId: session.userId,
-      projectId: token.projectId,
-      environmentIds: token.environments.map((row) => row.environmentId),
-    })
-    // Deleting a machine token stops CI: an admin action, like making one
-    if (token.protectedAccess) await requireMachineTokenDeletion({ userId: session.userId, sessionId: session.sessionId, projectId: token.projectId })
-    await db.delete(schema.apiToken).where(orm.eq(schema.apiToken.id, tokenId))
+    await deleteToken({ ...await tokenLogin(), tokenId })
+    return { ok: true }
+  })
+}
+
+// A new value and expiry for the same token; the value before keeps working
+// for graceDays. Shows the new key once, like making one.
+export async function regenerateTokenAction({ tokenId, prefix, expiresInDays, graceDays }: { tokenId: string; prefix: string; expiresInDays: number; graceDays: number }) {
+  return stepUpOr(async () => regenerateToken({ ...await tokenLogin(), tokenId, prefix, expiresInDays, graceDays }))
+}
+
+export async function stopPreviousValueAction({ tokenId }: { tokenId: string }) {
+  return stepUpOr(async () => {
+    await stopPreviousValue({ ...await tokenLogin(), tokenId })
     return { ok: true }
   })
 }
@@ -601,14 +534,14 @@ export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
 export async function createTrustRuleAction(rule: TrustRuleInput) {
   return stepUpOr(async () => {
     const session = await requireSession()
-    return createTrustRule({ userId: session.userId, sessionId: session.sessionId, ownHost: new URL(getActionRequest().url).hostname, rule })
+    return createTrustRule({ userId: session.userId, sessionId: session.sessionId, request: getActionRequest(), ownHost: new URL(getActionRequest().url).hostname, rule })
   })
 }
 
 export async function deleteTrustRuleAction({ ruleId }: { ruleId: string }) {
   return stepUpOr(async () => {
     const session = await requireSession()
-    await deleteTrustRule({ userId: session.userId, sessionId: session.sessionId, ruleId })
+    await deleteTrustRule({ userId: session.userId, sessionId: session.sessionId, request: getActionRequest(), ruleId })
     return { ok: true }
   })
 }
@@ -616,9 +549,24 @@ export async function deleteTrustRuleAction({ ruleId }: { ruleId: string }) {
 export async function replaceTrustRuleKeysAction({ ruleId, jwks }: { ruleId: string; jwks: string }) {
   return stepUpOr(async () => {
     const session = await requireSession()
-    await replaceTrustRuleKeys({ userId: session.userId, sessionId: session.sessionId, ruleId, jwks })
+    await replaceTrustRuleKeys({ userId: session.userId, sessionId: session.sessionId, request: getActionRequest(), ruleId, jwks })
     return { ok: true }
   })
+}
+
+// A new expiry for the same rule, which becomes the renewing admin's
+export async function renewTrustRuleAction({ ruleId, expiresInDays }: { ruleId: string; expiresInDays: number }) {
+  return stepUpOr(async () => {
+    const session = await requireSession()
+    const request = getActionRequest()
+    return renewTrustRule({ userId: session.userId, sessionId: session.sessionId, request, ownHost: new URL(request.url).hostname, ruleId, expiresInDays })
+  })
+}
+
+// What the renewal dialog shows about a rule's use, for org admins
+export async function trustRuleEvidenceAction({ ruleId }: { ruleId: string }) {
+  const session = await requireSession()
+  return trustRuleEvidence({ userId: session.userId, ruleId })
 }
 
 export async function syncMissingSecretsAction(args: {
@@ -822,7 +770,7 @@ export async function deleteProjectAction({ projectId, typedName }: { projectId:
     await requireProjectChange({ ...session, projectId })
     await requireProjectDeletionTyped({ projectId, typed: typedName })
     const project = await getDb().query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } })
-    await getDb().delete(schema.project).where(orm.eq(schema.project.id, projectId))
+    await deleteProject({ projectId, by: { userId: session.userId, request: getActionRequest() } })
     throw redirect(project ? router.href('/dash/orgs/:orgId', { orgId: project.orgId }) : router.href('/dash'))
   })
 }
@@ -840,7 +788,7 @@ export async function leaveOrgAction({ orgId }: { orgId: string }) {
     const admins = await getDb().query.orgMember.findMany({ where: { orgId, role: 'admin' }, columns: { userId: true } })
     if (admins.length === 1) return { error: 'This organization needs at least one admin: make someone else an admin first' }
   }
-  await deleteOrgMember(member)
+  await deleteOrgMember(member, { userId: session.userId, request: getActionRequest() })
   throw redirect(router.href('/dash'))
 }
 

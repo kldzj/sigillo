@@ -369,10 +369,23 @@ export const apiToken = sqliteCore.sqliteTable('api_token', {
   // or pod it was. Kept after the rule is deleted, for the read log.
   trustRuleId: sqliteCore.text('trust_rule_id').references(() => trustRule.id, { onDelete: 'set null' }),
   workload: sqliteCore.text('workload', { mode: 'json' }).$type<{ kid: string | null; claims: Record<string, unknown> }>(),
+  // Regenerating gives the row a new value and expiry (app/src/tokens.ts).
+  // The value before it keeps working until previous_expires_at, so CI can
+  // switch over, and its hash stays after that, so it is told why it stopped.
+  // A regeneration moves hashed_key here in the same update: a hash is never
+  // in both columns.
+  previousHashedKey: sqliteCore.text('previous_hashed_key'),
+  previousExpiresAt: epochMs('previous_expires_at'),
+  previousLastUsedAt: epochMs('previous_last_used_at'),
+  previousLastUsedIp: sqliteCore.text('previous_last_used_ip'),
+  // The start of the current value's lifetime; null until regenerated
+  regeneratedAt: epochMs('regenerated_at'),
+  regeneratedBy: sqliteCore.text('regenerated_by').references(() => user.id, { onDelete: 'set null' }),
 }, (table) => [
   sqliteCore.index('api_token_project_id_idx').on(table.projectId),
   sqliteCore.index('api_token_hashed_key_idx').on(table.hashedKey),
   sqliteCore.index('api_token_trust_rule_id_idx').on(table.trustRuleId),
+  sqliteCore.uniqueIndex('api_token_previous_hashed_key_unique').on(table.previousHashedKey),
 ])
 
 // ── Workload identities ─────────────────────────────────────────────
@@ -404,14 +417,51 @@ export const trustRule = sqliteCore.sqliteTable('trust_rule', {
   environmentIds: sqliteCore.text('environment_ids', { mode: 'json' }).$type<string[]>().notNull(),
   // Its tokens read and change protected environments, like a machine token's
   protectedAccess: sqliteCore.integer('protected_access', { mode: 'boolean' }).notNull().default(false),
-  // An org admin, for as long as they are one: tokens act for them
+  // An org admin, for as long as they are one: tokens act for them. Renewing
+  // the rule makes it the renewing admin's.
   createdBy: sqliteCore.text('created_by').notNull().references(() => user.id, { onDelete: 'cascade' }),
   createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
   expiresAt: epochMs('expires_at').notNull(),
   lastUsedAt: epochMs('last_used_at'),
+  // Renewed in place, keeping its id: when last, and how often
+  renewedAt: epochMs('renewed_at'),
+  renewals: sqliteCore.integer('renewals').notNull().default(0),
 }, (table) => [
   sqliteCore.index('trust_rule_issuer_idx').on(table.issuer),
   sqliteCore.index('trust_rule_project_id_idx').on(table.projectId),
+])
+
+// ── Security log ────────────────────────────────────────────────────
+// A row for each change to what can reach secrets: tokens, trust rules,
+// protection, members, passkeys (app/src/security-log.ts). Written in the
+// same batch as the change. No foreign keys, names copied in, like
+// passkey_event: the log outlives the org, the project and the people.
+// Never a value, a token or a JWT.
+export const SECURITY_EVENT_KINDS = [
+  'token.created', 'token.regenerated', 'token.deleted', 'token.previous_stopped',
+  'rule.created', 'rule.renewed', 'rule.deleted', 'rule.keys_replaced',
+  'environment.protected', 'environment.unprotected', 'environment.deleted',
+  'values.purged', 'member.removed', 'member.role_changed', 'passkeys.reset',
+] as const
+
+export const securityEvent = sqliteCore.sqliteTable('security_event', {
+  id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
+  orgId: sqliteCore.text('org_id').notNull(),
+  // Null for an organization's own events
+  projectId: sqliteCore.text('project_id'),
+  projectName: sqliteCore.text('project_name'),
+  kind: sqliteCore.text('kind', { enum: SECURITY_EVENT_KINDS }).notNull(),
+  // The token, rule, environment or member, and its name at the time
+  subjectId: sqliteCore.text('subject_id').notNull(),
+  subjectName: sqliteCore.text('subject_name').notNull(),
+  // 'user:<id>' or 'token:<id>', as the history chains write it
+  actor: sqliteCore.text('actor').notNull(),
+  actorName: sqliteCore.text('actor_name'),
+  ipAddress: sqliteCore.text('ip_address'),
+  details: sqliteCore.text('details', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+  createdAt: epochMs('created_at').notNull().$defaultFn(() => Date.now()),
+}, (table) => [
+  sqliteCore.index('security_event_org_id_idx').on(table.orgId, table.createdAt),
 ])
 
 // Env allowlist for a token. Zero rows = all envs in the project.
@@ -487,7 +537,7 @@ export const deviceCode = sqliteCore.sqliteTable('device_code', {
 // ── Relations (v2 API) ──────────────────────────────────────────────
 
 export const relations = defineRelations(
-  { user, session, account, verification, passkey, passkeyEvent, stepUpRequest, stepUpGrant, org, orgMember, orgInvitation, project, environment, secretEvent, secretRead, apiToken, apiTokenEnvironment, trustRule, deviceCode, oauthDomain, memberAccess },
+  { user, session, account, verification, passkey, passkeyEvent, stepUpRequest, stepUpGrant, org, orgMember, orgInvitation, project, environment, secretEvent, secretRead, apiToken, apiTokenEnvironment, trustRule, securityEvent, deviceCode, oauthDomain, memberAccess },
   (r) => ({
     user: {
       sessions: r.many.session(),
@@ -549,6 +599,7 @@ export const relations = defineRelations(
     apiToken: {
       project: r.one.project({ from: r.apiToken.projectId, to: r.project.id }),
       creator: r.one.user({ from: r.apiToken.createdBy, to: r.user.id }),
+      regenerator: r.one.user({ from: r.apiToken.regeneratedBy, to: r.user.id }),
       environments: r.many.apiTokenEnvironment(),
       trustRule: r.one.trustRule({ from: r.apiToken.trustRuleId, to: r.trustRule.id }),
     },
@@ -569,5 +620,6 @@ export const relations = defineRelations(
       project: r.one.project({ from: r.memberAccess.projectId, to: r.project.id }),
     },
     oauthDomain: {},
+    securityEvent: {},
   }),
 )

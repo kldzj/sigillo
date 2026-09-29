@@ -51,6 +51,46 @@ export const DEFAULT_TOKEN_EXPIRY_DAYS = 90
 // A machine token reads protected environments without a passkey, so it must
 // expire sooner
 export const MACHINE_TOKEN_MAX_DAYS = 90
+// How long a regenerated token's previous value keeps working, in days,
+// never past its own expiry
+export const GRACE_DAYS = [0, 1, 7] as const
+export const DEFAULT_GRACE_DAYS = 7
+
+export const GITHUB_ISSUER = 'https://token.actions.githubusercontent.com'
+
+// ── Expiry ──────────────────────────────────────────────────────────
+
+const DAY_MS = 86_400_000
+
+// A token or trust rule is expiring once less than this is left of it: a
+// quarter of its lifetime, 14 days at most. A 7-day token warns for its last
+// 42 hours, a 30-day one for 7½ days, longer ones for 14 days.
+export function warnWindow(lifetimeMs: number): number {
+  return Math.min(14 * DAY_MS, Math.max(0, lifetimeMs) / 4)
+}
+
+export type ExpiryLevel = 'ok' | 'warning' | 'expired'
+
+// When a token or trust rule stops working, as the Machines tab, the
+// dashboard banner and the API's Sigillo-Warning header all judge it.
+// lifetimeStart is when its current lifetime began: made, regenerated or
+// renewed. A token from before tokens expired has no expiresAt, and is
+// flagged too.
+export function describeExpiry({ expiresAt, lifetimeStart, now }: { expiresAt: number | null; lifetimeStart: number; now: number }): { text: string; level: ExpiryLevel } {
+  if (expiresAt === null) return { text: 'never expires', level: 'warning' }
+  const left = expiresAt - now
+  if (left <= 0) return { text: 'expired', level: 'expired' }
+  return { text: `in ${durationText(left)}`, level: left < warnWindow(expiresAt - lifetimeStart) ? 'warning' : 'ok' }
+}
+
+// Whole days rounded up, as the API's Sigillo-Warning counts them; hours and
+// minutes for the last two days
+function durationText(ms: number): string {
+  const [count, unit] = ms < 3_600_000 ? [Math.ceil(ms / 60_000), 'minute']
+    : ms < 2 * DAY_MS ? [Math.ceil(ms / 3_600_000), 'hour']
+    : [Math.ceil(ms / DAY_MS), 'day']
+  return `${count} ${unit}${count === 1 ? '' : 's'}`
+}
 
 // Who may sign up and sign in, from ALLOWED_USERS: comma-separated email
 // addresses and domains. Empty lets in anyone the provider signs in. Only
