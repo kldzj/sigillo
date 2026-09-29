@@ -405,7 +405,7 @@ export interface SelfHostOptions {
 
 const interactive = () => process.stdin.isTTY && !isAgent
 
-async function selfHost(options: SelfHostOptions) {
+export async function selfHost(options: SelfHostOptions) {
   const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
   const state = readState()
   const savedDeployments = Object.values(state.deployments ?? {})
@@ -540,6 +540,8 @@ async function selfHost(options: SelfHostOptions) {
     betterAuthSecret: secrets.betterAuthSecret ?? saved?.betterAuthSecret,
     encryptionKey: secrets.encryptionKey ?? saved?.encryptionKey,
     encryptionKeys: saved?.encryptionKeys,
+    // Every backup made so far opens only with it
+    backupIdentity: saved?.backupIdentity,
     ...provider,
     // Recorded once both workers have the new list, so a failed run retries
     allowedUsers: saved?.allowedUsers,

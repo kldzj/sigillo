@@ -2,8 +2,10 @@
 // databases are SQLite databases, the state file lives in memory, and there
 // is no terminal, so nothing prompts.
 
+import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { gzipSync } from 'node:zlib'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
@@ -45,7 +47,7 @@ vi.mock('@clack/prompts', () => {
   }
 })
 
-const { restoreDeployment, rotateKey } = await import('../src/selfhost/cli.js')
+const { restoreDeployment, rotateKey, selfHost } = await import('../src/selfhost/cli.js')
 
 // A home of its own, for the files the commands read there
 const home = process.env.HOME
@@ -194,6 +196,83 @@ async function backupOf(): Promise<{ file: string; saved: DeploymentState }> {
   writeFileSync(file, await sealBackup(backup, identity))
   return { file, saved: deployment(identity) }
 }
+
+// A Cloudflare account where both workers of the deployment run: its D1
+// databases by id, and the database each worker is bound to
+function account(databases: Record<string, DatabaseSync>) {
+  const bound: Record<string, string> = {}
+  const uploads = new Map<string, string>()
+  const client = {
+    async listAccounts() {
+      return [{ id: 'acc', name: 'Acme' }]
+    },
+    async getWorkerSettings(_accountId: string, scriptName: string) {
+      const vars: Record<string, string> = { sigillo: 'PROVIDER_URL', 'sigillo-auth': 'BETTER_AUTH_URL' }
+      if (!vars[scriptName]) return null
+      const url = vars[scriptName] === 'PROVIDER_URL' ? 'https://sigillo-auth.acme.workers.dev' : 'https://sigillo.acme.workers.dev'
+      return { bindings: [{ type: 'd1', name: 'DB' }, { type: 'plain_text', name: vars[scriptName], text: url }] }
+    },
+    async getAccountSubdomain() {
+      return { subdomain: 'acme' }
+    },
+    async d1Query({ databaseId, sql, params }: { databaseId: string; sql: string; params?: string[] }) {
+      return [{ results: d1(databases[databaseId]!)(sql, params) }]
+    },
+    async createAssetsUploadSession() {
+      return { jwt: 'assets', buckets: [] }
+    },
+    async putWorker({ scriptName, formData }: { scriptName: string; formData: FormData }) {
+      const metadata = JSON.parse(await (formData.get('metadata') as File).text()) as { bindings: Array<{ type: string; id?: string }> }
+      bound[scriptName] = metadata.bindings.find((binding) => binding.type === 'd1')!.id!
+    },
+    async enableWorkersDev() {},
+    async putWorkerSecret() {},
+    async deleteWorkerSecret() {},
+    async createD1(_accountId: string, name: string) {
+      databases[name] = new DatabaseSync(':memory:')
+      return { uuid: name, name }
+    },
+    async d1ImportStep({ databaseId, body }: { databaseId: string; body: { action: string } }) {
+      if (body.action === 'init') return { upload_url: `https://upload.example/${databaseId}`, filename: 'backup.sql' }
+      databases[databaseId]!.exec(uploads.get(databaseId)!)
+      return { success: true, status: 'complete' }
+    },
+    async deleteD1(_accountId: string, databaseId: string) {
+      delete databases[databaseId]
+    },
+  }
+  // Uploads of imports, and the health checks of both workers
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = new URL(String(input))
+    if (url.host !== 'upload.example') return new Response('ok')
+    const sql = String(init?.body)
+    uploads.set(url.pathname.slice(1), sql)
+    return new Response('', { headers: { etag: `"${createHash('md5').update(sql).digest('hex')}"` } })
+  })
+  return { client: client as unknown as CfClient, bound, databases }
+}
+
+// The release both workers run, as a local bundle file
+function bundleFile(): string {
+  const worker = { compatibilityDate: '2026-04-16', compatibilityFlags: ['nodejs_compat'], mainModule: 'index.js', modules: { 'index.js': Buffer.from('export default {}').toString('base64') }, assets: {}, migrations: {} }
+  const file = path.join(dir, 'bundle.json.gz')
+  writeFileSync(file, gzipSync(JSON.stringify({ formatVersion: 2, version: '0.16.0', createdAt: '2026-09-29T00:00:00.000Z', app: worker, provider: worker })))
+  return file
+}
+
+describe('updating a deployment', () => {
+  test('keeps its backup key, which every backup so far needs', async () => {
+    const saved = deployment('AGE-SECRET-KEY-1TEST')
+    fake.state = { deployments: { 'acc/sigillo': saved } }
+    const cloudflare = account({ 'app-before': new DatabaseSync(':memory:'), 'auth-before': new DatabaseSync(':memory:') })
+    fake.client = cloudflare.client
+    await selfHost({ bundle: bundleFile(), yes: true })
+    expect({ bound: cloudflare.bound, saved: fake.state.deployments!['acc/sigillo'] }).toEqual({
+      bound: { 'sigillo-auth': 'auth-before', sigillo: 'app-before' },
+      saved: { ...saved, backupIdentity: 'AGE-SECRET-KEY-1TEST' },
+    })
+  })
+})
 
 describe('restoring a backup', () => {
   test('needs --yes without a terminal, since it discards every change since the backup', async () => {
