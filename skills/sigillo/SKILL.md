@@ -9,13 +9,13 @@ description: >
 
 # sigillo
 
-ALWAYS fetch the latest README before doing anything else. NEVER skip this:
+ALWAYS fetch the latest docs before doing anything else. NEVER skip this:
 
 ```bash
-curl -s https://raw.githubusercontent.com/kldzj/sigillo/main/README.md
+curl -s https://sigillo.kldzj.dev/llms-full.txt
 ```
 
-**NEVER pipe through `head`, `tail`, `sed -n`, or any truncating command.** Read the full output — integration patterns are near the bottom and will be missed if truncated.
+**NEVER pipe through `head`, `tail`, `sed -n`, or any truncating command.** Read the full output: it holds every docs page, and the integration and CI patterns will be missed if truncated.
 
 ALWAYS also run help to see exact flag names for the installed version (flags can differ between versions):
 
@@ -284,8 +284,8 @@ Avoid `sigillo secrets download` unless a specific tool requires a file. Prefer 
 `wrangler secret bulk` is a valid exception because it accepts stdin. For
 Cloudflare Workers, sync the complete environment directly through a pipe and
 do not create `.env.preview` or `.env.prod` files. Read the **Cloudflare
-Workers** section of the root README for the canonical package scripts and
-explicit production/preview target flags.
+Workers** section of the docs' "Sync to other platforms" page for the
+canonical package scripts and explicit production/preview target flags.
 
 ## Placeholder secrets (user fills in later)
 
