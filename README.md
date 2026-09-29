@@ -9,7 +9,7 @@
 
 Sigillo replaces `.env` files with a **secrets manager you self-host** on Cloudflare. Prefix your commands with `sigillo run` and secrets are injected as environment variables, never written to disk.
 
-> **This is [kldzj/sigillo](https://github.com/kldzj/sigillo)**, a fork of [remorses/sigillo](https://github.com/remorses/sigillo) that keeps building on it for teams who want tighter control over their secrets, with features such as passkey approval for production, a signed history of every change and read, and machine tokens for CI. Some of them are opinionated in ways upstream may not want, so they live here, while fixes that suit both go upstream as pull requests. The [releases](https://github.com/kldzj/sigillo/releases) list everything the fork adds. There is no hosted service: every instance runs on your own Cloudflare account with its own Google login. The CLI is published as [`@kldzj/sigillo`](https://www.npmjs.com/package/@kldzj/sigillo), and the docs are at [sigillo.kldzj.dev](https://sigillo.kldzj.dev).
+> **This is [kldzj/sigillo](https://github.com/kldzj/sigillo)**, a fork of [Sigillo](https://github.com/remorses/sigillo) by [Tommy D. Rossi](https://github.com/remorses) that keeps building on it for teams who want tighter control over their secrets, with features such as passkey approval for production, a signed history of every change and read, and machine tokens for CI. Some of them are opinionated in ways upstream may not want, so they live here, while fixes that suit both go upstream as pull requests. The [releases](https://github.com/kldzj/sigillo/releases) list everything the fork adds. There is no hosted service: every instance runs on your own Cloudflare account with its own Google login. The CLI is published as [`@kldzj/sigillo`](https://www.npmjs.com/package/@kldzj/sigillo), and the docs are at [sigillo.kldzj.dev](https://sigillo.kldzj.dev).
 
 ```bash
 # instead of this
@@ -831,4 +831,4 @@ curl -X PUT -H "Authorization: Bearer sig_xxx" \
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE). Sigillo was created by [Tommy D. Rossi](https://github.com/remorses) and the Sigillo contributors at [remorses/sigillo](https://github.com/remorses/sigillo); this fork is maintained by Nikolai Kolodziej.

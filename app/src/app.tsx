@@ -1279,9 +1279,14 @@ async function Footer() {
         <div className="flex flex-wrap items-center justify-end gap-4 px-6 py-5">
           <ThemeSelect />
           <FooterColo />
-          <span className="text-xs text-muted-foreground">
-            © {new Date().getFullYear()} Sigillo
-          </span>
+          <a
+            href="https://github.com/remorses/sigillo"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            Based on Sigillo by Tommy D. Rossi
+          </a>
           <a
             href="https://github.com/kldzj/sigillo"
             target="_blank"

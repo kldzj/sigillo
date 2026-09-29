@@ -2,7 +2,7 @@
   "name": "@kldzj/sigillo",
   "version": "0.16.0",
   "type": "module",
-  "description": "CLI for Sigillo — self-hostable secret manager. Manage secrets, environments, and configs from the terminal.",
+  "description": "CLI for kldzj/sigillo, a fork of Sigillo by Tommy D. Rossi: a self-hostable secret manager. Manage secrets, environments, and configs from the terminal.",
   "bin": {
     "sigillo": "dist/bin.js"
   },

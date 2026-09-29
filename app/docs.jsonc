@@ -25,6 +25,17 @@
       "href": "/docs/self-hosting"
     }
   },
+  "footer": {
+    "links": [
+      {
+        "header": "Credits",
+        "items": [
+          { "label": "Based on Sigillo by Tommy D. Rossi", "href": "https://github.com/remorses/sigillo" },
+          { "label": "MIT license", "href": "https://github.com/kldzj/sigillo/blob/main/LICENSE" }
+        ]
+      }
+    ]
+  },
   "navigation": {
     "tabs": [
       {
