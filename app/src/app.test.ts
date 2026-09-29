@@ -1567,6 +1567,29 @@ describe('encryption v2', () => {
     })
   })
 
+  test('refuses an ENCRYPTION_KEY that isn\'t 32 bytes', async () => {
+    const withKey = async <T>(bytes: number, run: () => Promise<T>) => {
+      const before = process.env.ENCRYPTION_KEY
+      process.env.ENCRYPTION_KEY = btoa('k'.repeat(bytes))
+      try {
+        return await run()
+      } finally {
+        if (before === undefined) delete process.env.ENCRYPTION_KEY
+        else process.env.ENCRYPTION_KEY = before
+      }
+    }
+    const stored = await encrypt('v', slot)
+    expect({
+      aes128: await withKey(16, () => outcome(() => encrypt('v', slot))),
+      aes192: await withKey(24, () => outcome(() => decrypt(stored.encrypted, stored.iv, slot))),
+      aes256: await withKey(32, async () => { const again = await encrypt('v', slot); return decrypt(again.encrypted, again.iv, slot) }),
+    }).toEqual({
+      aes128: 'ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32), not 16',
+      aes192: 'ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32), not 24',
+      aes256: 'v',
+    })
+  })
+
   test('values from before v2 read next to v2 ones', async () => {
     const user = await createTestUser({ name: 'V1 User' })
     const af = authedFetch(user.token)

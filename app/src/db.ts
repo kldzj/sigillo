@@ -1385,13 +1385,20 @@ function importAesKey(raw: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
 }
 
-async function baseKey(): Promise<CryptoKey> {
+// A key of the wrong length throws here, not in the promise, so no key ring
+// is made and every encrypt and decrypt fails with it
+function baseKey(): Promise<CryptoKey> {
   const configuredKey = process.env.ENCRYPTION_KEY?.trim()
-  if (configuredKey) return importAesKey(fromBase64(configuredKey))
+  if (configuredKey) {
+    const raw = fromBase64(configuredKey)
+    // 16 or 24 bytes would import too, as a weaker AES-128 or AES-192 key
+    if (raw.length !== 32) throw new Error(`ENCRYPTION_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32), not ${raw.length}`)
+    return importAesKey(raw)
+  }
   // AES-256 needs exactly 32 bytes. Hashing the Better Auth secret gives a
   // stable 32-byte fallback key. Plain base64-encoding the secret text would
   // produce variable-length bytes and break encryption.
-  return importAesKey(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.BETTER_AUTH_SECRET))))
+  return crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.BETTER_AUTH_SECRET)).then((digest) => importAesKey(new Uint8Array(digest)))
 }
 
 function keyRing(): KeyRing {
