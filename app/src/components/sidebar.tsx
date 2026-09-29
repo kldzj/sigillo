@@ -26,6 +26,7 @@ import {
   CheckIcon,
   MenuIcon,
   SettingsIcon,
+  UsersIcon,
 } from "lucide-react";
 import { cn } from "sigillo-app/src/lib/utils";
 import { Button } from "sigillo-app/src/components/ui/button";
@@ -182,7 +183,17 @@ function SidebarContent({
         </nav>
       </div>
 
-      {/* ── The organization's own settings ─────────────────── */}
+      {/* ── The organization's members and settings ─────────── */}
+      {currentOrgId && (
+        <Link
+          href={router.href('/dash/orgs/:orgId/members', { orgId: currentOrgId })}
+          onClick={onNavigate}
+          className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+        >
+          <UsersIcon className="size-4 shrink-0 opacity-60" />
+          Members
+        </Link>
+      )}
       {currentOrgId && (
         <Link
           href={router.href('/dash/orgs/:orgId/settings', { orgId: currentOrgId })}

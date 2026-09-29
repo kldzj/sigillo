@@ -1,4 +1,4 @@
-// Read log — who read a protected environment's values, when, how and from
+// History → Reads: who read a protected environment's values, when, how and from
 // which IP (secret_read). Org admins only. Also shows protection being turned
 // on and off, since reads in between are not recorded.
 
@@ -26,6 +26,7 @@ import {
 } from "sigillo-app/src/components/ui/table";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
 import { formatIp } from "sigillo-app/src/lib/utils";
+import { HistorySwitch } from "./history-switch.tsx";
 
 const KIND_LABELS: Record<string, string> = {
   list: "Listed",
@@ -37,7 +38,7 @@ const KIND_LABELS: Record<string, string> = {
   unprotected: "Protection off",
 };
 
-export function ReadLogTable() {
+export function ReadsTable() {
   const {
     projectName,
     environments,
@@ -46,18 +47,21 @@ export function ReadLogTable() {
     isProtected,
     isAdmin,
     projectId,
-  } = useLoaderData('/dash/projects/:projectId/envs/:envSlug/read-log');
+  } = useLoaderData('/dash/projects/:projectId/envs/:envSlug/history/reads');
+  const selectedEnv = environments.find((e) => e.id === selectedEnvId);
 
   return (
     <>
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-2xl font-bold tracking-tight">{projectName}</h1>
+        <div className="flex flex-wrap items-center gap-2">
+        {selectedEnv && <HistorySwitch projectId={projectId} envSlug={selectedEnv.slug} active="reads" />}
         <Select
           defaultValue={selectedEnvId || ""}
           onValueChange={(val: string | null) => {
             if (!val || !projectId) return
             const env = environments.find((e) => e.id === val);
-            if (env) router.push(router.href('/dash/projects/:projectId/envs/:envSlug/read-log', { projectId, envSlug: env.slug }));
+            if (env) router.push(router.href('/dash/projects/:projectId/envs/:envSlug/history/reads', { projectId, envSlug: env.slug }));
           }}
         >
           <SelectTrigger size="sm" className="w-auto min-w-40">
@@ -73,6 +77,7 @@ export function ReadLogTable() {
             ))}
           </SelectPopup>
         </Select>
+        </div>
       </div>
 
       {!isAdmin ? (

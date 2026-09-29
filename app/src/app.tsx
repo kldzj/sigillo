@@ -86,10 +86,10 @@ function hasCookie(args: { cookieHeader: string; name: string }) {
 }
 
 // ── Remembered environment ─────────────────────────────────────────
-// Each project remembers the environment last opened (secrets, event log or
-// read log) in a cookie, so its tabs and links return there instead of
+// Each project remembers the environment last opened (its secrets or its
+// history) in a cookie, so its tabs and links return there instead of
 // jumping to the first environment.
-const envPagePath = /^\/dash\/projects\/([^/]+)\/envs\/([^/]+)(?:\/(?:event-log|read-log))?$/
+const envPagePath = /^\/dash\/projects\/([^/]+)\/envs\/([^/]+)(?:\/history(?:\/reads)?)?$/
 
 function envCookieName(projectId: string) {
   return `sigillo-env-${projectId}`
@@ -270,6 +270,96 @@ export const app = new Spiceflow({ tracer })
         <OrgSettingsPage />
       </div>
     )
+  })
+
+  // ── Members ─────────────────────────────────────────────────────
+  .loader('/dash/orgs/:orgId/members', async ({ params, request }) => {
+    const db = getDb()
+    const { orgId } = params
+    const session = await requirePageSession(request)
+    const { role } = await requirePageOrgMember(session.userId, orgId)
+
+    // Which projects there are and who opens which, only for admins: a
+    // member may not know every project's name
+    const [sidebar, orgRow, allMembers, orgProjects] = await Promise.all([
+      orgSidebar({ request, userId: session.userId, orgId }),
+      db.query.org.findFirst({ where: { id: orgId }, columns: { name: true } }),
+      db.query.orgMember.findMany({
+        where: { orgId },
+        with: {
+          user: { columns: { id: true, name: true, email: true, image: true } },
+          accessRules: { columns: { projectId: true } },
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
+      role === 'admin' ? db.query.project.findMany({
+        where: { orgId },
+        columns: { id: true, name: true },
+        orderBy: { createdAt: 'asc' },
+      }) : [],
+    ])
+    const members = role === 'admin' ? allMembers : allMembers.map((member) => ({ ...member, accessRules: [] }))
+
+    // Admins see who has passkeys, and every passkey added or removed. People
+    // who left still need this organization's approval for a first passkey,
+    // so their requests show here too.
+    const userIds = members.map((member) => member.userId)
+    const formerMembers = role === 'admin' ? await listFormerMembers(orgId) : []
+    const [passkeys, events, enrollments] = role === 'admin'
+      ? await Promise.all([
+        db.query.passkey.findMany({ where: { userId: { in: userIds } }, columns: { userId: true } }),
+        db.query.passkeyEvent.findMany({ where: { userId: { in: userIds } }, orderBy: { createdAt: 'desc' }, limit: 50 }),
+        pendingEnrollments({ userIds: [...userIds, ...formerMembers.map((user) => user.id)], orgId }),
+      ])
+      : [[], [], []]
+    const nameOf = (userId: string) => {
+      const member = members.find((member) => member.userId === userId)?.user
+      if (member) return member.name
+      const former = formerMembers.find((user) => user.id === userId)
+      return former ? `${former.name} (left)` : 'Former member'
+    }
+    const passkeyCounts = Object.fromEntries(userIds.map((userId) => [userId, passkeys.filter((p) => p.userId === userId).length]))
+    const passkeyEvents = events.map((event) => ({
+      id: event.id,
+      member: nameOf(event.userId),
+      action: event.action,
+      passkeyName: event.passkeyName,
+      by: event.actor === 'self-host' ? 'self-host' : event.actor === `user:${event.userId}` ? 'themselves' : nameOf(event.actor.replace(/^user:/, '')),
+      ipAddress: event.ipAddress,
+      createdAt: event.createdAt,
+    }))
+
+    // Members asking an admin to approve their first passkey
+    const passkeyRequests = enrollments.map((row) => ({
+      id: row.id,
+      member: nameOf(row.userId),
+      isYou: row.userId === session.userId,
+      userAgent: row.userAgent,
+      ipAddress: row.ipAddress,
+      country: row.country,
+      createdAt: row.createdAt,
+      approvedHere: row.approvedHere,
+      waitingForOthers: row.waitingForOthers,
+    }))
+
+    return {
+      ...sidebar,
+      orgId,
+      orgName: orgRow?.name ?? 'Organization',
+      role,
+      currentUserId: session.userId,
+      members,
+      orgProjects,
+      passkeyCounts,
+      passkeyEvents,
+      passkeyRequests,
+    }
+  })
+
+  .page('/dash/orgs/:orgId/members', async () => {
+    const { MembersPage } = await import('sigillo-app/src/components/access-table')
+
+    return <MembersPage />
   })
 
   .loader('/dash/projects/:projectId/*', async ({ params, request }) => {
@@ -516,96 +606,10 @@ export const app = new Spiceflow({ tracer })
     return <EnvironmentsPage />
   })
 
-  // ── Access page ────────────────────────────────────────────────
-  .loader('/dash/projects/:projectId/access', async ({ params, request, redirect }) => {
-    const db = getDb()
-    const { projectId } = params
-    const session = await requirePageSession(request)
-    const orgId = await getOrgIdForProject(projectId)
-    if (!orgId) throw redirect('/')
-    const { role } = await requirePageOrgMember(session.userId, orgId)
-
-    // Which projects there are and who opens which, only for admins: a
-    // member may not know every project's name
-    const [allMembers, orgProjects] = await Promise.all([
-      db.query.orgMember.findMany({
-        where: { orgId },
-        with: {
-          user: { columns: { id: true, name: true, email: true, image: true } },
-          accessRules: { columns: { projectId: true } },
-        },
-        orderBy: { createdAt: 'asc' },
-      }),
-      role === 'admin' ? db.query.project.findMany({
-        where: { orgId },
-        columns: { id: true, name: true },
-        orderBy: { createdAt: 'asc' },
-      }) : [],
-    ])
-    const members = role === 'admin' ? allMembers : allMembers.map((member) => ({ ...member, accessRules: [] }))
-
-    // Admins see who has passkeys, and every passkey added or removed. People
-    // who left still need this organization's approval for a first passkey,
-    // so their requests show here too.
-    const userIds = members.map((member) => member.userId)
-    const formerMembers = role === 'admin' ? await listFormerMembers(orgId) : []
-    const [passkeys, events, enrollments] = role === 'admin'
-      ? await Promise.all([
-        db.query.passkey.findMany({ where: { userId: { in: userIds } }, columns: { userId: true } }),
-        db.query.passkeyEvent.findMany({ where: { userId: { in: userIds } }, orderBy: { createdAt: 'desc' }, limit: 50 }),
-        pendingEnrollments({ userIds: [...userIds, ...formerMembers.map((user) => user.id)], orgId }),
-      ])
-      : [[], [], []]
-    const nameOf = (userId: string) => {
-      const member = members.find((member) => member.userId === userId)?.user
-      if (member) return member.name
-      const former = formerMembers.find((user) => user.id === userId)
-      return former ? `${former.name} (left)` : 'Former member'
-    }
-    const passkeyCounts = Object.fromEntries(userIds.map((userId) => [userId, passkeys.filter((p) => p.userId === userId).length]))
-    const passkeyEvents = events.map((event) => ({
-      id: event.id,
-      member: nameOf(event.userId),
-      action: event.action,
-      passkeyName: event.passkeyName,
-      by: event.actor === 'self-host' ? 'self-host' : event.actor === `user:${event.userId}` ? 'themselves' : nameOf(event.actor.replace(/^user:/, '')),
-      ipAddress: event.ipAddress,
-      createdAt: event.createdAt,
-    }))
-
-    // Members asking an admin to approve their first passkey
-    const passkeyRequests = enrollments.map((row) => ({
-      id: row.id,
-      member: nameOf(row.userId),
-      isYou: row.userId === session.userId,
-      userAgent: row.userAgent,
-      ipAddress: row.ipAddress,
-      country: row.country,
-      createdAt: row.createdAt,
-      approvedHere: row.approvedHere,
-      waitingForOthers: row.waitingForOthers,
-    }))
-
-    return {
-      orgId,
-      role,
-      currentUserId: session.userId,
-      members,
-      orgProjects,
-      passkeyCounts,
-      passkeyEvents,
-      passkeyRequests,
-    }
-  })
-
-  .page('/dash/projects/:projectId/access', async () => {
-    const { AccessPage } = await import('sigillo-app/src/components/access-table')
-
-    return <AccessPage />
-  })
-
-  // ── Event Log page ─────────────────────────────────────────────
-  .get('/dash/projects/:projectId/event-log', async ({ params, request, redirect }) => {
+  // ── History: changes ───────────────────────────────────────────
+  // At /history, not /event-log: EasyPrivacy (on by default in uBlock
+  // Origin Lite) blocks `/event-log?`, so navigating to it and its actions failed.
+  .get('/dash/projects/:projectId/history', async ({ params, request, redirect }) => {
     // Only someone who can open the project learns its environments' slugs
     const session = await requirePageSession(request)
     const access = await getProjectMemberAccess(session.userId, params.projectId)
@@ -616,10 +620,10 @@ export const app = new Spiceflow({ tracer })
       orderBy: { createdAt: 'asc' },
     })
     const envSlug = projectEnvSlug(request, params.projectId, environments) || '_'
-    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(envSlug)}/event-log`)
+    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(envSlug)}/history`)
   })
 
-  .loader('/dash/projects/:projectId/envs/:envSlug/event-log', async ({ params, request, redirect }) => {
+  .loader('/dash/projects/:projectId/envs/:envSlug/history', async ({ params, request, redirect }) => {
     const db = getDb()
     const { projectId, envSlug } = params
     const session = await requirePageSession(request)
@@ -630,7 +634,7 @@ export const app = new Spiceflow({ tracer })
     const selectedEnvId = matchedEnv?.id ?? environments[0]?.id ?? null
 
     if (selectedEnvId && !matchedEnv && environments[0]) {
-      throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/event-log`)
+      throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/history`)
     }
 
     const access = await getProjectMemberAccess(session.userId, projectId)
@@ -677,33 +681,19 @@ export const app = new Spiceflow({ tracer })
     }
   })
 
-  .page('/dash/projects/:projectId/envs/:envSlug/event-log', async () => {
-    const { EventLogTable } = await import('sigillo-app/src/components/event-log-table')
+  .page('/dash/projects/:projectId/envs/:envSlug/history', async () => {
+    const { ChangesTable } = await import('sigillo-app/src/components/changes-table')
 
     return (
       <div className="flex flex-col gap-3 w-full">
-        <EventLogTable />
+        <ChangesTable />
       </div>
     )
   })
 
-  // ── Read Log page ──────────────────────────────────────────────
+  // ── History: reads ─────────────────────────────────────────────
   // Reads of a protected environment's values, for org admins
-  .get('/dash/projects/:projectId/read-log', async ({ params, request, redirect }) => {
-    // Only someone who can open the project learns its environments' slugs
-    const session = await requirePageSession(request)
-    const access = await getProjectMemberAccess(session.userId, params.projectId)
-    if (!access || (access.accessibleProjectIds !== null && !access.accessibleProjectIds.includes(params.projectId))) throw redirect('/dash')
-    const db = getDb()
-    const environments = await db.query.environment.findMany({
-      where: { projectId: params.projectId },
-      orderBy: { createdAt: 'asc' },
-    })
-    const envSlug = projectEnvSlug(request, params.projectId, environments) || '_'
-    throw redirect(`/dash/projects/${encodeURIComponent(params.projectId)}/envs/${encodeURIComponent(envSlug)}/read-log`)
-  })
-
-  .loader('/dash/projects/:projectId/envs/:envSlug/read-log', async ({ params, request, redirect }) => {
+  .loader('/dash/projects/:projectId/envs/:envSlug/history/reads', async ({ params, request, redirect }) => {
     const db = getDb()
     const { projectId, envSlug } = params
     const session = await requirePageSession(request)
@@ -711,7 +701,7 @@ export const app = new Spiceflow({ tracer })
     const environments = await db.query.environment.findMany({ where: { projectId }, orderBy: { createdAt: 'asc' } })
     const matchedEnv = environments.find((e) => e.slug === envSlug)
     if (!matchedEnv && environments[0]) {
-      throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/read-log`)
+      throw redirect(`/dash/projects/${encodeURIComponent(projectId)}/envs/${encodeURIComponent(environments[0].slug)}/history/reads`)
     }
 
     const access = await getProjectMemberAccess(session.userId, projectId)
@@ -739,12 +729,12 @@ export const app = new Spiceflow({ tracer })
     }
   })
 
-  .page('/dash/projects/:projectId/envs/:envSlug/read-log', async () => {
-    const { ReadLogTable } = await import('sigillo-app/src/components/read-log-table')
+  .page('/dash/projects/:projectId/envs/:envSlug/history/reads', async () => {
+    const { ReadsTable } = await import('sigillo-app/src/components/reads-table')
 
     return (
       <div className="flex flex-col gap-3 w-full">
-        <ReadLogTable />
+        <ReadsTable />
       </div>
     )
   })
@@ -804,7 +794,7 @@ export const app = new Spiceflow({ tracer })
   })
 
   // ── Tokens page ────────────────────────────────────────────────────
-  .loader('/dash/projects/:projectId/tokens', async ({ params, request }) => {
+  .loader('/dash/projects/:projectId/machines', async ({ params, request }) => {
     const db = getDb()
     const { projectId } = params
     const session = await requirePageSession(request)
@@ -873,7 +863,7 @@ export const app = new Spiceflow({ tracer })
     }
   })
 
-  .page('/dash/projects/:projectId/tokens', async () => {
+  .page('/dash/projects/:projectId/machines', async () => {
     const { TokensPage } = await import('sigillo-app/src/components/tokens-page')
 
     return (
@@ -1137,32 +1127,21 @@ function TabBar({
   envSlug: string | null
 }) {
   const base = `/dash/projects/${projectId}`
-  const envMatch = pathname.match(new RegExp(`^${base}/envs/([^/]+)`))
+  const envMatch = pathname.match(new RegExp(`^${base}/envs/([^/]+)(?:/(history)(?:/reads)?)?$`))
   const envSlug = envMatch?.[1] ?? rememberedEnvSlug
+  // The tab under an environment; matched by position, since an environment can be named `history`
+  const envTab = envMatch ? envMatch[2] ?? 'secrets' : null
   const secretsHref = envSlug
     ? router.href('/dash/projects/:projectId/envs/:envSlug', { projectId, envSlug })
     : router.href('/dash/projects/:projectId', { projectId })
-  const eventLogHref = envSlug
-    ? router.href('/dash/projects/:projectId/envs/:envSlug/event-log', { projectId, envSlug })
-    : router.href('/dash/projects/:projectId/event-log', { projectId })
-  const readLogHref = envSlug
-    ? router.href('/dash/projects/:projectId/envs/:envSlug/read-log', { projectId, envSlug })
-    : router.href('/dash/projects/:projectId/read-log', { projectId })
+  const historyHref = envSlug
+    ? router.href('/dash/projects/:projectId/envs/:envSlug/history', { projectId, envSlug })
+    : router.href('/dash/projects/:projectId/history', { projectId })
   const tabs = [
-    { label: 'Secrets', href: secretsHref, active: pathname === base || (pathname.startsWith(`${base}/envs`) && !pathname.endsWith('/event-log') && !pathname.endsWith('/read-log')) },
+    { label: 'Secrets', href: secretsHref, active: pathname === base || envTab === 'secrets' },
     { label: 'Environments', href: router.href('/dash/projects/:projectId/environments', { projectId }), active: pathname === `${base}/environments` },
-    { label: 'Tokens', href: router.href('/dash/projects/:projectId/tokens', { projectId }), active: pathname === `${base}/tokens` },
-    { label: 'Access', href: router.href('/dash/projects/:projectId/access', { projectId }), active: pathname === `${base}/access` },
-    {
-      label: 'Event Log',
-      href: eventLogHref,
-      active: pathname === `${base}/event-log` || pathname.endsWith('/event-log'),
-    },
-    {
-      label: 'Read Log',
-      href: readLogHref,
-      active: pathname === `${base}/read-log` || pathname.endsWith('/read-log'),
-    },
+    { label: 'Machines', href: router.href('/dash/projects/:projectId/machines', { projectId }), active: pathname === `${base}/machines` },
+    { label: 'History', href: historyHref, active: pathname === `${base}/history` || envTab === 'history' },
     { label: 'Settings', href: router.href('/dash/projects/:projectId/settings', { projectId }), active: pathname === `${base}/settings` },
   ] as const
 

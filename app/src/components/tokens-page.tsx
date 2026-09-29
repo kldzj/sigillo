@@ -1,4 +1,4 @@
-// Tokens management page — table of API tokens with create/delete.
+// The Machines tab: API tokens with create/delete, and workload identities.
 // Each token is scoped to a project and optionally to an env allowlist
 // (zero rows = all envs), and expires after a lifetime picked at creation.
 // The full key is only shown once at creation (never stored), so the
@@ -28,20 +28,27 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
-import { cn, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatIp } from "sigillo-app/src/lib/utils"
+import { cn, DOCS_URL, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatIp } from "sigillo-app/src/lib/utils"
 import { createTokenAction, deleteTokenAction } from "../actions.ts"
 import { withStepUp } from "./step-up.ts"
 import { WorkloadIdentities } from "./trust-rules.tsx"
 
 
 export function TokensPage() {
-  const { projectName, projectId, environments, tokens, isAdmin } = useLoaderData('/dash/projects/:projectId/tokens')
+  const { projectName, projectId, environments, tokens, isAdmin } = useLoaderData('/dash/projects/:projectId/machines')
   const [createOpen, setCreateOpen] = useState(false)
 
   return (
     <>
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">{projectName}</h1>
+      <h1 className="text-2xl font-bold tracking-tight">{projectName}</h1>
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-1">
+          <h2 className="text-lg font-semibold tracking-tight">Tokens</h2>
+          <p className="text-sm text-muted-foreground">
+            For CI, servers and scripts: a token reads and changes this project's secrets through the API and the CLI.{" "}
+            <a className="underline" href={`${DOCS_URL}/docs/ci`}>How to use one</a>
+          </p>
+        </div>
         <Button variant="outline" onClick={() => setCreateOpen(true)}>
           <PlusIcon className="size-4" />
           Create token
@@ -82,7 +89,7 @@ function tokenScopeLabel(environmentNames: string[]) {
 }
 
 function TokensTable() {
-  const { tokens } = useLoaderData('/dash/projects/:projectId/tokens')
+  const { tokens } = useLoaderData('/dash/projects/:projectId/machines')
   return (
     <Frame className="w-full">
       <Table className="table-fixed">

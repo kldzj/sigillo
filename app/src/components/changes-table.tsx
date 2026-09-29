@@ -1,4 +1,4 @@
-// Event log table — shows the append-only secretEvent audit trail.
+// History → Changes: the append-only secretEvent audit trail.
 // Env select filters events. Eye icon fetches and shows an old value (set
 // events only), which protected environments record in the read log.
 // Badges: green for "set", red for "delete", grey for "purge". Admins can
@@ -42,10 +42,11 @@ import {
   TableRow,
 } from "sigillo-app/src/components/ui/table";
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
+import { HistorySwitch } from "./history-switch.tsx";
 
 // Secret values use the .text-security-disc CSS class from globals.css.
 
-export function EventLogTable() {
+export function ChangesTable() {
   const {
     projectName,
     events,
@@ -55,7 +56,8 @@ export function EventLogTable() {
     projectId,
     isAdmin,
     oldValues,
-  } = useLoaderData('/dash/projects/:projectId/envs/:envSlug/event-log');
+  } = useLoaderData('/dash/projects/:projectId/envs/:envSlug/history');
+  const selectedEnv = environments.find((e) => e.id === selectedEnvId);
   const [visibleValues, setVisibleValues] = useState<Record<string, boolean>>({});
   const [values, setValues] = useState<Record<string, string | null>>({});
 
@@ -76,9 +78,10 @@ export function EventLogTable() {
 
   return (
     <>
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-2xl font-bold tracking-tight">{projectName}</h1>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+        {selectedEnv && <HistorySwitch projectId={projectId} envSlug={selectedEnv.slug} active="changes" />}
         {isAdmin && oldValues > 0 && selectedEnvId && (
           <PurgeOldValues
             environmentId={selectedEnvId}
@@ -91,7 +94,7 @@ export function EventLogTable() {
           onValueChange={(val: string | null) => {
             if (!val || !projectId) return
             const env = environments.find((e) => e.id === val);
-            if (env) router.push(router.href('/dash/projects/:projectId/envs/:envSlug/event-log', { projectId, envSlug: env.slug }));
+            if (env) router.push(router.href('/dash/projects/:projectId/envs/:envSlug/history', { projectId, envSlug: env.slug }));
           }}
         >
           <SelectTrigger size="sm" className="w-auto min-w-40">

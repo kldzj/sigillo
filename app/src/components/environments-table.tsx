@@ -260,7 +260,7 @@ export function EnvironmentsTable() {
     },
     {
       // Protected environments need a passkey to read, and record every read of
-      // their values (Read Log tab). Turning protection off needs a passkey too.
+      // their values (History → Reads). Turning protection off needs a passkey too.
       accessorKey: "protected",
       header: "Protected",
       size: 120,

@@ -1,4 +1,4 @@
-// Access table for organization members.
+// Members of an organization, at /dash/orgs/:orgId/members.
 // Admins can change roles inline, remove members, and manage per-project access.
 
 "use client"
@@ -34,13 +34,18 @@ type Member = {
   } | null
 }
 
-export function AccessPage() {
-  const { projectName, orgId, role } = useLoaderData('/dash/projects/:projectId/access')
+export function MembersPage() {
+  const { orgName, orgId, role } = useLoaderData('/dash/orgs/:orgId/members')
 
   return (
     <div className="flex flex-col gap-3 w-full">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">{projectName}</h1>
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Members</h1>
+          <p className="text-muted-foreground text-sm mt-1">
+            {orgName}: roles, which projects each member opens, and passkeys.
+          </p>
+        </div>
         {role === 'admin' ? <InviteButton orgId={orgId} /> : null}
       </div>
       <AccessTable />
@@ -49,7 +54,7 @@ export function AccessPage() {
 }
 
 export function AccessTable() {
-  const { role, currentUserId, members, orgProjects, passkeyCounts } = useLoaderData('/dash/projects/:projectId/access')
+  const { role, currentUserId, members, orgProjects, passkeyCounts } = useLoaderData('/dash/orgs/:orgId/members')
   const canManage = role === 'admin'
   const [roleOverrides, setRoleOverrides] = useState<Record<string, Member["role"]>>({})
   const [pendingRoleId, setPendingRoleId] = useState<string | null>(null)
@@ -259,7 +264,7 @@ export function AccessTable() {
 // with one: an admin approves it with their own passkey, never their own
 
 function PasskeyRequests() {
-  const { passkeyRequests } = useLoaderData('/dash/projects/:projectId/access')
+  const { passkeyRequests } = useLoaderData('/dash/orgs/:orgId/members')
   const [error, setError] = useState<string | null>(null)
   if (passkeyRequests.length === 0) return null
   const answer = async (requestId: string, approve: boolean) => {
@@ -329,7 +334,7 @@ function PasskeyRequests() {
 // Every passkey a member added or removed, or an admin removed, for admins
 
 function PasskeyChanges() {
-  const { passkeyEvents } = useLoaderData('/dash/projects/:projectId/access')
+  const { passkeyEvents } = useLoaderData('/dash/orgs/:orgId/members')
   if (passkeyEvents.length === 0) return null
   return (
     <div className="flex flex-col gap-2 mt-4">

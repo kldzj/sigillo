@@ -58,7 +58,7 @@ async function insertApiToken({
 }) {
   const { key, hashedKey, prefix } = await generateApiToken()
   const db = getDb()
-  // Its creator is a member of the org, as the Tokens tab requires: a token
+  // Its creator is a member of the org, as the Machines tab requires: a token
   // acts with its creator's access
   const project = await db.query.project.findFirst({ where: { id: projectId }, columns: { orgId: true } })
   if (project) await db.insert(schema.orgMember).values({ orgId: project.orgId, userId: createdBy, role: 'member' }).onConflictDoNothing()
@@ -2522,9 +2522,20 @@ describe('log pages', () => {
       return new URL(res.headers.get('location') ?? '', 'http://e.ly').pathname
     }
     expect({
-      signedOut: [await open('event-log'), await open('read-log')],
-      outsider: [await open('event-log', outsider.token), await open('read-log', outsider.token)],
-    }).toEqual({ signedOut: ['/login', '/login'], outsider: ['/dash', '/dash'] })
+      signedOut: await open('history'),
+      outsider: await open('history', outsider.token),
+    }).toEqual({ signedOut: '/login', outsider: '/dash' })
+  })
+
+  test('members are the organization\'s page, not a project\'s', async () => {
+    const owner = await createTestUser({ name: 'Members Owner' })
+    const outsider = await createTestUser({ name: 'Members Outsider' })
+    const orgId = assertOk(await authedFetch(owner.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Members Org' } })).id
+    const open = (path: string, token: string) => app.handle(new Request(`http://e.ly${path}`, { headers: { authorization: `Bearer ${token}` }, redirect: 'manual' }))
+    const members = await open(`/dash/orgs/${orgId}/members`, owner.token)
+    const outsiders = await open(`/dash/orgs/${orgId}/members`, outsider.token)
+    expect({ owner: members.status, outsider: new URL(outsiders.headers.get('location') ?? '', 'http://e.ly').pathname })
+      .toEqual({ owner: 200, outsider: '/' })
   })
 })
 
@@ -2993,15 +3004,15 @@ describe('remembered environment', () => {
   test('the tabs without an environment go back to the one last opened, while it exists', async () => {
     const where = async (path: string, cookie?: string) => new URL((await get(path, cookie)).headers.get('location') ?? '', 'http://e.ly').pathname
     expect({
-      none: await where(`/dash/projects/${projectId}/event-log`),
-      remembered: await where(`/dash/projects/${projectId}/read-log`, `sigillo-env-${projectId}=prod`),
-      deleted: await where(`/dash/projects/${projectId}/event-log`, `sigillo-env-${projectId}=gone`),
-      otherProject: await where(`/dash/projects/${projectId}/event-log`, `sigillo-env-other=prod`),
+      none: await where(`/dash/projects/${projectId}/history`),
+      remembered: await where(`/dash/projects/${projectId}/history`, `sigillo-env-${projectId}=prod`),
+      deleted: await where(`/dash/projects/${projectId}/history`, `sigillo-env-${projectId}=gone`),
+      otherProject: await where(`/dash/projects/${projectId}/history`, `sigillo-env-other=prod`),
     }).toEqual({
-      none: `/dash/projects/${projectId}/envs/dev/event-log`,
-      remembered: `/dash/projects/${projectId}/envs/prod/read-log`,
-      deleted: `/dash/projects/${projectId}/envs/dev/event-log`,
-      otherProject: `/dash/projects/${projectId}/envs/dev/event-log`,
+      none: `/dash/projects/${projectId}/envs/dev/history`,
+      remembered: `/dash/projects/${projectId}/envs/prod/history`,
+      deleted: `/dash/projects/${projectId}/envs/dev/history`,
+      otherProject: `/dash/projects/${projectId}/envs/dev/history`,
     })
   })
 
@@ -3014,9 +3025,15 @@ describe('remembered environment', () => {
   })
 
   test('opening an environment page remembers it', async () => {
-    const res = await get(`/dash/projects/${projectId}/envs/preview/event-log`)
-    expect({ status: res.status, cookie: res.headers.getSetCookie().find((c) => c.startsWith('sigillo-env-')) })
-      .toEqual({ status: 200, cookie: `sigillo-env-${projectId}=preview; Path=/dash; Max-Age=31536000; SameSite=Lax; HttpOnly` })
+    const opened = async (path: string) => {
+      const res = await get(path)
+      return { status: res.status, cookie: res.headers.getSetCookie().find((c) => c.startsWith('sigillo-env-')) }
+    }
+    const remembered = (slug: string) => ({ status: 200, cookie: `sigillo-env-${projectId}=${slug}; Path=/dash; Max-Age=31536000; SameSite=Lax; HttpOnly` })
+    expect({
+      changes: await opened(`/dash/projects/${projectId}/envs/preview/history`),
+      reads: await opened(`/dash/projects/${projectId}/envs/prod/history/reads`),
+    }).toEqual({ changes: remembered('preview'), reads: remembered('prod') })
   })
 })
 

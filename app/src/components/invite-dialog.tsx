@@ -36,7 +36,7 @@ function InviteDialog({ open, onOpenChange, orgId }: {
   onOpenChange: (open: boolean) => void
   orgId: string
 }) {
-  const { orgProjects } = useLoaderData('/dash/projects/:projectId/access')
+  const { orgProjects } = useLoaderData('/dash/orgs/:orgId/members')
   const [inviteUrl, setInviteUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [copied, setCopied] = useState(false)

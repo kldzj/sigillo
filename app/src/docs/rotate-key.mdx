@@ -12,7 +12,7 @@ To give your instance a new encryption key, for example after someone who knew t
 npx @kldzj/sigillo self-host --rotate-key
 ```
 
-It saves a new key in `~/.sigillo/selfhost.json` and makes it the worker's current key, so new values use it. Then it re-encrypts every stored value with it, the old values in the event log too. That runs on your machine, through the D1 API, so the worker never decrypts everything at once. After waiting a minute for requests that were already running, it removes the old key from the worker and from the file. If it stops halfway, the next `--rotate-key` finishes that rotation instead of starting another.
+It saves a new key in `~/.sigillo/selfhost.json` and makes it the worker's current key, so new values use it. Then it re-encrypts every stored value with it, the old values in the history too. That runs on your machine, through the D1 API, so the worker never decrypts everything at once. After waiting a minute for requests that were already running, it removes the old key from the worker and from the file. If it stops halfway, the next `--rotate-key` finishes that rotation instead of starting another.
 
 The worker keeps its keys in the `ENCRYPTION_KEYS` secret. Every value names the key it was encrypted with, and is bound to its environment and name, so a copy elsewhere in the database doesn't decrypt. `BETTER_AUTH_SECRET` can't be rotated this way, since it signs sessions and the history.
 

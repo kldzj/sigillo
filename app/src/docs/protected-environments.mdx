@@ -13,7 +13,7 @@ A protected environment doesn't trust a session on its own. Reading or changing 
 On the project's **Environments** tab, an org admin sets **Protected** to **On**. From then on:
 
 - Reading or changing its values takes a passkey approval, in the browser or from the CLI.
-- Every read is recorded before the values leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see them on the **Read Log** tab: see [the signed history](./history.mdx).
+- Every read is recorded before the values leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see them under **History** → **Reads**: see [the signed history](./history.mdx).
 - API tokens stop working for it: only [machine tokens and workload identity](./ci.mdx) reach it.
 - Deleting or renaming it, or the project it belongs to, is up to an org admin with their passkey, so nobody else can move it aside and let an unprotected one take over its slug or name, or delete it along with its read log.
 
@@ -59,7 +59,7 @@ Everyone adds theirs under **user menu → Passkeys**: a laptop's fingerprint re
 
 ### A member's first passkey
 
-Once your organization has an admin with a passkey, an admin also approves each member's first passkey on a project's **Access** tab, where they see the device and IP address it comes from; nobody approves their own. A member of several organizations with protected environments needs an approval from an admin of each, since a passkey works in all of them.
+Once your organization has an admin with a passkey, an admin also approves each member's first passkey on the organization's **Members** page, where they see the device and IP address it comes from; nobody approves their own. A member of several organizations with protected environments needs an approval from an admin of each, since a passkey works in all of them.
 
 Leaving doesn't get around that: someone who left an organization or was removed still needs its approval for a first passkey, and its admins see the request marked as from someone who left. An invite link made before they left doesn't bring them back, and neither does auto-join. So someone who got into a member's Google account still can't add a passkey unnoticed.
 
@@ -69,7 +69,7 @@ Adding or removing one after that takes an approval with a passkey you already h
 
 ### Reset a member's passkeys
 
-On a project's **Access** tab, org admins see how many passkeys each member has and every passkey added or removed. **Reset** removes a member's passkeys, for someone who lost theirs, and signs them out everywhere; they add new ones after signing in again. Passkeys belong to the person, so only an admin of every organization they're in can reset them.
+On the organization's **Members** page, org admins see how many passkeys each member has and every passkey added or removed. **Reset** removes a member's passkeys, for someone who lost theirs, and signs them out everywhere; they add new ones after signing in again. Passkeys belong to the person, so only an admin of every organization they're in can reset them.
 
 ### Lost every passkey
 

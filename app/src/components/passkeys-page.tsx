@@ -174,7 +174,7 @@ export function PasskeysPage() {
           {enrollment.pending.approversNeeded > 1
             ? `Waiting for an admin of each of your organizations with protected environments to approve your first passkey: ${enrollment.pending.approvedBy} of ${enrollment.pending.approversNeeded} have.`
             : "Waiting for an admin to approve your first passkey."}{" "}
-          They see your request on a project's Access tab. Come back to this page in this browser once they have.
+          They see your request on their organization's Members page. Come back to this page in this browser once they have.
         </p>
       ) : needsFreshSignIn ? (
         <div className="flex flex-col gap-2 items-start">

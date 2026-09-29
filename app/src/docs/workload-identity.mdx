@@ -10,7 +10,7 @@ A token stored in CI or in a cluster works for anyone who copies it, until it ex
 
 ## Trust rules
 
-Org admins add rules on a project's **Tokens** tab, under **Workload identities**, and each change takes their passkey. A rule names:
+Org admins add rules on a project's **Machines** tab, under **Workload identities**, and each change takes their passkey. A rule names:
 
 - the **issuer** whose keys signed the JWT: GitHub Actions, a cluster, or another OIDC issuer
 - the **audience** the JWT must be for, your instance's URL unless you change it, so a JWT made for another service doesn't work here

@@ -50,7 +50,7 @@ sigillo me
 
 Shows current user and organizations. If it errors with "not logged in" or "no Sigillo server configured", run `sigillo login` first. Every instance is self-hosted, so ask the user for their instance URL if you don't know it.
 
-If a command fails with `not signed in, or the session expired: run sigillo login`, the saved login no longer works (it expired, was ended, or predates signed sessions): run `sigillo login --api-url <instance>` again. An API token that fails with `API token expired` needs a new one from the project's **Tokens** tab.
+If a command fails with `not signed in, or the session expired: run sigillo login`, the saved login no longer works (it expired, was ended, or predates signed sessions): run `sigillo login --api-url <instance>` again. An API token that fails with `API token expired` needs a new one from the project's **Machines** tab.
 
 **2. Login (opens browser device flow):** the user types the code the command prints on the page that opens, and approves, with their passkey once they have one. Show them the code; never approve it yourself.
 
@@ -169,7 +169,7 @@ The same pattern works for any secret copy, between environments, or when seedin
 
 ### Protected environments need the user's passkey
 
-In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` needs a passkey approval, and is recorded in its Read Log with your login, the secret names and your IP address. So does every change: `secrets set` and `secrets delete`. Deleting or renaming it, or its project, is up to an org admin. Read only what the task needs, and change a protected environment only when the user asked for that change.
+In an environment marked **Protected**, every `sigillo run`, `secrets`, `secrets get` and `secrets download` needs a passkey approval, and is recorded in its history (**History** → **Reads**) with your login, the secret names and your IP address. So does every change: `secrets set` and `secrets delete`. Deleting or renaming it, or its project, is up to an org admin. Read only what the task needs, and change a protected environment only when the user asked for that change.
 
 Without an approval, the command prints a link and a code on stderr, then waits up to 10 minutes:
 
@@ -181,7 +181,7 @@ Waiting for your approval...
 
 Show the user the link and the code right away, and tell them what the command reads or changes. If your shell only returns output when a command ends, run it in the background and read its output as it comes, or you'll only see the code once it's too late. Never open the page or try to approve it yourself: only the user's passkey can. Once they approve, the command continues. The approval belongs to the login, not to the command: for 15 minutes, other commands on that environment run without asking again. If it prints `the approval expired`, ask before running it again.
 
-An API token gets `only a machine token can use it`. Don't work around it: tell the user an org admin can create a machine token on the **Tokens** tab.
+An API token gets `only a machine token can use it`. Don't work around it: tell the user an org admin can create a machine token on the **Machines** tab.
 
 ### Never read `.env` files or `~/.sigillo/*`
 

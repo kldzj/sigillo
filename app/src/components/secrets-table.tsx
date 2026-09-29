@@ -52,7 +52,7 @@ import { useLoaderData } from "spiceflow/react";
 class NotApproved extends Error {}
 
 // Secret values use the .text-security-disc CSS class from globals.css
-// instead of inline style objects (eliminates duplication with event-log-table).
+// instead of inline style objects (eliminates duplication with changes-table).
 
 function SecretValueCell({
   value,

@@ -1,4 +1,4 @@
-// Workload identities on the Tokens tab: trust rules that let a GitHub
+// Workload identities on the Machines tab: trust rules that let a GitHub
 // Actions job or a Kubernetes pod exchange the JWT its platform issues for a
 // token of one hour (app/src/workload.ts), so no token is stored anywhere.
 // Org admins only, and every change takes their passkey. Presets fill the
@@ -32,7 +32,7 @@ const CLUSTER_ISSUER = "https://kubernetes.default.svc.cluster.local"
 type Rule = ReturnType<typeof useRules>[number]
 
 function useRules() {
-  return useLoaderData("/dash/projects/:projectId/tokens").rules
+  return useLoaderData("/dash/projects/:projectId/machines").rules
 }
 
 export function WorkloadIdentities() {
@@ -66,7 +66,7 @@ function issuerLabel(rule: Rule) {
 }
 
 function RulesTable({ rules }: { rules: Rule[] }) {
-  const { environments } = useLoaderData("/dash/projects/:projectId/tokens")
+  const { environments } = useLoaderData("/dash/projects/:projectId/machines")
   const [history, setHistory] = useState<Rule | null>(null)
   const [keysFor, setKeysFor] = useState<Rule | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
@@ -267,7 +267,7 @@ function Choice({ checked, onChange, children }: { checked: boolean; onChange: (
 }
 
 function CreateRuleDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
-  const { projectId, environments, origin } = useLoaderData("/dash/projects/:projectId/tokens")
+  const { projectId, environments, origin } = useLoaderData("/dash/projects/:projectId/machines")
   const [preset, setPreset] = useState<Preset>("github")
   const [fields, setFields] = useState<Record<string, string>>({})
   const [pasteKeys, setPasteKeys] = useState(true)

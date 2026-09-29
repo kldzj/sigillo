@@ -104,6 +104,6 @@ A login lasts until it ends, or you end it on your [sessions page](./access.mdx#
 ## What else keeps data
 
 - **Workers Logs.** Both workers have Cloudflare's Workers Logs on, and `self-host` turns them on again with every deploy. A request's log holds its method, URL and headers: the name of a secret fetched on its own, and the client's IP address. Cloudflare replaces credentials such as the `Authorization` header with `REDACTED`, as `wrangler tail` shows. Logs are kept for 3 days on the Free plan or 7 on Workers Paid, and anyone who can read logs on the account can see them.
-- **Old values.** The event log keeps every value a secret ever had, until an admin [purges them](./secrets.mdx#history-and-old-values).
+- **Old values.** The history keeps every value a secret ever had, until an admin [purges them](./secrets.mdx#history-and-old-values).
 - **`workers.dev`.** Both workers keep their `workers.dev` URLs, also with a custom domain (`--domain`): `self-host` uses them, and the login provider only has that one.
 - **Cloudflare's time travel** keeps the last 30 days of each database (7 on the Free plan): see [back up and restore](./backups.mdx#cloudflares-time-travel).

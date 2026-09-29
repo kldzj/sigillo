@@ -30,8 +30,8 @@ On **Organization settings**, in the sidebar:
 | Create projects and environments, read and change secrets | In the projects they can open | Everywhere |
 | Rename or delete a project or environment | When it has no admin-only or protected environment | Always; a protected one takes a passkey |
 | API tokens | Create their own, delete their own | Also delete anyone's, and create [machine tokens and trust rules](./ci.mdx) |
-| Event Log | In the environments they can open | Everywhere, and purge old values |
-| Read Log of protected environments | No | Yes |
+| History: changes | In the environments they can open | Everywhere, and purge old values |
+| History: reads of protected environments | No | Yes |
 | Invite, change roles, remove people, set project access | No | Yes |
 | Auto-join, an environment's Min Role and protection, deleting the organization | No | Yes |
 
@@ -39,7 +39,7 @@ Admins always reach every project. In an organization with a protected environme
 
 ## Invite people
 
-On a project's **Access** tab, an admin clicks **Invite member**, optionally ticks **Limit to specific projects** and picks them, and clicks **Generate invite link**. Share the link with the people you invite:
+On the organization's **Members** page, in the sidebar, an admin clicks **Invite member**, optionally ticks **Limit to specific projects** and picks them, and clicks **Generate invite link**. Share the link with the people you invite:
 
 - They sign in first, so the [sign-in allowlist](./self-hosting.mdx#who-can-sign-in) must let them in, and then click **Join organization**.
 - They join as members, with the projects the invite names, or all of them.
@@ -58,17 +58,17 @@ With auto-join, anyone who signs in with a verified email address of your domain
 
 ## Limit a member to some projects
 
-A project's **Access** tab lists everyone in the organization, with their role and projects. Members see the list too, including everyone's email address, but can't change it.
+The **Members** page lists everyone in the organization, with their role and projects. Members see the list too, including everyone's email address, but can't change it.
 
 An admin clicks a member's **Projects** cell to choose **Full access to all projects**, or the projects they may open. A member with none sees no projects.
 
 ## Admin-only environments
 
-Set **Min Role** to **Admin** on the **Environments** tab, and members can't open the environment's secrets or its Event Log, rename or delete it, or rename or delete its project. A member can't create a token for the whole project either, and any token reaches the environment only while its creator is an admin.
+Set **Min Role** to **Admin** on the **Environments** tab, and members can't open the environment's secrets or its history, rename or delete it, or rename or delete its project. A member can't create a token for the whole project either, and any token reaches the environment only while its creator is an admin.
 
 ## Change roles and remove people
 
-On the **Access** tab, an admin changes a role in the **Role** column. An organization always keeps at least one admin. When an admin becomes a member, the invite links they made are deleted, their machine tokens no longer reach protected environments, and their trust rules stop working.
+On the **Members** page, an admin changes a role in the **Role** column. An organization always keeps at least one admin. When an admin becomes a member, the invite links they made are deleted, their machine tokens no longer reach protected environments, and their trust rules stop working.
 
 The trash icon removes someone from the organization. Their API tokens and trust rules for its projects go with them, and so do the invite links they made; the secrets they wrote stay. For everything else to do when someone leaves, see [when someone leaves](./offboarding.mdx).
 
