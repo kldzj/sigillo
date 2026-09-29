@@ -48,7 +48,7 @@ sigillo run -- next dev
     (safe output)
 ```
 
-Secrets are **automatically redacted** from process output so they never leak into agent context windows, CI logs, or terminal history.
+Secrets are **automatically redacted** from process output, so API keys, tokens and passwords don't leak into agent context windows, CI logs, or terminal history. Redaction covers values that look random, 16 characters or longer; see **Output redaction** below.
 
 **Open-source alternative** to [Doppler](https://doppler.com) and [Infisical](https://infisical.com).
 
@@ -70,7 +70,7 @@ Secrets are **automatically redacted** from process output so they never leak in
 ### Why agents need this
 
 - **Don't let agents read your secrets**: agents should never see your raw secret values. Instead of giving agents access to `.env` files, use `sigillo run` to inject secrets into processes without exposing them.
-- **Automatic output redaction**: `sigillo run` replaces secret values in stdout/stderr with `*`, so secrets never enter your chat context window. Even if an agent runs `printenv`, it won't see the real values in the output.
+- **Automatic output redaction**: `sigillo run` replaces secret values that look random in stdout/stderr with `*`, so keys and tokens stay out of your chat context window. Even if an agent runs `printenv`, it won't see them in the output.
 
 ## Install skill for AI agents
 
@@ -329,7 +329,7 @@ Put **non-secret env vars before** `sigillo run`, especially in package scripts.
 }
 ```
 
-**Output redaction** is enabled by default. Secret values with high entropy (>=3.5 Shannon bits, >=16 chars) are replaced with `*` in stdout/stderr. This prevents secrets from leaking into agent context windows or CI logs.
+**Output redaction** is enabled by default. Secret values with high entropy (>=3.5 Shannon bits, >=16 chars) are replaced with `*` in stdout/stderr. This keeps them out of agent context windows and CI logs. Shorter or more predictable values, like a port, a hostname or a word, print as they are.
 
 ### Local package binaries
 
