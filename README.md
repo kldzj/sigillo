@@ -750,10 +750,12 @@ Two auth paths depending on the environment:
 <details>
 <summary><b>Secrets encryption</b></summary>
 
-Every secret value is **AES-256-GCM** encrypted before storage. Each write generates a random 12-byte IV. The encryption key is either:
+Every secret value is **AES-256-GCM** encrypted before storage. Each write generates a random 12-byte IV, and binds the value to its environment and name, so a copy elsewhere in the database doesn't decrypt. The encryption key is either:
 
 - `ENCRYPTION_KEY`: 32 random bytes, base64-encoded (`openssl rand -base64 32`)
 - Derived from `BETTER_AUTH_SECRET` via SHA-256 (default if `ENCRYPTION_KEY` is not set)
+
+`npx @kldzj/sigillo self-host --rotate-key` gives an instance a new key, re-encrypts every stored value with it and retires the old one. Each value names the key it was encrypted with.
 
 ```diagram
   plaintext value ("sk-live-xxx")
@@ -770,7 +772,7 @@ Every secret value is **AES-256-GCM** encrypted before storage. Each write gener
   │                                  │
   │  operation:       "set"          │
   │  name:            "API_KEY"      │
-  │  value_encrypted: <ciphertext>   │
+  │  value_encrypted: v2.<key id>.…  │
   │  iv:              <12 bytes>     │
   │  actor:           "user:usr_abc" │
   │  seq, hash,       row in the     │
@@ -778,7 +780,7 @@ Every secret value is **AES-256-GCM** encrypted before storage. Each write gener
   └──────────────────────────────────┘
 ```
 
-Secrets are stored as an **append-only event log**. Current values are derived by replaying events. This gives you a full audit trail of every change with user/token attribution, and the signed hash chain makes an edited or removed row visible to `sigillo audit verify`.
+Secrets are stored as an **append-only event log**. Current values are derived by replaying events. This gives you a full audit trail of every change with user/token attribution, and the signed hash chain makes an edited or removed row visible to `sigillo audit verify`. Org admins can purge an environment's old values, all but each secret's current one: the rows stay, and the chain still verifies.
 
 </details>
 

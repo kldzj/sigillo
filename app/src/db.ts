@@ -4,8 +4,8 @@
 // epochMs custom columns that accept both Date and number inputs, so
 // BetterAuth's Date params are converted to epoch ms before reaching D1.
 // getAuth(request) creates a BetterAuth instance backed by the same drizzle
-// client for the current request host. encrypt()/decrypt() use ENCRYPTION_KEY
-// when set, otherwise derive a stable AES-256 key from BETTER_AUTH_SECRET.
+// client for the current request host. encrypt()/decrypt() use the key ring
+// described at "Encryption" below.
 
 import { env } from 'cloudflare:workers'
 import * as orm from 'drizzle-orm'
@@ -911,6 +911,7 @@ export async function getProjectIdForEnvironment(environmentId: string, projectI
 
 export type DerivedSecret = {
   id: string
+  environmentId: string
   name: string
   valueEncrypted: string
   iv: string
@@ -930,6 +931,7 @@ export function actorOf(author: { userId: string | null; apiTokenId: string | nu
 // Minimal shape of a secret event row needed to replay current state.
 type SecretEventRow = {
   id: string
+  environmentId: string
   name: string
   operation: string
   valueEncrypted: string | null
@@ -952,6 +954,7 @@ function replaySecretEvents(allEvents: SecretEventRow[]): DerivedSecret[] {
   const events = chained.length ? chained.sort((a, b) => a.seq! - b.seq!) : allEvents
   const state = new Map<string, {
     id: string
+    environmentId: string
     name: string
     valueEncrypted: string | null
     iv: string | null
@@ -961,12 +964,15 @@ function replaySecretEvents(allEvents: SecretEventRow[]): DerivedSecret[] {
   }>()
 
   for (const evt of events) {
+    // A purge removed old values, not the current one
+    if (evt.operation === 'purge') continue
     const existing = state.get(evt.name)
     if (evt.operation === 'delete') {
       state.delete(evt.name)
     } else {
       state.set(evt.name, {
         id: evt.id,
+        environmentId: evt.environmentId,
         name: evt.name,
         valueEncrypted: evt.valueEncrypted,
         iv: evt.iv,
@@ -982,6 +988,7 @@ function replaySecretEvents(allEvents: SecretEventRow[]): DerivedSecret[] {
     .filter((s) => s.valueEncrypted && s.iv)
     .map((s) => ({
       id: s.id,
+      environmentId: s.environmentId,
       name: s.name,
       valueEncrypted: s.valueEncrypted!,
       iv: s.iv!,
@@ -1249,37 +1256,90 @@ export async function getRequestApiToken(request: Request): Promise<{
 }
 
 // ── Encryption (AES-256-GCM) ────────────────────────────────────────
+// A value is stored as v2.<key id>.<ciphertext>, its IV in its own column,
+// and encrypted with its environment and name as additional data: a copy in
+// another environment or under another name doesn't decrypt. Key 0 is
+// ENCRYPTION_KEY, or else derived from BETTER_AUTH_SECRET. After a rotation
+// (`self-host --rotate-key`), ENCRYPTION_KEYS holds the newer keys and names
+// the current one, which new values use; reads pick a value's key by its id.
+// Values from before v2 have no prefix and no additional data, under key 0.
 
-async function getEncryptionKey(): Promise<CryptoKey> {
+// Where a value belongs
+export type ValueSlot = { environmentId: string; name: string }
+
+const KEY_ID = /^[a-z0-9]{1,16}$/
+
+type KeyRing = { current: string; keys: Map<string, Promise<CryptoKey>> }
+let cachedRing: { source: string; ring: KeyRing } | undefined
+
+function importAesKey(raw: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
+  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+}
+
+async function baseKey(): Promise<CryptoKey> {
   const configuredKey = process.env.ENCRYPTION_KEY?.trim()
-  if (configuredKey) {
-    const raw = Uint8Array.from(atob(configuredKey), (c) => c.charCodeAt(0))
-    return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
-  }
-
+  if (configuredKey) return importAesKey(fromBase64(configuredKey))
   // AES-256 needs exactly 32 bytes. Hashing the Better Auth secret gives a
   // stable 32-byte fallback key. Plain base64-encoding the secret text would
   // produce variable-length bytes and break encryption.
-  const derived = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.BETTER_AUTH_SECRET))
-  return crypto.subtle.importKey('raw', derived, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+  return importAesKey(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.BETTER_AUTH_SECRET))))
 }
 
-export async function encrypt(plaintext: string): Promise<{ encrypted: string; iv: string }> {
-  const key = await getEncryptionKey()
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const encoded = new TextEncoder().encode(plaintext)
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded)
-  return {
-    encrypted: btoa(String.fromCharCode(...new Uint8Array(ciphertext))),
-    iv: btoa(String.fromCharCode(...iv)),
+function keyRing(): KeyRing {
+  const configured = process.env.ENCRYPTION_KEYS?.trim() ?? ''
+  const source = [configured, process.env.ENCRYPTION_KEY ?? '', env.BETTER_AUTH_SECRET].join('\n')
+  if (cachedRing?.source === source) return cachedRing.ring
+  const keys = new Map([['0', baseKey()]])
+  let current = '0'
+  if (configured) {
+    const parsed = JSON.parse(configured) as { current?: unknown; keys?: Record<string, unknown> }
+    for (const [id, value] of Object.entries(parsed.keys ?? {})) {
+      const raw = typeof value === 'string' ? fromBase64(value) : null
+      if (!KEY_ID.test(id) || id === '0' || raw?.length !== 32) throw new Error(`ENCRYPTION_KEYS holds an invalid key: ${id}`)
+      keys.set(id, importAesKey(raw))
+    }
+    if (typeof parsed.current !== 'string' || !keys.has(parsed.current)) throw new Error('ENCRYPTION_KEYS names no current key it holds')
+    current = parsed.current
   }
+  cachedRing = { source, ring: { current, keys } }
+  return cachedRing.ring
 }
 
-export async function decrypt(encrypted: string, iv: string): Promise<string> {
-  const key = await getEncryptionKey()
-  const ivBytes = Uint8Array.from(atob(iv), (c) => c.charCodeAt(0))
-  const ciphertext = Uint8Array.from(atob(encrypted), (c) => c.charCodeAt(0))
-  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, key, ciphertext)
+function slotData({ environmentId, name }: ValueSlot) {
+  return new TextEncoder().encode(`${environmentId}:${name}`)
+}
+
+export async function encrypt(plaintext: string, slot: ValueSlot): Promise<{ encrypted: string; iv: string }> {
+  const { current, keys } = keyRing()
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: slotData(slot) }, await keys.get(current)!, new TextEncoder().encode(plaintext))
+  return { encrypted: `v2.${current}.${toBase64(new Uint8Array(ciphertext))}`, iv: toBase64(iv) }
+}
+
+export async function decrypt(encrypted: string, iv: string, slot: ValueSlot): Promise<string> {
+  const v2 = encrypted.startsWith('v2.')
+  const [keyId, ciphertext] = v2 ? encrypted.slice(3).split('.') : ['0', encrypted]
+  const key = keyRing().keys.get(keyId!)
+  if (!key) throw new Error(`${slot.name} is encrypted with the key ${keyId}, which this instance doesn't have`)
+  let plaintext: ArrayBuffer
+  try {
+    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(iv), ...(v2 ? { additionalData: slotData(slot) } : {}) }, await key, fromBase64(ciphertext!))
+  } catch {
+    throw new Error(`${slot.name} can't be decrypted`)
+  }
   // Keeps a leading byte order mark: the history's digest covers it
   return new TextDecoder('utf-8', { ignoreBOM: true }).decode(plaintext)
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+function fromBase64(value: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
 }

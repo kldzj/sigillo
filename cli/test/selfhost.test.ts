@@ -17,6 +17,8 @@ import {
   type SelfhostBundle, type WorkerBundle,
 } from '../src/selfhost/deploy.js'
 import { deriveStateKey, isSealed, openState, sealState, unlockStateFile } from '../src/selfhost/state-file.js'
+import { baseKeyOf, countNotUnder, newKeyId, openValue, reencryptAll, sealValue, type KeyRing, type Query } from '../src/selfhost/rotate.js'
+import { DatabaseSync } from 'node:sqlite'
 
 describe('parseWranglerToml', () => {
   const sample = [
@@ -574,5 +576,129 @@ describe('state file on disk', () => {
   test('nothing is read or written before the file is unlocked', async () => {
     const { cloudflare } = await loadWithHome()
     expect(() => cloudflare.writeState({})).toThrow('~/.sigillo/selfhost.json was not unlocked')
+  })
+})
+
+describe('rotating the encryption key', () => {
+  // Also in app/src/app.test.ts, whose Worker reads it: both sides write and
+  // read the same bytes
+  const vector = {
+    key: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
+    iv: 'c2lnaWxsby12Mml2',
+    encrypted: 'v2.t1.04HOaWtJFS4lf19AmZ7SSntwRBs93eL6CAmTPylB1fxE2Y6tqkquxR0BRLSg',
+    slot: { environmentId: '01TESTENVIRONMENT', name: 'DATABASE_URL' },
+    value: 'postgres://app:hunter2@db/app',
+    // The same key and IV before v2: key 0, no additional data
+    v1: 'z4vafG9CXSt+PAVE/XS9/aX7CtsC6HgJG5MY8Q==',
+  }
+  const base = Buffer.from(vector.key, 'base64')
+
+  test('writes and reads what the Worker does', async () => {
+    const sealed = await sealValue({ keyId: 't1', key: vector.key, slot: vector.slot, plaintext: vector.value, iv: Buffer.from(vector.iv, 'base64') })
+    const ring = { current: 't1', keys: { t1: vector.key } }
+    const outcome = (run: () => Promise<string>) => run().catch((error: Error) => error.message)
+    expect({
+      sealed: sealed.encrypted,
+      opened: await openValue({ ring, baseKey: base, encrypted: vector.encrypted, iv: vector.iv, slot: vector.slot }),
+      v1: await openValue({ ring: undefined, baseKey: base, encrypted: vector.v1, iv: vector.iv, slot: vector.slot }),
+      elsewhere: await outcome(() => openValue({ ring, baseKey: base, encrypted: vector.encrypted, iv: vector.iv, slot: { ...vector.slot, name: 'OTHER' } })),
+      missingKey: await outcome(() => openValue({ ring: undefined, baseKey: base, encrypted: vector.encrypted, iv: vector.iv, slot: vector.slot })),
+    }).toEqual({
+      sealed: vector.encrypted,
+      opened: vector.value,
+      v1: 'legacy-value',
+      elsewhere: "OTHER can't be decrypted",
+      missingKey: "DATABASE_URL is encrypted with the key t1, which ~/.sigillo/selfhost.json doesn't have",
+    })
+  })
+
+  test('key 0 is ENCRYPTION_KEY, or else derived from BETTER_AUTH_SECRET, and a new key id is new', () => {
+    const ring = { current: 'abc123', keys: { abc123: vector.key } }
+    const id = newKeyId(ring)
+    expect({
+      explicit: baseKeyOf({ encryptionKey: vector.key, betterAuthSecret: 'ignored' }).equals(base),
+      derived: baseKeyOf({ betterAuthSecret: 'secret' }).equals(createHash('sha256').update('secret').digest()),
+      id: /^[a-z0-9]{6}$/.test(id) && id !== 'abc123',
+    }).toEqual({ explicit: true, derived: true, id: true })
+    expect(() => baseKeyOf({})).toThrow('neither ENCRYPTION_KEY nor BETTER_AUTH_SECRET')
+  })
+
+  // The statements run on SQLite, as D1 runs them
+  const database = () => {
+    const db = new DatabaseSync(':memory:')
+    db.exec('CREATE TABLE secret_event (id text PRIMARY KEY, environment_id text NOT NULL, name text NOT NULL, value_encrypted text, iv text)')
+    const query: Query = async (sql, params = []) => {
+      const statement = db.prepare(sql)
+      if (/^\s*SELECT/i.test(sql)) return statement.all(...params) as Array<Record<string, unknown>>
+      statement.run(...params)
+      return []
+    }
+    return { db, query }
+  }
+  const insert = (db: DatabaseSync, row: { id: string; name: string; value: { encrypted: string; iv: string } | null }) =>
+    db.prepare('INSERT INTO secret_event VALUES (?, ?, ?, ?, ?)').run(row.id, vector.slot.environmentId, row.name, row.value?.encrypted ?? null, row.value?.iv ?? null)
+
+  test('re-encrypts every value under the current key, from before v2 too, and leaves a purged one purged', async () => {
+    const { db, query } = database()
+    const t2 = Buffer.alloc(32, 7).toString('base64')
+    const ring: KeyRing = { current: 't2', keys: { t1: vector.key, t2 } }
+    const slot = (name: string) => ({ ...vector.slot, name })
+    insert(db, { id: 'a', name: 'DATABASE_URL', value: { encrypted: vector.v1, iv: vector.iv } })
+    insert(db, { id: 'b', name: 'KEY0', value: await sealValue({ keyId: '0', key: vector.key, slot: slot('KEY0'), plaintext: 'under key 0' }) })
+    insert(db, { id: 'c', name: 'DATABASE_URL', value: { encrypted: vector.encrypted, iv: vector.iv } })
+    insert(db, { id: 'd', name: 'PURGED', value: null })
+    // Rows a..c are more than one batch once there are enough of them
+    for (let i = 0; i < 30; i++) insert(db, { id: `m${String(i).padStart(2, '0')}`, name: `MANY_${i}`, value: await sealValue({ keyId: 't1', key: vector.key, slot: slot(`MANY_${i}`), plaintext: `value ${i}` }) })
+    // An admin purges row c while the rotation runs
+    let purgedMeanwhile = false
+    const racing: Query = async (sql, params) => {
+      if (sql.startsWith('UPDATE') && !purgedMeanwhile) {
+        purgedMeanwhile = true
+        db.prepare("UPDATE secret_event SET value_encrypted = NULL, iv = NULL WHERE id = 'c'").run()
+      }
+      return query(sql, params)
+    }
+    const progress: number[] = []
+    const done = await reencryptAll({ query: racing, ring, baseKey: base, onProgress: (n) => progress.push(n) })
+    const rows = db.prepare('SELECT id, name, value_encrypted, iv FROM secret_event ORDER BY id').all() as Array<{ id: string; name: string; value_encrypted: string | null; iv: string | null }>
+    const read = async (id: string) => {
+      const row = rows.find((r) => r.id === id)!
+      return row.value_encrypted ? openValue({ ring: { current: 't2', keys: { t2 } }, baseKey: Buffer.alloc(32), encrypted: row.value_encrypted, iv: row.iv!, slot: slot(row.name) }) : null
+    }
+    expect({
+      done,
+      progress,
+      prefixes: [...new Set(rows.filter((row) => row.value_encrypted).map((row) => row.value_encrypted!.slice(0, 6)))],
+      a: await read('a'),
+      b: await read('b'),
+      c: await read('c'),
+      d: await read('d'),
+      m29: await read('m29'),
+      left: await countNotUnder(query, 't2'),
+    }).toEqual({
+      done: 33,
+      progress: [25, 33],
+      prefixes: ['v2.t2.'],
+      a: 'legacy-value',
+      b: 'under key 0',
+      c: null,
+      d: null,
+      m29: 'value 29',
+      left: 0,
+    })
+  })
+
+  test('stops at a value it can\'t read, naming its row, and a second run carries on', async () => {
+    const { db, query } = database()
+    const ring: KeyRing = { current: 't1', keys: { t1: vector.key } }
+    insert(db, { id: 'a', name: 'GOOD', value: await sealValue({ keyId: '0', key: vector.key, slot: { ...vector.slot, name: 'GOOD' }, plaintext: 'good' }) })
+    insert(db, { id: 'b', name: 'BAD', value: { encrypted: 'v2.0.AAAA', iv: vector.iv } })
+    const failed = await reencryptAll({ query, ring, baseKey: base }).catch((error: Error) => error.message)
+    db.prepare("DELETE FROM secret_event WHERE id = 'b'").run()
+    expect({ failed, left: await countNotUnder(query, 't1'), again: await reencryptAll({ query, ring, baseKey: base }) }).toEqual({
+      failed: `BAD can't be decrypted (row b of environment ${vector.slot.environmentId}): the rotation stopped there`,
+      left: 1,
+      again: 1,
+    })
   })
 })

@@ -801,7 +801,7 @@ export const apiApp = new Spiceflow()
       await recordSecretRead({ request, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'list', names: derived.map((d) => d.name) })
       // Decrypt each value to check if it's empty
       const secrets = await Promise.all(derived.map(async (d) => {
-        const value = await decrypt(d.valueEncrypted, d.iv)
+        const value = await decrypt(d.valueEncrypted, d.iv, d)
         return {
           id: d.id, name: d.name,
           createdAt: d.createdAt, updatedAt: d.updatedAt,
@@ -840,7 +840,7 @@ export const apiApp = new Spiceflow()
       const secret = derived.find((d) => d.name === params.name)
       if (!secret) return json({ error: 'not found' }, { status: 404 })
       await recordSecretRead({ request, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'value', names: [secret.name] })
-      const value = await decrypt(secret.valueEncrypted, secret.iv)
+      const value = await decrypt(secret.valueEncrypted, secret.iv, secret)
       return { id: secret.id, name: secret.name, value, environmentId: auth.environmentId, createdAt: secret.createdAt, updatedAt: secret.updatedAt }
     },
   })
@@ -878,7 +878,7 @@ export const apiApp = new Spiceflow()
       await recordSecretRead({ request, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'download', names: derived.map((d) => d.name) })
       const entries: Record<string, string> = {}
       for (const d of derived) {
-        entries[d.name] = await decrypt(d.valueEncrypted, d.iv)
+        entries[d.name] = await decrypt(d.valueEncrypted, d.iv, d)
       }
 
       const rendered = renderDownloadedSecrets(entries, format)

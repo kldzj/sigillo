@@ -35,6 +35,7 @@ import {
   internalErrorMessage,
 } from './db.ts'
 import { apiApp } from './api.ts'
+import { countOldValues } from './audit.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
 import { cn, loginErrorMessage, DOCS_URL, ENV_SLUG_REGEX } from 'sigillo-app/src/lib/utils'
@@ -636,7 +637,7 @@ export const app = new Spiceflow({ tracer })
     const locked = !!matchedEnv && !!getEnvironmentAccessError(access, matchedEnv)
 
     // Load events for selected env, sorted by createdAt DESC
-    let events: { id: string; name: string; operation: string; valueEncrypted: string | null; iv: string | null; createdAt: number; environmentName: string; userName: string; unsigned: boolean }[] = []
+    let events: { id: string; name: string; operation: string; valueEncrypted: string | null; iv: string | null; createdAt: number; environmentName: string; userName: string; unsigned: boolean; purged: boolean }[] = []
     if (selectedEnvId && !locked) {
       const envMap = new Map(environments.map((e) => [e.id, e.name]))
       const rows = await db.query.secretEvent.findMany({
@@ -655,17 +656,24 @@ export const app = new Spiceflow({ tracer })
         userName: actorName(names, r.actor ?? actorOf(r)),
         // Not part of the signed history: added to the database around it
         unsigned: r.seq === null,
+        // Removed by an admin; the row keeps its digest (audit.ts)
+        purged: r.operation === 'set' && !r.valueEncrypted && !!r.valueDigest,
       }))
     }
 
     // No values: an old value is fetched when revealed (see readEventValue)
     const eventsWithoutValues = events.map(({ valueEncrypted, iv, ...evt }) => ({ ...evt, hasValue: evt.operation === 'set' && !!valueEncrypted && !!iv }))
+    // Admins may purge the old values
+    const isAdmin = access?.role === 'admin'
+    const oldValues = isAdmin && selectedEnvId && !locked ? await countOldValues(selectedEnvId) : 0
 
     return {
       events: eventsWithoutValues,
       selectedEnvId,
       locked,
       projectId,
+      isAdmin,
+      oldValues,
     }
   })
 

@@ -76,6 +76,8 @@ export interface DeploymentState {
   betterAuthSecret?: string
   /** Every new deployment's own key (random or SIGILLO_ENCRYPTION_KEY); unset for older ones that derive it */
   encryptionKey?: string
+  /** The Worker's ENCRYPTION_KEYS after a rotation (rotate.ts): the key ids, their keys, and the current one */
+  encryptionKeys?: { current: string; keys: Record<string, string> }
   /** the deployment's own login provider (unset when it uses another one) */
   providerWorkerName?: string
   providerDatabaseId?: string

@@ -66,12 +66,20 @@ ENCRYPTION_KEY=<output of openssl rand -base64 32>
 
 The value must be valid base64 — `atob()` is used to decode it at runtime. If `ENCRYPTION_KEY` is omitted, the app hashes `BETTER_AUTH_SECRET` with SHA-256 and uses that 32-byte digest as the AES key.
 
+**Format and key ring (fork).** A value is stored as `v2.<key id>.<base64 ciphertext>`, its IV in `iv`, and encrypted with `<environment id>:<name>` as AES-GCM additional data, so a copy in another environment or under another name doesn't decrypt. Key `0` is `ENCRYPTION_KEY` or the derived key above. The `ENCRYPTION_KEYS` secret, JSON `{"current":"<id>","keys":{"<id>":"<base64, 32 bytes>"}}`, adds keys and names the current one: new values use it, and a read picks the value's key by id. A value without a prefix is from before v2 (key 0, no additional data) and stays readable.
+
+Rules:
+- `encrypt(value, slot)` and `decrypt(encrypted, iv, slot)` always take the value's environment and name (`ValueSlot`). A derived secret carries both, so pass it as the slot.
+- `self-host --rotate-key` adds a key, re-encrypts every value in the CLI through the D1 API (`cli/src/selfhost/rotate.ts`), then drops the keys no value uses. The CLI writes the same format as `app/src/db.ts`, and both test suites check the same vector: change them together.
+- No Worker route may decrypt every value. Re-encryption stays in the CLI, which holds the keys in `selfhost.json` anyway.
+
 ## Tamper-evident history (fork)
 
 `app/src/audit.ts` keeps two hash chains per environment: its `secret_event` rows and its `secret_read` rows (reads of a **protected** environment). Each row has `seq` (1, 2, 3...), `hash` = SHA-256 of the previous hash (hex) and the row's preimage, and `signature` = the Worker's Ed25519 signature of the hash. The signing key and the value digest key come from `BETTER_AUTH_SECRET` via HKDF. `GET /api/v0/projects/:projectId/environments/:environmentId/audit` (org admins, session only) returns every row with its preimage rebuilt from D1, and `sigillo audit verify` (`cli/zig/src/audit.zig`) checks it and keeps the last heads in `~/.sigillo/audit.json`.
 
 Rules:
 - **Only `appendSecretEvents()` writes `secret_event`.** A row inserted any other way has no `seq`, so once the environment has a chain the replay ignores it and verify reports it. Tests that need old-style rows insert them before the environment's first chained write; those join the chain in order.
+- **Only a row's value may ever change, and only two ways:** `self-host --rotate-key` re-encrypts it (`value_encrypted`, `iv`), and `purgeOldValues()` removes an old one and keeps its digest in `value_digest`, next to a `purge` row in the chain. Both keep the chain valid because a set event's preimage holds the plaintext's digest. The replay skips `purge` rows.
 - **Never change a preimage's fields or their order.** Rows are verified by rebuilding their preimage, so any change breaks every existing row. A new field needs a new preimage version.
 - A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it. Values have no AAD, so a ciphertext copied into another environment still decrypts there; only a chained row's digest catches it.
 - Rows from before the chain are adopted on their environment's next write (and on the audit GET) with `adopted` set and the preimage kind `adopted` instead of `event`. Adopting a chain's rows a second time, after someone cleared their `seq` in D1, changes every hash, so a saved witness no longer matches. Never adopt with the `event` kind.

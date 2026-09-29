@@ -1,0 +1,1 @@
+ALTER TABLE `secret_event` ADD `value_digest` text;

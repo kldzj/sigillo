@@ -273,18 +273,24 @@ export const environment = sqliteCore.sqliteTable('environment', {
 
 // Append-only event log for secrets. Each row is an immutable event.
 // "set" = create or update a secret value. "delete" = remove the secret.
+// "purge" = an admin removed the old values of that name (app/src/audit.ts).
 // Current state is derived by taking the last event per (environmentId, name).
-// NEVER update or delete rows in this table — it is the audit trail.
+// NEVER update or delete rows in this table — it is the audit trail. Only a
+// value may change: re-encrypted under a new key by `self-host
+// --rotate-key`, or removed by a purge, which keeps its digest.
 export const secretEvent = sqliteCore.sqliteTable('secret_event', {
   id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),
   environmentId: sqliteCore.text('environment_id').notNull().references(() => environment.id, { onDelete: 'cascade' }),
   name: sqliteCore.text('name').notNull(),
-  // "set" = create or update, "delete" = remove
-  operation: sqliteCore.text('operation', { enum: ['set', 'delete'] }).notNull(),
+  // "set" = create or update, "delete" = remove, "purge" = old values removed
+  operation: sqliteCore.text('operation', { enum: ['set', 'delete', 'purge'] }).notNull(),
   // Encrypted with Web Crypto AES-GCM, stored as base64. Null for delete events.
   valueEncrypted: sqliteCore.text('value_encrypted'),
   // AES-GCM initialization vector, stored as base64. Null for delete events.
   iv: sqliteCore.text('iv'),
+  // A purged value's digest, as its history row was signed with: the value
+  // is gone, and the row still verifies. Null for every other row.
+  valueDigest: sqliteCore.text('value_digest'),
   // Who performed the action: userId for session auth, apiTokenId for bearer
   // tokens. SET NULL, never CASCADE: deleting a token or user must not delete
   // the secrets it wrote (cascade used to revert values to older versions).

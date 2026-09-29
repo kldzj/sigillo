@@ -14,15 +14,16 @@
 import { betterAuth } from 'better-auth'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 import { describe, test, expect, beforeAll } from 'vitest'
+import { env as workerEnv } from 'cloudflare:workers'
 import { createSpiceflowFetch } from 'spiceflow/client'
 import * as orm from 'drizzle-orm'
 import worker, { app } from './app.js'
 import { getAuth, encrypt, decrypt, deriveSecrets, deriveEnvironmentSecretsAndNames, generateApiToken, getDb, autoJoinOrgsByDomain, getMemberProjectAccess, getAccessibleProjectIds, getClaimableAutoJoinDomain, deleteOrgMember, joinOrgByInvite, listFormerMembers, setOrgMemberRole, getSession, countSecrets, requireOrgDeletionTyped, requireEnvironmentDeletionTyped, requireProjectDeletionTyped, oauthClientRegistration, listUserSessions, endUserSession, endOtherUserSessions, internalErrorMessage } from './db.js'
 import { schema } from 'db'
 import { makeSignature } from 'better-auth/crypto'
-import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue } from './audit.js'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, getAuditChains, verifyChain, getAuditPublicKey, readSecretValues, readEventValue, purgeOldValues } from './audit.js'
 import { createSoftAuthenticator } from './soft-authenticator.js'
-import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
+import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode } from './lib/utils.js'
 
@@ -832,7 +833,7 @@ describe('api tokens', () => {
     const values = Object.fromEntries(await Promise.all(
       derived
         .filter((d) => ['TOKEN_OVERWRITE', 'TOKEN_ONLY', 'USER_ONLY'].includes(d.name))
-        .map(async (d) => [d.name, await decrypt(d.valueEncrypted!, d.iv!)] as const),
+        .map(async (d) => [d.name, await decrypt(d.valueEncrypted!, d.iv!, d)] as const),
     ))
     expect(values).toMatchInlineSnapshot(`
       {
@@ -1265,15 +1266,16 @@ describe('secrets derivation — batching & multi-author', () => {
     authorBId = authorB.user.id
 
     const db = getDb()
-    const a = await encrypt('alpha-value')
-    const b = await encrypt('beta-value')
-    const c = await encrypt('prod-only-value')
+    const a = await encrypt('alpha-value', { environmentId: devEnvId, name: 'SHARED_KEY' })
+    const b = await encrypt('beta-value', { environmentId: devEnvId, name: 'DEV_ONLY' })
+    const c = await encrypt('prod-only-value', { environmentId: prodEnvId, name: 'PROD_ONLY' })
+    const aProd = await encrypt('alpha-value', { environmentId: prodEnvId, name: 'SHARED_KEY' })
     // dev: SHARED_KEY by author A, DEV_ONLY by author B
     await db.insert(schema.secretEvent).values([
       { environmentId: devEnvId, name: 'SHARED_KEY', operation: 'set', valueEncrypted: a.encrypted, iv: a.iv, userId: authorAId },
       { environmentId: devEnvId, name: 'DEV_ONLY', operation: 'set', valueEncrypted: b.encrypted, iv: b.iv, userId: authorBId },
       // prod: SHARED_KEY + PROD_ONLY so the names union spans envs
-      { environmentId: prodEnvId, name: 'SHARED_KEY', operation: 'set', valueEncrypted: a.encrypted, iv: a.iv, userId: authorAId },
+      { environmentId: prodEnvId, name: 'SHARED_KEY', operation: 'set', valueEncrypted: aProd.encrypted, iv: aProd.iv, userId: authorAId },
       { environmentId: prodEnvId, name: 'PROD_ONLY', operation: 'set', valueEncrypted: c.encrypted, iv: c.iv, userId: authorBId },
     ])
   })
@@ -1470,30 +1472,117 @@ describe('secrets list — isEmpty and allNames', () => {
 })
 
 describe('encryption roundtrip', () => {
+  const slot = { environmentId: 'env-1', name: 'X' }
+
   test('encrypt then decrypt returns original', async () => {
-    const { encrypted, iv } = await encrypt('hello-world')
-    const decrypted = await decrypt(encrypted, iv)
+    const { encrypted, iv } = await encrypt('hello-world', slot)
+    const decrypted = await decrypt(encrypted, iv, slot)
     expect(decrypted).toBe('hello-world')
   })
 
   test('two encryptions produce different IVs', async () => {
-    const a = await encrypt('same-value')
-    const b = await encrypt('same-value')
+    const a = await encrypt('same-value', slot)
+    const b = await encrypt('same-value', slot)
     expect(a.iv).not.toBe(b.iv)
     expect(a.encrypted).not.toBe(b.encrypted)
   })
 
   test('empty string roundtrip', async () => {
-    const { encrypted, iv } = await encrypt('')
-    const decrypted = await decrypt(encrypted, iv)
+    const { encrypted, iv } = await encrypt('', slot)
+    const decrypted = await decrypt(encrypted, iv, slot)
     expect(decrypted).toBe('')
   })
 
   test('unicode roundtrip', async () => {
     const value = '🔐 Ключ шифрования 密钥'
-    const { encrypted, iv } = await encrypt(value)
-    const decrypted = await decrypt(encrypted, iv)
+    const { encrypted, iv } = await encrypt(value, slot)
+    const decrypted = await decrypt(encrypted, iv, slot)
     expect(decrypted).toBe(value)
+  })
+})
+
+describe('encryption v2', () => {
+  const slot = { environmentId: 'env-1', name: 'X' }
+  // Also in cli/test/selfhost.test.ts, which checks that self-host's
+  // re-encryption writes the same bytes
+  const vector = {
+    key: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
+    iv: 'c2lnaWxsby12Mml2',
+    encrypted: 'v2.t1.04HOaWtJFS4lf19AmZ7SSntwRBs93eL6CAmTPylB1fxE2Y6tqkquxR0BRLSg',
+    slot: { environmentId: '01TESTENVIRONMENT', name: 'DATABASE_URL' },
+    value: 'postgres://app:hunter2@db/app',
+  }
+  const outcome = (run: () => Promise<unknown>) => run().then((value) => value, (error: Error) => error.message)
+  const withKeys = async <T>(keys: string, run: () => Promise<T>) => {
+    const before = process.env.ENCRYPTION_KEYS
+    process.env.ENCRYPTION_KEYS = keys
+    try {
+      return await run()
+    } finally {
+      if (before === undefined) delete process.env.ENCRYPTION_KEYS
+      else process.env.ENCRYPTION_KEYS = before
+    }
+  }
+
+  test('binds a value to its environment and name, and names its key', async () => {
+    const stored = await encrypt('v', slot)
+    expect({
+      prefix: stored.encrypted.slice(0, 5),
+      same: await decrypt(stored.encrypted, stored.iv, slot),
+      otherEnvironment: await outcome(() => decrypt(stored.encrypted, stored.iv, { ...slot, environmentId: 'env-2' })),
+      otherName: await outcome(() => decrypt(stored.encrypted, stored.iv, { ...slot, name: 'Y' })),
+    }).toEqual({ prefix: 'v2.0.', same: 'v', otherEnvironment: "X can't be decrypted", otherName: "Y can't be decrypted" })
+  })
+
+  test('new values use the ring\'s current key, older ones keep theirs, and a missing key is named', async () => {
+    const underKey0 = await encrypt('under key 0', slot)
+    const inRing = await withKeys(JSON.stringify({ current: 't1', keys: { t1: vector.key } }), async () => {
+      const underT1 = await encrypt('under t1', slot)
+      return {
+        underT1,
+        prefix: underT1.encrypted.slice(0, 6),
+        vector: await decrypt(vector.encrypted, vector.iv, vector.slot),
+        key0: await decrypt(underKey0.encrypted, underKey0.iv, slot),
+        t1: await decrypt(underT1.encrypted, underT1.iv, slot),
+      }
+    })
+    expect({
+      ...inRing,
+      underT1: undefined,
+      withoutT1: await outcome(() => decrypt(inRing.underT1.encrypted, inRing.underT1.iv, slot)),
+      noCurrent: await withKeys(JSON.stringify({ current: 't2', keys: { t1: vector.key } }), () => outcome(() => encrypt('v', slot))),
+      shortKey: await withKeys(JSON.stringify({ current: 't1', keys: { t1: 'c2hvcnQ=' } }), () => outcome(() => encrypt('v', slot))),
+    }).toEqual({
+      underT1: undefined,
+      prefix: 'v2.t1.',
+      vector: vector.value,
+      key0: 'under key 0',
+      t1: 'under t1',
+      withoutT1: "X is encrypted with the key t1, which this instance doesn't have",
+      noCurrent: 'ENCRYPTION_KEYS names no current key it holds',
+      shortKey: 'ENCRYPTION_KEYS holds an invalid key: t1',
+    })
+  })
+
+  test('values from before v2 read next to v2 ones', async () => {
+    const user = await createTestUser({ name: 'V1 User' })
+    const af = authedFetch(user.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'V1 Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'V1 Project', orgId } })).id
+    const envId = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'dev' } })).id
+    // A value as the Worker stored it before v2: key 0, no prefix, no additional data
+    const key0 = await crypto.subtle.importKey('raw', await crypto.subtle.digest('SHA-256', new TextEncoder().encode(workerEnv.BETTER_AUTH_SECRET)), { name: 'AES-GCM' }, false, ['encrypt'])
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key0, new TextEncoder().encode('from v1')))
+    await getDb().insert(schema.secretEvent).values({
+      environmentId: envId, name: 'OLD', operation: 'set', userId: user.user.id,
+      valueEncrypted: btoa(String.fromCharCode(...ciphertext)), iv: btoa(String.fromCharCode(...iv)),
+    })
+    assertOk(await af('/api/v0/projects/:pid/environments/:eid/secrets', { method: 'POST', params: { pid: projectId, eid: envId }, body: { name: 'NEW', value: 'from v2' } }))
+    const res = await app.handle(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${envId}/secrets/download?format=json`, { headers: { authorization: `Bearer ${user.token}` } }))
+    const stored = await getDb().query.secretEvent.findMany({ where: { environmentId: envId }, orderBy: { createdAt: 'asc' } })
+    expect({ values: await res.json(), formats: stored.map((row) => [row.name, row.valueEncrypted!.startsWith('v2.0.')]) })
+      .toEqual({ values: { NEW: 'from v2', OLD: 'from v1' }, formats: [['OLD', false], ['NEW', true]] })
   })
 })
 
@@ -2625,7 +2714,7 @@ describe('tamper-evident history', () => {
     const envId = await newEnv()
     await setSecret(admin.token, envId, 'X', 'v')
     const first = await eventRow(envId, 1)
-    const encrypted = await encrypt('forged')
+    const encrypted = await encrypt('forged', { environmentId: envId, name: 'X' })
     await getDb().insert(schema.secretEvent).values({
       environmentId: envId, name: 'X', operation: 'set', valueEncrypted: encrypted.encrypted, iv: encrypted.iv,
       userId: admin.user.id, actor: `user:${admin.user.id}`, seq: 2, hash: 'x', signature: first.signature,
@@ -2640,17 +2729,85 @@ describe('tamper-evident history', () => {
   test('a row added around the chain is counted and ignored', async () => {
     const envId = await newEnv()
     await setSecret(admin.token, envId, 'X', 'real')
-    const encrypted = await encrypt('planted')
+    const encrypted = await encrypt('planted', { environmentId: envId, name: 'X' })
     await getDb().insert(schema.secretEvent).values({ environmentId: envId, name: 'X', operation: 'set', valueEncrypted: encrypted.encrypted, iv: encrypted.iv })
     const derived = await deriveSecrets(envId)
     const result = await verify(envId)
-    expect({ ok: result.events.ok, outside: result.outside, value: await decrypt(derived[0]!.valueEncrypted, derived[0]!.iv) })
+    expect({ ok: result.events.ok, outside: result.outside, value: await decrypt(derived[0]!.valueEncrypted, derived[0]!.iv, derived[0]!) })
       .toEqual({ ok: true, outside: 1, value: 'real' })
+  })
+
+  test('purging old values removes all but each secret\'s current one, and the history still verifies', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'one')
+    await setSecret(admin.token, envId, 'X', 'two')
+    await setSecret(admin.token, envId, 'GONE', 'was here')
+    await app.handle(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${envId}/secrets/GONE`, { method: 'DELETE', headers: { authorization: `Bearer ${admin.token}` } }))
+    const before = await verify(envId)
+    const author = { userId: admin.user.id, apiTokenId: null, sessionId: await sessionIdOf(admin.token) }
+    const purged = await purgeOldValues({ environmentId: envId, author })
+    const rows = await getDb().query.secretEvent.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } })
+    const after = await verify(envId)
+    const values = Object.fromEntries(await Promise.all((await deriveSecrets(envId)).map(async (s) => [s.name, await decrypt(s.valueEncrypted, s.iv, s)] as const)))
+    expect({
+      before: before.events.ok,
+      purged,
+      rows: rows.map((row) => [row.seq, row.name, row.operation, !!row.valueEncrypted, !!row.valueDigest]),
+      after: after.events.ok,
+      values,
+      again: await purgeOldValues({ environmentId: envId, author }),
+    }).toEqual({
+      before: true,
+      purged: { purged: 2 },
+      rows: [
+        [1, 'X', 'set', false, true],
+        [2, 'X', 'set', true, false],
+        [3, 'GONE', 'set', false, true],
+        [4, 'GONE', 'delete', false, false],
+        [5, 'X', 'purge', false, false],
+        [6, 'GONE', 'purge', false, false],
+      ],
+      after: true,
+      values: { X: 'two' },
+      again: { purged: 0 },
+    })
+  })
+
+  test('a purged value put back or cleared by hand breaks the history', async () => {
+    const envId = await newEnv()
+    await setSecret(admin.token, envId, 'X', 'one')
+    await setSecret(admin.token, envId, 'X', 'two')
+    // Someone with the database clears a value without purging
+    const first = await eventRow(envId, 1)
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: null, iv: null }).where(orm.eq(schema.secretEvent.id, first.id))
+    const cleared = await verify(envId)
+    // or, once it is purged for real, clears the current value and gives it
+    // the purged one's digest
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: first.valueEncrypted, iv: first.iv }).where(orm.eq(schema.secretEvent.id, first.id))
+    await purgeOldValues({ environmentId: envId, author: { userId: admin.user.id, apiTokenId: null, sessionId: null } })
+    const second = await eventRow(envId, 2)
+    await getDb().update(schema.secretEvent).set({ valueEncrypted: null, iv: null, valueDigest: (await eventRow(envId, 1)).valueDigest }).where(orm.eq(schema.secretEvent.id, second.id))
+    expect({ cleared: cleared.events, swapped: (await verify(envId)).events })
+      .toEqual({ cleared: { ok: false, problem: 'row 1 does not match its hash' }, swapped: { ok: false, problem: 'row 2 does not match its hash' } })
+  })
+
+  test('only an org admin purges, with their passkey even where nothing is protected', async () => {
+    const envId = await newEnv()
+    const outcome = (user: typeof admin, sessionId: Promise<string>) => sessionId.then((id) => requireOldValuesPurge({ userId: user.user.id, sessionId: id, environmentId: envId }))
+      .then(() => 'ok', (error) => error instanceof StepUpRequiredError ? `step-up:${error.purpose}` : (error as Error).message)
+    const auth = await getTestAuth()
+    const signIn = await auth.api.signInEmail({ body: { email: admin.user.email, password: 'test-password-123' } })
+    const login = `${signIn.token}.${await makeSignature(signIn.token, (await auth.$context).secret)}`
+    const byMember = await outcome(member, sessionIdOf(member.token))
+    const withoutPasskey = await outcome(admin, sessionIdOf(login))
+    await grantAdmin(login)
+    expect({ byMember, withoutPasskey, approved: await outcome(admin, sessionIdOf(login)) })
+      .toEqual({ byMember: 'Only admins can do this', withoutPasskey: 'step-up:admin', approved: 'ok' })
   })
 
   test('rows from before the chain join it in their order', async () => {
     const envId = await newEnv()
-    const values = await Promise.all(['1', '2'].map((value) => encrypt(value)))
+    const values = await Promise.all(['1', '2'].map((value) => encrypt(value, { environmentId: envId, name: 'OLD' })))
     await getDb().insert(schema.secretEvent).values(values.map((value, i) => ({
       environmentId: envId, name: 'OLD', operation: 'set' as const, valueEncrypted: value.encrypted, iv: value.iv, createdAt: 1000 + i,
     })))
@@ -2659,7 +2816,7 @@ describe('tamper-evident history', () => {
     const derived = await deriveSecrets(envId)
     expect({
       events: result.events.ok, rows: result.chains.events.rows.length, outside: result.outside, adopted: result.chains.events.adopted,
-      old: await decrypt(derived.find((d) => d.name === 'OLD')!.valueEncrypted, derived.find((d) => d.name === 'OLD')!.iv),
+      old: await decrypt(derived.find((d) => d.name === 'OLD')!.valueEncrypted, derived.find((d) => d.name === 'OLD')!.iv, derived.find((d) => d.name === 'OLD')!),
     }).toEqual({ events: true, rows: 3, outside: 0, adopted: 2, old: '2' })
   })
 
@@ -2670,7 +2827,7 @@ describe('tamper-evident history', () => {
     if (!before.events.ok || !before.events.head) throw new Error('expected an intact chain')
     const witness = before.events.head
     // Someone with the database drops every seq, and adds a row in the admin's name
-    const planted = await encrypt('https://attacker.example/hook')
+    const planted = await encrypt('https://attacker.example/hook', { environmentId: envId, name: 'WEBHOOK_URL' })
     await getDb().update(schema.secretEvent).set({ seq: null }).where(orm.eq(schema.secretEvent.environmentId, envId))
     await getDb().insert(schema.secretEvent).values({
       environmentId: envId, name: 'WEBHOOK_URL', operation: 'set', valueEncrypted: planted.encrypted, iv: planted.iv, userId: admin.user.id, createdAt: Date.now() + 1000,
@@ -3231,7 +3388,7 @@ describe('protected writes and admin actions', () => {
     for (const [method, path, body] of writes(envId)) statuses.push((await call(token, path, method, body)).status)
     return statuses
   }
-  const values = async (envId: string) => Object.fromEntries(await Promise.all((await deriveSecrets(envId)).map(async (s) => [s.name, await decrypt(s.valueEncrypted, s.iv)] as const)))
+  const values = async (envId: string) => Object.fromEntries(await Promise.all((await deriveSecrets(envId)).map(async (s) => [s.name, await decrypt(s.valueEncrypted, s.iv, s)] as const)))
   // A second login of the admin, without grants from other tests
   const freshLogin = async () => {
     const auth = await getTestAuth()
@@ -3377,7 +3534,7 @@ describe('protected writes and admin actions', () => {
 
   test('every action that can need a passkey answers { stepUp } instead of failing', () => {
     const source = (import.meta.glob('./actions.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>)['./actions.ts']!
-    const gate = /\b(requireOrgAdmin|requireProtectedAccess|requireAdminApproval|requireMachineTokenApproval|requireMachineTokenDeletion|appendSecretEvents|recordSecretRead|readSecretValues|readEventValue|setEnvironmentProtection|resetMemberPasskeys|approveEnrollment|declineEnrollment|requirePasskeyOnceEnrolled)\(/
+    const gate = /\b(requireOrgAdmin|requireProtectedAccess|requireAdminApproval|requireMachineTokenApproval|requireMachineTokenDeletion|requireOldValuesPurge|appendSecretEvents|recordSecretRead|readSecretValues|readEventValue|setEnvironmentProtection|resetMemberPasskeys|approveEnrollment|declineEnrollment|requirePasskeyOnceEnrolled)\(/
     const functions = source.split(/\n(?=(?:export )?async function )/)
     const nameOf = (fn: string) => fn.match(/async function (\w+)/)?.[1] ?? ''
     const gatedHelpers = functions.filter((fn) => fn.startsWith('async function') && gate.test(fn)).map(nameOf)

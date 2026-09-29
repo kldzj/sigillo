@@ -337,9 +337,10 @@ export function generateBetterAuthSecret(): string {
 /**
  * Secrets to bind on this deploy. A new deployment gets its own
  * ENCRYPTION_KEY, separate from the BETTER_AUTH_SECRET that signs sessions:
- * SIGILLO_ENCRYPTION_KEY if set, a random key otherwise. Neither is ever
- * rotated, since a new key would make every stored secret unreadable, so a
- * deployment without an ENCRYPTION_KEY keeps deriving it from BETTER_AUTH_SECRET.
+ * SIGILLO_ENCRYPTION_KEY if set, a random key otherwise. A deploy never
+ * changes either, since a new key would make every stored secret unreadable:
+ * a deployment without an ENCRYPTION_KEY keeps deriving it from
+ * BETTER_AUTH_SECRET, and a new key comes only with --rotate-key (rotate.ts).
  * Returns {} for an existing worker (inherit everything via keep_bindings).
  */
 export function resolveDeploySecrets({ workerExists, saved, encryptionKeyEnv }: {

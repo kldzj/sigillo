@@ -6,8 +6,10 @@
 // so a deployment depends on nobody else's infrastructure.
 //
 // Idempotent: re-running updates both workers to the latest release, applies
-// only new D1 migrations, and never rotates BETTER_AUTH_SECRET or ENCRYPTION_KEY.
+// only new D1 migrations, and never rotates BETTER_AUTH_SECRET or the
+// encryption key. The encryption key changes only with --rotate-key.
 
+import { randomBytes } from 'node:crypto'
 import { goke, colors, isAgent } from 'goke'
 import * as clack from '@clack/prompts'
 import { z } from 'zod'
@@ -23,6 +25,7 @@ import {
   type WorkerSettings,
 } from './cloudflare.js'
 import { PASSPHRASE_ENV, passphraseProblem } from './state-file.js'
+import { baseKeyOf, countNotUnder, newKeyId, reencryptAll, type Query } from './rotate.js'
 import {
   appCompatibilityFlags,
   applyMigrations,
@@ -65,6 +68,7 @@ cli
   .option('--change-passphrase', 'Encrypt ~/.sigillo/selfhost.json with a new passphrase, then stop')
   // No schema: goke then gives "" for a bare flag instead of undefined, which would deploy
   .option('--reset-passkeys [email]', 'Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop')
+  .option('--rotate-key', 'Give the instance a new encryption key, re-encrypt every stored value with it and retire the old key, then stop')
   .option('--yes', 'Accept all defaults (non-interactive)')
   .example('npx @kldzj/sigillo self-host')
   .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
@@ -93,6 +97,10 @@ cli
         await resetPasskeys(options)
         return
       }
+      if (options.rotateKey) {
+        await rotateKey(options)
+        return
+      }
       if (options.changePassphrase) {
         if (!interactive()) throw new Error('--change-passphrase needs a terminal')
         changeStatePassphrase(await askNewPassphrase())
@@ -114,11 +122,7 @@ cli
 async function resetPasskeys(options: SelfHostOptions) {
   const email = options.resetPasskeys!.trim()
   if (!email) throw new Error('Pass the email of the user: --reset-passkeys you@acme.com')
-  const deployments = Object.values(readState().deployments ?? {})
-    .filter((d) => (!options.account || d.accountId === options.account) && (!options.name || d.workerName === options.name))
-  if (deployments.length === 0) throw new Error('No saved deployment matches: pass --name, or run self-host from the machine that deployed it')
-  if (deployments.length > 1) throw new Error('Several deployments are saved: pass --name')
-  const deployment = deployments[0]!
+  const { deployment } = savedDeployment(options)
   const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
   const database = { accountId: deployment.accountId, databaseId: deployment.databaseId }
   const [found] = await client.d1Query({
@@ -154,6 +158,68 @@ async function resetPasskeys(options: SelfHostOptions) {
   clack.outro(`Removed ${count} passkey${count === 1 ? '' : 's'} of ${email} and signed them out. They add new ones after signing in again.`)
 }
 
+// The one saved deployment the options point at, with its key in the state file
+function savedDeployment(options: SelfHostOptions): { key: string; deployment: DeploymentState } {
+  const deployments = Object.entries(readState().deployments ?? {})
+    .filter(([, d]) => (!options.account || d.accountId === options.account) && (!options.name || d.workerName === options.name))
+  if (deployments.length === 0) throw new Error('No saved deployment matches: pass --name, or run self-host from the machine that deployed it')
+  if (deployments.length > 1) throw new Error('Several deployments are saved: pass --name')
+  const [key, deployment] = deployments[0]!
+  return { key, deployment }
+}
+
+function saveDeployment(key: string, deployment: DeploymentState) {
+  const state = readState()
+  writeState({ ...state, deployments: { ...state.deployments, [key]: deployment } })
+}
+
+// A new encryption key. The Worker gets it first, as the current key of its
+// ring, so new values use it; then every stored value is re-encrypted here
+// (rotate.ts); and once none uses them, the older keys leave the Worker and
+// selfhost.json. Stopped halfway, the next run finishes the same rotation.
+async function rotateKey(options: SelfHostOptions) {
+  const { key, deployment } = savedDeployment(options)
+  const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
+  const worker = { accountId: deployment.accountId, scriptName: deployment.workerName }
+  const query: Query = async (sql, params) =>
+    (await client.d1Query({ accountId: deployment.accountId, databaseId: deployment.databaseId, sql, params }))[0]?.results ?? []
+  const baseKey = baseKeyOf(deployment)
+  let ring = deployment.encryptionKeys
+  const unfinished = ring ? await countNotUnder(query, ring.current) : 0
+  if (ring && unfinished > 0) {
+    clack.log.info(`The rotation to key ${ring.current} is unfinished: ${unfinished} value${unfinished === 1 ? '' : 's'} still use an older key. Finishing it.`)
+  } else {
+    if (interactive() && !options.yes) {
+      const sure = await clack.confirm({ message: `Give ${deployment.workerName} a new encryption key and re-encrypt every stored value with it?` })
+      if (clack.isCancel(sure) || !sure) process.exit(0)
+    }
+    const id = newKeyId(ring)
+    ring = { current: id, keys: { ...ring?.keys, [id]: randomBytes(32).toString('base64') } }
+    // Saved before the Worker has it: a key the Worker uses is never missing here
+    saveDeployment(key, { ...deployment, encryptionKeys: ring })
+    await client.putWorkerSecret({ ...worker, name: 'ENCRYPTION_KEYS', text: JSON.stringify(ring) })
+  }
+  const spinner = clack.spinner()
+  spinner.start('Re-encrypting stored values')
+  const progress = (done: number) => spinner.message(`Re-encrypting stored values: ${done}`)
+  let done = await reencryptAll({ query, ring, baseKey, onProgress: progress })
+  // A request the Worker was still serving with its old ring may have written
+  // under an older key: give those a minute, then catch them too
+  spinner.message('Waiting a minute for requests that began before the new key')
+  await new Promise((resolve) => setTimeout(resolve, 60_000))
+  done += await reencryptAll({ query, ring, baseKey, onProgress: progress })
+  spinner.stop(`Re-encrypted ${done} value${done === 1 ? '' : 's'} with key ${ring.current}`)
+  if (await countNotUnder(query, ring.current) > 0) {
+    throw new Error('Values under an older key appeared again, so the older keys stay: run --rotate-key again to finish')
+  }
+  // No value uses the older keys any more
+  const retired = { current: ring.current, keys: { [ring.current]: ring.keys[ring.current]! } }
+  await client.putWorkerSecret({ ...worker, name: 'ENCRYPTION_KEYS', text: JSON.stringify(retired) })
+  if (deployment.encryptionKey) await client.deleteWorkerSecret({ ...worker, name: 'ENCRYPTION_KEY' })
+  saveDeployment(key, { ...deployment, encryptionKeys: retired, encryptionKey: undefined })
+  clack.outro(`${deployment.workerName} encrypts with key ${ring.current}. The older keys are gone from the Worker and ~/.sigillo/selfhost.json.`)
+}
+
 async function askPassphrase(): Promise<string> {
   const passphrase = await clack.password({ message: 'Passphrase for ~/.sigillo/selfhost.json' })
   if (clack.isCancel(passphrase)) process.exit(0)
@@ -187,6 +253,7 @@ interface SelfHostOptions {
   allowedUsers?: string
   changePassphrase?: boolean
   resetPasskeys?: string
+  rotateKey?: boolean
   yes?: boolean
 }
 
@@ -322,6 +389,7 @@ async function selfHost(options: SelfHostOptions) {
     databaseId,
     betterAuthSecret: secrets.betterAuthSecret ?? saved?.betterAuthSecret,
     encryptionKey: secrets.encryptionKey ?? saved?.encryptionKey,
+    encryptionKeys: saved?.encryptionKeys,
     ...provider,
     // Recorded once both workers have the new list, so a failed run retries
     allowedUsers: saved?.allowedUsers,
@@ -356,6 +424,8 @@ async function selfHost(options: SelfHostOptions) {
       ? {
           BETTER_AUTH_SECRET: secrets.betterAuthSecret,
           ...(secrets.encryptionKey ? { ENCRYPTION_KEY: secrets.encryptionKey } : {}),
+          // A recreated Worker gets back the key ring of its last rotation
+          ...(saved?.encryptionKeys ? { ENCRYPTION_KEYS: JSON.stringify(saved.encryptionKeys) } : {}),
           ...(allowedUsers ? { ALLOWED_USERS: allowedUsers } : {}),
         }
       : undefined,

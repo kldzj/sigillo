@@ -32,7 +32,7 @@ Cloudflare hides a secret's value once it's set, in the dashboard and in Wrangle
 `npx @kldzj/sigillo self-host` saves everything it needs to update your instance in `~/.sigillo/selfhost.json` on the machine that ran it:
 
 - `BETTER_AUTH_SECRET`, which signs every session and the history
-- `ENCRYPTION_KEY`, which decrypts every secret
+- `ENCRYPTION_KEY`, or the key ring of a [rotation](./self-hosting.mdx#rotate-the-encryption-key), which decrypts every secret
 - the login provider's secret and your Google OAuth client
 - the Cloudflare login, if you signed in with the browser
 
@@ -115,10 +115,11 @@ What it can't catch: the signing key comes from `BETTER_AUTH_SECRET`, so someone
 1. On any project's **Access** tab, remove them. That removes them from the organization: every project at once, the API tokens and machine tokens they created there, and their open invitations. Auto-join doesn't add them back, and neither does an invite link made before; only a new invitation does.
 2. Take their address off the allowlist if it's listed, and remove them from your Google Workspace.
 3. Rotate the secrets they could read. They may have copies. In protected environments, the **Read Log** shows which values they read.
-4. If they could reach the Cloudflare account, or knew the passphrase of `selfhost.json`, remove their account membership, choose a new passphrase (`self-host --change-passphrase`), and rotate the secrets of every environment. A new passphrase doesn't lock them out of a copy of the file they already have, so the secrets have to change. `self-host` can't rotate `BETTER_AUTH_SECRET` or `ENCRYPTION_KEY` yet.
+4. If they could reach the Cloudflare account, or knew the passphrase of `selfhost.json`, remove their account membership, choose a new passphrase (`self-host --change-passphrase`), and rotate the secrets of every environment. A new passphrase doesn't lock them out of a copy of the file they already have, so the secrets have to change. Give the instance a new encryption key too (`self-host --rotate-key`), so a copy of the database taken later doesn't open with the key they know. `self-host` can't rotate `BETTER_AUTH_SECRET` yet.
 
 ## 8. Know what else keeps data
 
 - **Workers Logs.** Both workers have Cloudflare's Workers Logs on, and `self-host` turns them on again with every deploy. A request's log holds its method, URL and headers: the name of a secret fetched on its own, and the client's IP address. Cloudflare replaces credentials such as the `Authorization` header with `REDACTED`, as `wrangler tail` shows. Logs are kept for 3 days on the Free plan or 7 on Workers Paid, and anyone who can read logs on the account can see them.
+- **Old values.** The event log keeps every value a secret ever had, so an org admin can look up or restore an old one. On an environment's **Event Log** tab, **Purge old values** removes all of them but each secret's current one, with the admin's passkey. The rows stay with who changed what and when, and the history still verifies.
 - **`workers.dev`.** Both workers keep their `workers.dev` URLs, also with a custom domain (`--domain`): `self-host` uses them, and the login provider only has that one.
-- **Backups.** Cloudflare keeps a point-in-time history of each D1 database for 30 days on Workers Paid, 7 on Free. `wrangler d1 time-travel restore sigillo-db --timestamp=<unix time>` overwrites the database with that point and prints a bookmark that undoes it. Restored data is only readable with the keys in `selfhost.json`. If the last `sigillo audit verify` came after the point you restored, it then reports the history as shorter.
+- **Backups.** Cloudflare keeps a point-in-time history of each D1 database for 30 days on Workers Paid, 7 on Free. `wrangler d1 time-travel restore sigillo-db --timestamp=<unix time>` overwrites the database with that point and prints a bookmark that undoes it. Restored data is only readable with the keys in `selfhost.json`: a point from before a key rotation holds values under the old key, which the rotation removed. If the last `sigillo audit verify` came after the point you restored, it then reports the history as shorter.

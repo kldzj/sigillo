@@ -1,16 +1,27 @@
 // Event log table — shows the append-only secretEvent audit trail.
 // Env select filters events. Eye icon fetches and shows an old value (set
 // events only), which protected environments record in the read log.
-// Badges: green for "set", red for "delete".
+// Badges: green for "set", red for "delete", grey for "purge". Admins can
+// purge the old values, all but each secret's current one.
 
 "use client";
 
-import { ClockIcon, EyeIcon, EyeOffIcon } from "lucide-react";
+import { ClockIcon, EyeIcon, EyeOffIcon, EraserIcon } from "lucide-react";
 import { cn } from "sigillo-app/src/lib/utils";
 import { AdminOnlyEnvironment, EmptyState } from "sigillo-app/src/components/ui/empty-state";
-import { useState } from "react";
+import { useState, useTransition } from "react";
 import { router, useLoaderData } from "spiceflow/react";
-import { revealEventValueAction } from "../actions.ts";
+import { purgeOldValuesAction, revealEventValueAction } from "../actions.ts";
+import { Button } from "sigillo-app/src/components/ui/button";
+import {
+  Dialog,
+  DialogPopup,
+  DialogHeader,
+  DialogFooter,
+  DialogTitle,
+  DialogDescription,
+  DialogClose,
+} from "sigillo-app/src/components/ui/dialog";
 import { withStepUp } from "./step-up.ts";
 import { Badge } from "sigillo-app/src/components/ui/badge";
 import { Spinner } from "sigillo-app/src/components/ui/spinner";
@@ -42,6 +53,8 @@ export function EventLogTable() {
     selectedEnvId,
     locked,
     projectId,
+    isAdmin,
+    oldValues,
   } = useLoaderData('/dash/projects/:projectId/envs/:envSlug/event-log');
   const [visibleValues, setVisibleValues] = useState<Record<string, boolean>>({});
   const [values, setValues] = useState<Record<string, string | null>>({});
@@ -65,6 +78,14 @@ export function EventLogTable() {
     <>
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">{projectName}</h1>
+        <div className="flex items-center gap-2">
+        {isAdmin && oldValues > 0 && selectedEnvId && (
+          <PurgeOldValues
+            environmentId={selectedEnvId}
+            environmentName={environments.find((e) => e.id === selectedEnvId)?.name ?? "this environment"}
+            count={oldValues}
+          />
+        )}
         <Select
           defaultValue={selectedEnvId || ""}
           onValueChange={(val: string | null) => {
@@ -86,6 +107,7 @@ export function EventLogTable() {
             ))}
           </SelectPopup>
         </Select>
+        </div>
       </div>
 
       {locked ? (
@@ -130,6 +152,10 @@ export function EventLogTable() {
                         <Badge variant="default" size="sm" className="bg-emerald-600 text-white">
                           set
                         </Badge>
+                      ) : evt.operation === "purge" ? (
+                        <Badge variant="secondary" size="sm" title="An admin removed this secret's old values">
+                          purge
+                        </Badge>
                       ) : (
                         <Badge variant="destructive" size="sm">
                           delete
@@ -165,6 +191,8 @@ export function EventLogTable() {
                             )}
                           </button>
                         </div>
+                      ) : evt.purged ? (
+                        <span className="text-muted-foreground text-xs italic">purged</span>
                       ) : (
                         <span className="text-muted-foreground text-xs">—</span>
                       )}
@@ -191,5 +219,64 @@ export function EventLogTable() {
         </Frame>
       )}
     </>
+  );
+}
+
+// Removes the environment's old values for good, with the admin's passkey.
+// The history keeps who changed what and when.
+function PurgeOldValues({ environmentId, environmentName, count }: { environmentId: string; environmentName: string; count: number }) {
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+
+  function handlePurge() {
+    setError(null);
+    startTransition(async () => {
+      try {
+        const result = await withStepUp(() => purgeOldValuesAction({ environmentId }));
+        if (!result) return;
+        setOpen(false);
+        router.refresh();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Purging failed");
+      }
+    });
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => { setOpen(next); setError(null); }}>
+      <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+        <EraserIcon className="size-3.5" />
+        Purge old values
+      </Button>
+      <DialogPopup>
+        <DialogHeader>
+          <DialogTitle>Purge the old values of {environmentName}?</DialogTitle>
+          <DialogDescription>
+            This can't be undone.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="px-6 pb-4 text-sm text-muted-foreground flex flex-col gap-2">
+          <p>
+            <strong className="text-foreground">{count} old {count === 1 ? "value" : "values"}</strong> go
+            for good: every value but each secret's current one, including those of deleted secrets.
+            Current values stay.
+          </p>
+          <p>
+            The event log keeps who changed what and when, and the signed history still
+            verifies. It takes your passkey.
+          </p>
+          {error && <p className="text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" />}>
+            Cancel
+          </DialogClose>
+          <Button variant="destructive" onClick={handlePurge} disabled={isPending}>
+            {isPending ? "Purging..." : `Purge ${count} old ${count === 1 ? "value" : "values"}`}
+          </Button>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
   );
 }

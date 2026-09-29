@@ -236,6 +236,17 @@ export async function requireMachineTokenDeletion({ userId, sessionId, projectId
   await requireOrgAdmin({ userId, sessionId, orgId: project.orgId })
 }
 
+// Purging an environment's old values removes them for good: an org
+// admin's, approved with their passkey even where nothing is protected
+export async function requireOldValuesPurge({ userId, sessionId, environmentId }: { userId: string; sessionId: string; environmentId: string }) {
+  const [environment] = await getDb().select({ orgId: schema.project.orgId }).from(schema.environment)
+    .innerJoin(schema.project, orm.eq(schema.project.id, schema.environment.projectId))
+    .where(orm.eq(schema.environment.id, environmentId))
+  if (!environment) throw new Error('Environment not found')
+  await requireOrgAdmin({ userId, sessionId, orgId: environment.orgId })
+  if (!await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+}
+
 // ── Requests and approvals ──────────────────────────────────────────
 
 // Eight letters without vowels, so a code never spells a word, as XXXX-XXXX

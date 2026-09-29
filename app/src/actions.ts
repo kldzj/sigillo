@@ -32,10 +32,10 @@ import {
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
-import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, type NewSecretEvent } from './audit.ts'
+import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, purgeOldValues, type NewSecretEvent } from './audit.ts'
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
-  requireMachineTokenApproval, requireMachineTokenDeletion, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
+  requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, requireTokenDeletion, resetMemberPasskeys, type Purpose,
   requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, requirePasskeyOnceEnrolled,
 } from './step-up.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
@@ -169,6 +169,16 @@ export async function revealSecretsAction({ environmentId, names, download }: {
       environmentId, names, kind: download ? 'download' : 'value',
     }),
   }))
+}
+
+// An admin removes an environment's old values, all but each secret's
+// current one (audit.ts)
+export async function purgeOldValuesAction({ environmentId }: { environmentId: string }) {
+  const session = await requireSession()
+  return stepUpOr(async () => {
+    await requireOldValuesPurge({ ...session, environmentId })
+    return purgeOldValues({ environmentId, author: authorOf(session) })
+  })
 }
 
 export async function revealEventValueAction({ eventId }: { eventId: string }) {
@@ -320,7 +330,7 @@ async function saveSecrets({ edits: requested, environmentIds }: {
     if (edit.value !== undefined) return { ...edit, value: edit.value }
     const secret = current.find((s) => s.name === (edit.originalName ?? edit.name))
     if (!secret) throw new Error(`${edit.originalName ?? edit.name} no longer exists`)
-    return { ...edit, value: await decrypt(secret.valueEncrypted, secret.iv) }
+    return { ...edit, value: await decrypt(secret.valueEncrypted, secret.iv, secret) }
   }))
   if (kept.length && environmentIds.some((id) => id !== currentEnvId)) {
     await recordSecretRead({
@@ -630,7 +640,7 @@ async function syncMissingSecrets({
   const author = authorOf(session)
   await requireProtectedAccess({ environmentIds: [sourceEnvironmentId, targetEnvironmentId], reader: author })
   await recordSecretRead({ request: getActionRequest(), environment: source, author, kind: 'copy', names: toSync.map((s) => s.name) })
-  const values = await Promise.all(toSync.map((s) => decrypt(s.valueEncrypted, s.iv)))
+  const values = await Promise.all(toSync.map((s) => decrypt(s.valueEncrypted, s.iv, s)))
   await appendSecretEvents({
     author,
     events: toSync.map((s, i) => ({ environmentId: targetEnvironmentId, name: s.name, operation: 'set' as const, value: values[i]! })),

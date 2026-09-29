@@ -13,7 +13,8 @@
 // can hand them out and a verifier only needs SHA-256 and Ed25519. A set
 // event's preimage holds a keyed digest of its plaintext, not the ciphertext:
 // swapping in another row's ciphertext changes the digest, while
-// re-encrypting a value later does not.
+// re-encrypting a value later does not. A purged value keeps its digest in
+// value_digest, so its row still verifies once the value is gone.
 
 import { env } from 'cloudflare:workers'
 import * as orm from 'drizzle-orm'
@@ -100,11 +101,12 @@ async function valueDigest(environmentId: string, name: string, value: string): 
   return toBase64(new Uint8Array(mac))
 }
 
-// The digest of a stored set event, from its ciphertext as it is in D1
-async function storedValueDigest(row: { environmentId: string; name: string; valueEncrypted: string | null; iv: string | null }): Promise<string> {
-  if (!row.valueEncrypted || !row.iv) return 'no value'
+// The digest of a stored set event, from its ciphertext as it is in D1, or
+// the one kept when its value was purged
+async function storedValueDigest(row: { environmentId: string; name: string; valueEncrypted: string | null; iv: string | null; valueDigest: string | null }): Promise<string> {
+  if (!row.valueEncrypted || !row.iv) return row.valueDigest ?? 'no value'
   try {
-    return await valueDigest(row.environmentId, row.name, await decrypt(row.valueEncrypted, row.iv))
+    return await valueDigest(row.environmentId, row.name, await decrypt(row.valueEncrypted, row.iv, row))
   } catch {
     return 'undecryptable'
   }
@@ -207,18 +209,23 @@ export async function appendSecretEvents({ author, events }: { author: Reader; e
   const prepared = await Promise.all(events.map(async (event) => {
     const value = event.operation === 'set' ? event.value ?? '' : null
     return {
-      id: ulid(),
-      createdAt: Date.now(),
-      environmentId: event.environmentId,
-      name: event.name,
-      operation: event.operation,
-      actor: actorOf(author),
-      userId: author.userId,
-      apiTokenId: author.apiTokenId,
-      encrypted: value === null ? null : await encrypt(value),
+      ...newRow({ environmentId: event.environmentId, name: event.name, operation: event.operation, author }),
+      encrypted: value === null ? null : await encrypt(value, event),
       digest: value === null ? null : await valueDigest(event.environmentId, event.name, value),
     }
   }))
+  await appendPrepared(prepared)
+  return prepared.map((event) => ({ id: event.id, name: event.name }))
+}
+
+type PreparedEvent = ReturnType<typeof newRow> & { encrypted: { encrypted: string; iv: string } | null; digest: string | null }
+
+function newRow({ environmentId, name, operation, author }: { environmentId: string; name: string; operation: 'set' | 'delete' | 'purge'; author: Reader }) {
+  return { id: ulid(), createdAt: Date.now(), environmentId, name, operation, actor: actorOf(author), userId: author.userId, apiTokenId: author.apiTokenId }
+}
+
+// Chains and inserts the rows, with any other statements in the same batch
+async function appendPrepared(prepared: PreparedEvent[], alongside: BatchItem<'sqlite'>[] = []) {
   const db = getDb()
   await batchWithRetry(async () => {
     const queries: BatchItem<'sqlite'>[] = []
@@ -247,9 +254,43 @@ export async function appendSecretEvents({ author, events }: { author: Reader; e
         head = { seq, hash }
       }
     }
-    return queries
+    return [...queries, ...alongside]
   })
-  return prepared.map((event) => ({ id: event.id, name: event.name }))
+}
+
+// The rows holding an old value: every stored value but each secret's
+// current one. Once there is a chain, rows outside it don't count, as in the
+// replay.
+async function findOldValues(environmentId: string) {
+  const rows = await getDb().query.secretEvent.findMany({ where: { environmentId }, orderBy: { createdAt: 'asc' } })
+  const chained = rows.some((row) => row.seq !== null)
+  const current = new Set((await deriveSecrets(environmentId)).map((secret) => secret.id))
+  return rows.filter((row) => (!chained || row.seq !== null) && row.operation === 'set' && row.valueEncrypted && row.iv && !current.has(row.id))
+}
+
+export async function countOldValues(environmentId: string): Promise<number> {
+  return (await findOldValues(environmentId)).length
+}
+
+// Removes an environment's old values: every value but each secret's
+// current one. Their rows stay, with who and when, and keep the digest their
+// history row was signed with, so the chain still verifies. A purge row per
+// name records who removed them. The caller checks that it's an org admin's,
+// with their passkey (requireOldValuesPurge).
+export async function purgeOldValues({ environmentId, author }: { environmentId: string; author: Reader }): Promise<{ purged: number }> {
+  const db = getDb()
+  const old = await findOldValues(environmentId)
+  if (old.length === 0) return { purged: 0 }
+  const digests = await Promise.all(old.map((row) => storedValueDigest(row)))
+  // Their digest couldn't be kept, and their rows would never verify again
+  const unreadable = [...new Set(old.filter((_, i) => digests[i] === 'undecryptable').map((row) => row.name))]
+  if (unreadable.length) throw new Error(`Old values of ${unreadable.join(', ')} can't be decrypted, so nothing was purged`)
+  const prepared = [...new Set(old.map((row) => row.name))].map((name) => ({ ...newRow({ environmentId, name, operation: 'purge', author }), encrypted: null, digest: null }))
+  // Each value goes only if it is still the one read above
+  await appendPrepared(prepared, old.map((row, i) => db.update(schema.secretEvent)
+    .set({ valueEncrypted: null, iv: null, valueDigest: digests[i] })
+    .where(orm.and(orm.eq(schema.secretEvent.id, row.id), orm.eq(schema.secretEvent.valueEncrypted, row.valueEncrypted!)))))
+  return { purged: old.length }
 }
 
 export type SecretReadKind = (typeof schema.SECRET_READ_KINDS)[number]
@@ -343,7 +384,7 @@ export async function readSecretValues({ request, userId, sessionId, environment
   if (!env) throw new Error('Environment not found')
   const secrets = (await deriveSecrets(env.id)).filter((secret) => !names || names.includes(secret.name))
   await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null, sessionId }, kind, names: secrets.map((secret) => secret.name) })
-  return Object.fromEntries(await Promise.all(secrets.map(async (secret) => [secret.name, await decrypt(secret.valueEncrypted, secret.iv)] as const)))
+  return Object.fromEntries(await Promise.all(secrets.map(async (secret) => [secret.name, await decrypt(secret.valueEncrypted, secret.iv, secret)] as const)))
 }
 
 // An old value from the event log
@@ -359,7 +400,7 @@ export async function readEventValue({ request, userId, sessionId, eventId }: {
   if (!env) throw new Error('Environment not found')
   if (!event.valueEncrypted || !event.iv) return null
   await recordSecretRead({ request, environment: env, author: { userId, apiTokenId: null, sessionId }, kind: 'event-log', names: [event.name] })
-  return decrypt(event.valueEncrypted, event.iv)
+  return decrypt(event.valueEncrypted, event.iv, event)
 }
 
 // ── Verifying ───────────────────────────────────────────────────────
