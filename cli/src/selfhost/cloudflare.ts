@@ -78,6 +78,8 @@ export interface DeploymentState {
   encryptionKey?: string
   /** The Worker's ENCRYPTION_KEYS after a rotation (rotate.ts): the key ids, their keys, and the current one */
   encryptionKeys?: { current: string; keys: Record<string, string> }
+  /** The age identity backups are encrypted to (backup.ts), made with the first backup */
+  backupIdentity?: string
   /** the deployment's own login provider (unset when it uses another one) */
   providerWorkerName?: string
   providerDatabaseId?: string
@@ -289,6 +291,48 @@ export class CfClient {
       path: `/accounts/${accountId}/d1/database`,
       body: { name },
     })
+  }
+
+  /** One step of a database export: started, then polled at its bookmark. Once complete, the SQL is at result.signed_url. */
+  d1ExportStep({ accountId, databaseId, dumpOptions, bookmark }: {
+    accountId: string
+    databaseId: string
+    dumpOptions: { no_data?: boolean; no_schema?: boolean; tables?: string[] }
+    bookmark?: string
+  }) {
+    return this.fetch<{
+      status: 'active' | 'complete' | 'error'
+      at_bookmark?: string
+      error?: string
+      messages?: string[]
+      result?: { signed_url: string; filename: string }
+    }>({
+      method: 'POST',
+      path: `/accounts/${accountId}/d1/database/${databaseId}/export`,
+      body: { output_format: 'polling', dump_options: dumpOptions, ...(bookmark ? { current_bookmark: bookmark } : {}) },
+    })
+  }
+
+  /** One step of importing a SQL file: init (answers with an upload URL), ingest, then poll */
+  d1ImportStep({ accountId, databaseId, body }: {
+    accountId: string
+    databaseId: string
+    body: { action: 'init'; etag: string } | { action: 'ingest'; etag: string; filename: string } | { action: 'poll'; current_bookmark: string }
+  }) {
+    return this.fetch<{
+      upload_url?: string
+      filename?: string
+      success?: boolean
+      status?: 'active' | 'complete' | 'error'
+      at_bookmark?: string
+      error?: string
+      errors?: string[]
+      messages?: string[]
+    }>({ method: 'POST', path: `/accounts/${accountId}/d1/database/${databaseId}/import`, body })
+  }
+
+  deleteD1(accountId: string, databaseId: string) {
+    return this.fetch<unknown>({ method: 'DELETE', path: `/accounts/${accountId}/d1/database/${databaseId}` })
   }
 
   d1Query({ accountId, databaseId, sql, params = [] }: {

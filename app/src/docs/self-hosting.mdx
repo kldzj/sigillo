@@ -104,6 +104,28 @@ It saves a new key in `~/.sigillo/selfhost.json` and makes it the worker's curre
 
 The worker keeps its keys in the `ENCRYPTION_KEYS` secret. Every value names the key it was encrypted with, and is bound to its environment and name, so a copy elsewhere in the database doesn't decrypt. `BETTER_AUTH_SECRET` can't be rotated this way, since it signs sessions and the history.
 
+Backups made before a rotation can't be restored after it, since they need the old key: [make a new one](#back-up-and-restore) right after.
+
+## Back up and restore
+
+Cloudflare keeps 30 days of each database (7 on the Free plan) for [time travel](./hardening.mdx#8-know-what-else-keeps-data). For a copy of your own, outside Cloudflare:
+
+```bash
+npx @kldzj/sigillo self-host --backup
+```
+
+It exports both databases, the app's and the login provider's, into one file, `sigillo-<time>.backup.age` in the current directory, or the file you name (`--backup /backups/sigillo.backup.age`). The file is encrypted with [age](https://age-encryption.org) to a backup key that the first backup adds to `~/.sigillo/selfhost.json`. The values in it stay encrypted with the instance's keys, which aren't in the file, so restoring it needs `selfhost.json` too. Sessions, sign-in codes, passkey approvals and rate limits are left out.
+
+To go back to a backup:
+
+```bash
+npx @kldzj/sigillo self-host --restore sigillo-2026-09-29T10-04-05Z.backup.age
+```
+
+It imports the backup into two new databases and checks their history like `sigillo audit verify`: every row's hash and signature. Only then does it update both workers to use the new databases. Everything changed since the backup is gone and everyone signs in again, while API tokens keep working. An `audit verify` that saw newer rows reports the history as shorter. If a step fails, the instance keeps its databases and the new ones are deleted again. After a restore the old databases stay on the account, for you to delete once you're happy.
+
+A restore goes to the deployment the backup came from, on the same account. A backup from a newer Sigillo needs that version's CLI. [Rotating the key](#rotate-the-encryption-key) also replaces the backup key, so older backups can't be opened any more.
+
 ## Limit who can sign in
 
 By default, anyone who can sign in with Google gets an account. To let in only certain people, pass a comma-separated list of email addresses and domains:
@@ -134,6 +156,8 @@ Updates keep the list saved in `~/.sigillo/selfhost.json`. Pass `--allowed-users
 | `--change-passphrase` | Encrypt `~/.sigillo/selfhost.json` with a new passphrase, then stop |
 | `--reset-passkeys <email>` | Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop. See [Hardening](./hardening.mdx#5-require-a-passkey-for-production) |
 | `--rotate-key` | Give the instance a new encryption key, re-encrypt every stored value with it and retire the old key, then stop. See [above](#rotate-the-encryption-key) |
+| `--backup [file]` | Save an encrypted backup of both databases, then stop. See [above](#back-up-and-restore) |
+| `--restore <file>` | Restore both databases from a backup into new ones, check their history and switch the workers to them |
 | `--yes` | Accept all defaults, non-interactive |
 
 Non-interactive example for **CI or agents**:

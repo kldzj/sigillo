@@ -10,6 +10,7 @@
 // encryption key. The encryption key changes only with --rotate-key.
 
 import { randomBytes } from 'node:crypto'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { goke, colors, isAgent } from 'goke'
 import * as clack from '@clack/prompts'
 import { z } from 'zod'
@@ -26,6 +27,8 @@ import {
 } from './cloudflare.js'
 import { PASSPHRASE_ENV, passphraseProblem } from './state-file.js'
 import { baseKeyOf, countNotUnder, newKeyId, reencryptAll, type Query } from './rotate.js'
+import { LEFT_OUT, backupFileName, dumpDatabase, keyFingerprint, keyIdsInUse, loadDatabase, newBackupIdentity, openBackup, queryOf, sealBackup, type Backup, type DatabaseDump } from './backup.js'
+import { verifyHistory } from './history.js'
 import {
   appCompatibilityFlags,
   applyMigrations,
@@ -69,6 +72,8 @@ cli
   // No schema: goke then gives "" for a bare flag instead of undefined, which would deploy
   .option('--reset-passkeys [email]', 'Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop')
   .option('--rotate-key', 'Give the instance a new encryption key, re-encrypt every stored value with it and retire the old key, then stop')
+  .option('--backup [file]', 'Save an encrypted backup of both databases to this file (default: <name>-<time>.backup.age), then stop')
+  .option('--restore [file]', 'Restore both databases from this backup into fresh ones, check their history, and switch the workers to them')
   .option('--yes', 'Accept all defaults (non-interactive)')
   .example('npx @kldzj/sigillo self-host')
   .example('npx @kldzj/sigillo self-host --name sigillo --domain secrets.acme.com')
@@ -99,6 +104,14 @@ cli
       }
       if (options.rotateKey) {
         await rotateKey(options)
+        return
+      }
+      if (options.backup !== undefined) {
+        await backupDeployment(options)
+        return
+      }
+      if (options.restore !== undefined) {
+        await restoreDeployment(options)
         return
       }
       if (options.changePassphrase) {
@@ -216,8 +229,107 @@ async function rotateKey(options: SelfHostOptions) {
   const retired = { current: ring.current, keys: { [ring.current]: ring.keys[ring.current]! } }
   await client.putWorkerSecret({ ...worker, name: 'ENCRYPTION_KEYS', text: JSON.stringify(retired) })
   if (deployment.encryptionKey) await client.deleteWorkerSecret({ ...worker, name: 'ENCRYPTION_KEY' })
-  saveDeployment(key, { ...deployment, encryptionKeys: retired, encryptionKey: undefined })
+  // Older backups need the retired keys, so their backup key goes too: the next backup makes a new one
+  saveDeployment(key, { ...deployment, encryptionKeys: retired, encryptionKey: undefined, backupIdentity: undefined })
   clack.outro(`${deployment.workerName} encrypts with key ${ring.current}. The older keys are gone from the Worker and ~/.sigillo/selfhost.json.`)
+  if (deployment.backupIdentity) clack.log.warn("Backups made before this rotation can't be restored any more: make a new one now (--backup).")
+}
+
+// Both databases as Cloudflare exports them, without the tables of live
+// logins, in one file encrypted to the deployment's backup key (backup.ts)
+async function backupDeployment(options: SelfHostOptions) {
+  const { key, deployment } = savedDeployment(options)
+  const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
+  let identity = deployment.backupIdentity
+  if (!identity) {
+    identity = await newBackupIdentity()
+    saveDeployment(key, { ...deployment, backupIdentity: identity })
+  }
+  const at = new Date()
+  const file = options.backup || backupFileName(deployment.workerName, at)
+  if (existsSync(file)) throw new Error(`${file} already exists`)
+  const app = { client, accountId: deployment.accountId, databaseId: deployment.databaseId }
+  const keys = { ring: deployment.encryptionKeys, baseKey: baseKeyOf(deployment) }
+  const spinner = clack.spinner()
+  spinner.start('Exporting the app database')
+  const backup: Backup = {
+    format: 'sigillo-backup',
+    version: 1,
+    createdAt: at.toISOString(),
+    workerName: deployment.workerName,
+    sigilloVersion: deployment.deployedVersion ?? null,
+    keys: Object.fromEntries((await keyIdsInUse(app)).map((id) => {
+      const fingerprint = keyFingerprint(id, keys)
+      if (!fingerprint) throw new Error(`Some values are encrypted with the key ${id}, which ~/.sigillo/selfhost.json doesn't have, so a backup couldn't be restored`)
+      return [id, fingerprint]
+    })),
+    databases: { app: await dumpDatabase(app, LEFT_OUT.app), provider: null },
+  }
+  if (deployment.providerDatabaseId) {
+    spinner.message('Exporting the login provider database')
+    backup.databases.provider = await dumpDatabase({ ...app, databaseId: deployment.providerDatabaseId }, LEFT_OUT.provider)
+  }
+  writeFileSync(file, await sealBackup(backup, identity), { mode: 0o600, flag: 'wx' })
+  spinner.stop(`Saved ${file}`)
+  clack.outro('It opens with the backup key in ~/.sigillo/selfhost.json, and restores with the keys there: keep that file with your backups.')
+}
+
+// Into fresh databases, whose history is checked before both workers switch
+// to them. The databases from before stay, for the operator to delete.
+async function restoreDeployment(options: SelfHostOptions) {
+  if (!options.restore) throw new Error('Pass the backup file: --restore sigillo-<time>.backup.age')
+  const { key, deployment } = savedDeployment(options)
+  if (!deployment.backupIdentity) throw new Error('~/.sigillo/selfhost.json has no backup key for this deployment, so it has no backups to restore')
+  if (!deployment.betterAuthSecret) throw new Error("~/.sigillo/selfhost.json has no BETTER_AUTH_SECRET for this deployment, so the backup's history can't be checked")
+  const backup = await openBackup(new Uint8Array(readFileSync(options.restore)), deployment.backupIdentity)
+  if (backup.workerName !== deployment.workerName) throw new Error(`This is a backup of ${backup.workerName}, not ${deployment.workerName}`)
+  const target = readExpectedBundle()?.version ?? deployment.deployedVersion
+  if (target && backup.sigilloVersion && isOlderVersion(target, backup.sigilloVersion)) {
+    throw new Error(`This backup is from Sigillo ${backup.sigilloVersion}, newer than the ${target} this CLI deploys: restore it with npx @kldzj/sigillo@${backup.sigilloVersion} self-host`)
+  }
+  const ring = deployment.encryptionKeys
+  const baseKey = baseKeyOf(deployment)
+  const retired = Object.entries(backup.keys).filter(([id, fingerprint]) => keyFingerprint(id, { ring, baseKey }) !== fingerprint).map(([id]) => `key ${id}`)
+  if (retired.length) throw new Error(`This backup's values are encrypted with ${retired.join(', ')}, which a key rotation has since retired from ~/.sigillo/selfhost.json`)
+  if (interactive() && !options.yes) {
+    const sure = await clack.confirm({ message: `Restore ${deployment.workerName} to its backup of ${backup.createdAt}? Changes since are lost and everyone signs in again.` })
+    if (clack.isCancel(sure) || !sure) process.exit(0)
+  }
+  const client = await resolveCloudflareAuth({ apiToken: options.apiToken })
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z').toLowerCase()
+  const spinner = clack.spinner()
+  // The databases this run makes, deleted again if the restore stops
+  const created: string[] = []
+  const restoreInto = async (name: string, dump: DatabaseDump) => {
+    const databaseId = (await client.createD1(deployment.accountId, name)).uuid
+    created.push(databaseId)
+    await loadDatabase({ client, accountId: deployment.accountId, databaseId }, dump)
+    return databaseId
+  }
+  let check: Awaited<ReturnType<typeof verifyHistory>>
+  let appDatabaseId: string
+  let providerDatabaseId = deployment.providerDatabaseId
+  try {
+    spinner.start('Importing the app database')
+    appDatabaseId = await restoreInto(`${deployment.workerName}-db-${stamp}`, backup.databases.app)
+    if (backup.databases.provider && deployment.providerWorkerName) {
+      spinner.message('Importing the login provider database')
+      providerDatabaseId = await restoreInto(`${deployment.providerWorkerName}-db-${stamp}`, backup.databases.provider)
+    }
+    spinner.message('Checking the restored history')
+    const app = { client, accountId: deployment.accountId, databaseId: appDatabaseId }
+    check = await verifyHistory({ query: queryOf(app), betterAuthSecret: deployment.betterAuthSecret, ring, baseKey })
+    if (check.problems.length > 0) throw new Error(`The restored history does not verify:\n${check.problems.join('\n')}`)
+  } catch (error) {
+    spinner.stop('Restore stopped')
+    for (const databaseId of created) await client.deleteD1(deployment.accountId, databaseId).catch(() => undefined)
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\nThe instance keeps its databases, and the restored copies are deleted again.`)
+  }
+  spinner.stop(`Restored ${check.environments} environments, their history intact (${check.rows} rows${check.outside ? `, ${check.outside} added around it and ignored` : ''})`)
+  saveDeployment(key, { ...deployment, databaseId: appDatabaseId, providerDatabaseId })
+  // An update of both workers, bound to the restored databases
+  await selfHost(options)
+  clack.log.info(`The databases from before the restore stay (${deployment.databaseId}${deployment.providerDatabaseId ? `, ${deployment.providerDatabaseId}` : ''}): delete them once you're happy with it.`)
 }
 
 async function askPassphrase(): Promise<string> {
@@ -254,6 +366,8 @@ interface SelfHostOptions {
   changePassphrase?: boolean
   resetPasskeys?: string
   rotateKey?: boolean
+  backup?: string
+  restore?: string
   yes?: boolean
 }
 

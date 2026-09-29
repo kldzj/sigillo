@@ -590,6 +590,8 @@ npx @kldzj/sigillo self-host
 
 It logs into Cloudflare (reusing your `wrangler login` when present, or an OAuth browser flow, or a pre-filled API token link that works over SSH), deploys both Workers with their D1 databases, applies migrations, and prints your instance URL. A new deployment needs a **Google OAuth client** for its login provider: the command prints the redirect URI to register at [Google Cloud credentials](https://console.cloud.google.com/apis/credentials) and asks for the client ID and secret. It also asks who may sign in (`--allowed-users`), and for a passphrase that encrypts `~/.sigillo/selfhost.json`, the file with your deployment's keys. **Re-run the same command anytime to update** — only new migrations are applied and no secret is ever rotated.
 
+`self-host --backup` saves both databases in a file encrypted with [age](https://age-encryption.org), and `self-host --restore <file>` brings them back into new databases once their history verifies.
+
 See [Self-hosting](https://sigillo.kldzj.dev/docs/self-hosting) for every option and [Hardening](https://sigillo.kldzj.dev/docs/hardening) for securing your instance.
 
 ```bash

@@ -18,6 +18,8 @@ import {
 } from '../src/selfhost/deploy.js'
 import { deriveStateKey, isSealed, openState, sealState, unlockStateFile } from '../src/selfhost/state-file.js'
 import { baseKeyOf, countNotUnder, newKeyId, openValue, reencryptAll, sealValue, type KeyRing, type Query } from '../src/selfhost/rotate.js'
+import { verifyHistory } from '../src/selfhost/history.js'
+import { backupFileName, dumpDatabase, keyFingerprint, loadDatabase, newBackupIdentity, openBackup, sealBackup, splitStatements, type Backup } from '../src/selfhost/backup.js'
 import { DatabaseSync } from 'node:sqlite'
 
 describe('parseWranglerToml', () => {
@@ -699,6 +701,174 @@ describe('rotating the encryption key', () => {
       failed: `BAD can't be decrypted (row b of environment ${vector.slot.environmentId}): the rotation stopped there`,
       left: 1,
       again: 1,
+    })
+  })
+})
+
+describe('checking a restored history', () => {
+  // A real chain, written by the Worker in the app's test suite with its
+  // BETTER_AUTH_SECRET: a row from before the chain, a purged value, a
+  // delete, two purge rows and a read of a protected environment
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/history.json', import.meta.url), 'utf8'))
+  const secret = 'test-secret-at-least-32-characters-long!!'
+  const load = () => {
+    const db = new DatabaseSync(':memory:')
+    db.exec(`CREATE TABLE environment (id text PRIMARY KEY);
+      CREATE TABLE secret_event (id text PRIMARY KEY, environment_id text, name text, operation text, value_encrypted text, iv text, value_digest text,
+        user_id text, api_token_id text, created_at integer, actor text, seq integer, hash text, signature text, adopted integer);
+      CREATE TABLE secret_read (id text PRIMARY KEY, environment_id text, actor text, kind text, names text, ip_address text, created_at integer, seq integer, hash text, signature text)`)
+    db.prepare('INSERT INTO environment VALUES (?)').run(fixture.environmentId)
+    for (const e of fixture.events) {
+      db.prepare('INSERT INTO secret_event VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(e.id, e.environmentId, e.name, e.operation, e.valueEncrypted, e.iv, e.valueDigest,
+        e.userId, e.apiTokenId, e.createdAt, e.actor, e.seq, e.hash, e.signature, e.adopted ? 1 : 0)
+    }
+    for (const r of fixture.reads) {
+      db.prepare('INSERT INTO secret_read VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(r.id, r.environmentId, r.actor, r.kind, JSON.stringify(r.names), r.ipAddress, r.createdAt, r.seq, r.hash, r.signature)
+    }
+    const query: Query = async (sql, params = []) => db.prepare(sql).all(...params) as Array<Record<string, unknown>>
+    return { db, check: () => verifyHistory({ query, betterAuthSecret: secret, ring: undefined, baseKey: baseKeyOf({ betterAuthSecret: secret }) }) }
+  }
+  const env = fixture.environmentId
+
+  test('accepts the Worker\'s own rows', async () => {
+    expect(await load().check()).toEqual({ environments: 1, rows: 8, outside: 0, problems: [] })
+  })
+
+  test('finds an edited row, a changed purged digest, a copied signature and an edited read', async () => {
+    const renamed = load()
+    renamed.db.prepare("UPDATE secret_event SET name = 'Y' WHERE seq = 3").run()
+    const digest = load()
+    digest.db.prepare("UPDATE secret_event SET value_digest = 'AAAA' WHERE seq = 2").run()
+    const signature = load()
+    signature.db.prepare('UPDATE secret_event SET signature = (SELECT signature FROM secret_event WHERE seq = 1) WHERE seq = 5').run()
+    const read = load()
+    read.db.prepare(`UPDATE secret_read SET names = '["X","Z"]'`).run()
+    const wrongSecret = load()
+    expect({
+      renamed: (await renamed.check()).problems,
+      digest: (await digest.check()).problems,
+      signature: (await signature.check()).problems,
+      read: (await read.check()).problems,
+      wrongSecret: (await verifyHistory({ query: async (sql, params = []) => wrongSecret.db.prepare(sql).all(...params) as Array<Record<string, unknown>>, betterAuthSecret: 'another-secret-of-another-deployment', ring: undefined, baseKey: baseKeyOf({ betterAuthSecret: secret }) })).problems,
+    }).toEqual({
+      renamed: [`environment ${env}, changes row 3 does not match its hash`],
+      digest: [`environment ${env}, changes row 2 does not match its hash`],
+      signature: [`environment ${env}, changes row 5 has an invalid signature`],
+      read: [`environment ${env}, reads row 1 does not match its hash`],
+      wrongSecret: [`environment ${env}, changes row 1 does not match its hash`, `environment ${env}, reads row 1 has an invalid signature`],
+    })
+  })
+
+  test('counts a row added around the chain, which the Worker ignores', async () => {
+    const planted = load()
+    planted.db.prepare(`INSERT INTO secret_event (id, environment_id, name, operation, created_at) VALUES ('planted', '${env}', 'X', 'delete', 1)`).run()
+    expect(await planted.check()).toEqual({ environments: 1, rows: 8, outside: 1, problems: [] })
+  })
+})
+
+describe('backups', () => {
+  const backup: Backup = {
+    format: 'sigillo-backup',
+    version: 1,
+    createdAt: '2026-09-29T10:00:00.000Z',
+    workerName: 'sigillo',
+    sigilloVersion: '0.16.0',
+    keys: { '0': '0123456789abcdef' },
+    databases: { app: { schema: 'CREATE TABLE t (id text);', data: "INSERT INTO t VALUES ('a');", tables: ['t'], migrations: ['0001_init.sql'] }, provider: null },
+  }
+
+  test('open only with their own key, as standard age files', async () => {
+    const identity = await newBackupIdentity()
+    const sealed = await sealBackup(backup, identity)
+    expect({
+      age: Buffer.from(sealed.slice(0, 21)).toString('utf8'),
+      opened: await openBackup(sealed, identity),
+      other: await openBackup(sealed, await newBackupIdentity()).catch((error: Error) => error.message),
+      name: backupFileName('sigillo', new Date('2026-09-29T10:04:05.678Z')),
+    }).toEqual({
+      age: 'age-encryption.org/v1',
+      opened: backup,
+      other: "This backup doesn't open with the backup key in ~/.sigillo/selfhost.json: it was made for another deployment, or isn't a Sigillo backup",
+      name: 'sigillo-2026-09-29T10-04-05Z.backup.age',
+    })
+  })
+
+  test('name the keys their values need, so a restore after a rotation stops before it starts', () => {
+    const before = { ring: undefined, baseKey: baseKeyOf({ encryptionKey: Buffer.alloc(32, 1).toString('base64'), betterAuthSecret: 'secret' }) }
+    // The rotation re-encrypted every value and deleted ENCRYPTION_KEY, so key 0 is derived now
+    const after = { ring: { current: 'abc123', keys: { abc123: Buffer.alloc(32, 2).toString('base64') } }, baseKey: baseKeyOf({ betterAuthSecret: 'secret' }) }
+    expect({
+      zeroKept: keyFingerprint('0', before) === keyFingerprint('0', after),
+      current: keyFingerprint('abc123', after),
+      unknown: keyFingerprint('abc123', before),
+    }).toEqual({ zeroKept: false, current: expect.stringMatching(/^[0-9a-f]{16}$/), unknown: undefined })
+  })
+
+  test('split SQL at semicolons outside quotes', () => {
+    const sql = `PRAGMA defer_foreign_keys=TRUE;\nINSERT INTO "user" VALUES('a;b','it''s\nmultiline');\nINSERT INTO "a""b" VALUES(1);`
+    expect(splitStatements(sql)).toEqual([
+      'PRAGMA defer_foreign_keys=TRUE;',
+      `INSERT INTO "user" VALUES('a;b','it''s\nmultiline');`,
+      'INSERT INTO "a""b" VALUES(1);',
+    ])
+  })
+
+  // What the Cloudflare API answers, step by step, and what the CLI sent
+  const fakeCloudflare = () => {
+    const calls: string[] = []
+    const client = {
+      async d1Query({ sql }: { sql: string }) {
+        calls.push(`query ${sql.slice(0, 30)}`)
+        if (sql.includes('sqlite_master WHERE')) return [{ results: [{ name: 'd1_migrations' }, { name: 'org' }, { name: 'org_member' }, { name: 'session' }] }]
+        if (sql.includes("pragma_foreign_key_list('org_member')")) return [{ results: [{ ref: 'org' }] }]
+        if (sql.includes('d1_migrations')) return [{ results: [{ name: '0001_init.sql' }] }]
+        return [{ results: [] }]
+      },
+      async d1ExportStep({ dumpOptions, bookmark }: { dumpOptions: object; bookmark?: string }) {
+        calls.push(`export ${JSON.stringify(dumpOptions)} ${bookmark ?? 'start'}`)
+        return bookmark ? { status: 'complete', result: { signed_url: `https://export.example/${JSON.stringify(dumpOptions)}`, filename: 'x.sql' } } : { status: 'active', at_bookmark: 'b1' }
+      },
+      async d1ImportStep({ body }: { body: { action: string } }) {
+        calls.push(`import ${body.action}`)
+        if (body.action === 'init') return { upload_url: 'https://upload.example/x', filename: 'x.sql' }
+        if (body.action === 'ingest') return { success: true, status: 'active', at_bookmark: 'b2' }
+        return { success: true, status: 'complete' }
+      },
+    } as unknown as CfClient
+    return { calls, client }
+  }
+
+  test('export both halves of a database and import them in one step', async () => {
+    const { calls, client } = fakeCloudflare()
+    let uploaded = ''
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input)
+      // As D1 exports them: a member before the organization it points at
+      if (url.startsWith('https://export.example/')) return new Response(url.includes('no_data') ? 'CREATE TABLE org (id text);' : 'INSERT INTO "org_member" VALUES(\'m\',\'o\');\nINSERT INTO "org" VALUES(\'o\');')
+      uploaded = String(init?.body)
+      return new Response('', { status: 200, headers: { etag: `"${createHash('md5').update(uploaded).digest('hex')}"` } })
+    })
+    const database = { client, accountId: 'acc', databaseId: 'db' }
+    const dump = await dumpDatabase(database, ['session'])
+    await loadDatabase(database, dump)
+    vi.restoreAllMocks()
+    expect({ dump, uploaded, calls }).toEqual({
+      dump: { schema: 'CREATE TABLE org (id text);', data: 'INSERT INTO "org" VALUES(\'o\');\nINSERT INTO "org_member" VALUES(\'m\',\'o\');', tables: ['d1_migrations', 'org', 'org_member'], migrations: ['0001_init.sql'] },
+      uploaded: 'PRAGMA defer_foreign_keys = true;\nCREATE TABLE org (id text);\nINSERT INTO "org" VALUES(\'o\');\nINSERT INTO "org_member" VALUES(\'m\',\'o\');',
+      calls: [
+        'query SELECT name FROM sqlite_master',
+        'query SELECT name FROM d1_migrations',
+        'query SELECT "table" AS ref FROM pra',
+        'query SELECT "table" AS ref FROM pra',
+        'query SELECT "table" AS ref FROM pra',
+        'export {"no_data":true} start',
+        'export {"no_data":true} b1',
+        'export {"no_schema":true,"tables":["d1_migrations","org","org_member"]} start',
+        'export {"no_schema":true,"tables":["d1_migrations","org","org_member"]} b1',
+        'import init',
+        'import ingest',
+        'import poll',
+      ],
     })
   })
 })

@@ -81,12 +81,23 @@ Rules:
 - **Only `appendSecretEvents()` writes `secret_event`.** A row inserted any other way has no `seq`, so once the environment has a chain the replay ignores it and verify reports it. Tests that need old-style rows insert them before the environment's first chained write; those join the chain in order.
 - **Only a row's value may ever change, and only two ways:** `self-host --rotate-key` re-encrypts it (`value_encrypted`, `iv`), and `purgeOldValues()` removes an old one and keeps its digest in `value_digest`, next to a `purge` row in the chain. Both keep the chain valid because a set event's preimage holds the plaintext's digest. The replay skips `purge` rows.
 - **Never change a preimage's fields or their order.** Rows are verified by rebuilding their preimage, so any change breaks every existing row. A new field needs a new preimage version.
-- A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it. Values have no AAD, so a ciphertext copied into another environment still decrypts there; only a chained row's digest catches it.
+- A set event's preimage holds an HMAC of `[environment id, name, plaintext]`, not the ciphertext, so re-encrypting a value keeps the chain valid while swapping in another row's ciphertext breaks it. Values from before v2 have no AAD, so such a ciphertext copied into another environment still decrypts there; only a chained row's digest catches it.
+- `cli/src/selfhost/history.ts` rebuilds the same preimages to check a restored database. A new preimage version goes there too.
 - Rows from before the chain are adopted on their environment's next write (and on the audit GET) with `adopted` set and the preimage kind `adopted` instead of `event`. Adopting a chain's rows a second time, after someone cleared their `seq` in D1, changes every hash, so a saved witness no longer matches. Never adopt with the `event` kind.
 - The chains prove what `audit verify` has already seen. A D1 writer can still grant themselves access, read through the Worker, and delete the newest rows before the next check; the docs say so.
 - Every route that returns secret values calls `recordSecretRead()` **before** the values leave, and must let it throw: a read that can't be recorded fails.
 - Pages send secret names, never values. The web UI fetches a value when someone reveals, downloads or copies it, through `readSecretValues()` / `readEventValue()`, so the read log shows who looked at which value, not who opened a page.
 - Changing `BETTER_AUTH_SECRET` changes the signing key. Old rows then no longer verify, and `sigillo audit verify` reports the new key.
+
+## Backups (fork)
+
+`self-host --backup` exports both D1 databases through Cloudflare's export API and saves them gzipped and age-encrypted to `backupIdentity` in `selfhost.json` (`cli/src/selfhost/backup.ts`). `--restore` imports into new databases, checks the history (`history.ts`), then saves their ids and redeploys both workers. It never deletes the old databases.
+
+Rules:
+- **No key goes into a backup.** It names the keys its values need by id and fingerprint, and a restore refuses when `selfhost.json` no longer has one. `--rotate-key` drops `backupIdentity`, since older backups are unrestorable after it anyway.
+- `LEFT_OUT` lists the tables of live logins that a backup skips. A new table with a foreign key to one of them has to be left out too, or the import fails.
+- D1's export writes tables in its own order, not by foreign keys, and an import checks each row. `orderByReferences()` regroups the rows by `pragma_foreign_key_list`, queried one table at a time: joined to `sqlite_master`, D1 answers `SQLITE_AUTH`.
+- A failed restore deletes the databases it made, so nothing half-imported stays behind.
 
 ## Auth flow
 
