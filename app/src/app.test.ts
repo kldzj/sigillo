@@ -2994,7 +2994,32 @@ describe('tamper-evident history', () => {
       { kind: 'download', names: ['X', 'Y'], actor: `token:${tokenId}`, ipAddress: '203.0.113.9' },
       { kind: 'list', names: ['X', 'Y'], actor: `user:${admin.user.id}`, ipAddress: null },
     ])
-    expect((await verify(envId)).reads).toEqual({ ok: true, head: { seq: 4, hash: rows[3]!.hash } })
+    // The export is a read too, the chain's newest row
+    const { reads } = await verify(envId)
+    const exported = (await getDb().query.secretRead.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } }))[4]!
+    expect({ reads, exported: exported.kind }).toEqual({ reads: { ok: true, head: { seq: 5, hash: exported.hash } }, exported: 'audit' })
+  })
+
+  test('exporting a protected environment\'s history takes a passkey approval, and is a read in its log', async () => {
+    const protectedEnv = await newEnv()
+    const plainEnv = await newEnv()
+    for (const envId of [protectedEnv, plainEnv]) await setSecret(admin.token, envId, 'X', 'v')
+    await setEnvironmentProtection({ request: new Request('http://e.ly'), environmentId: protectedEnv, protect: true, author: { userId: admin.user.id, apiTokenId: null } })
+    const exported = async (envId: string) => {
+      const res = await get(admin.token, `${envId}/audit`)
+      const body = await res.json() as { code?: string; environmentIds?: string[]; events?: unknown }
+      return { status: res.status, code: body.code ?? null, environmentIds: body.environmentIds ?? null, chains: !!body.events }
+    }
+    const kinds = async (envId: string) => (await getDb().query.secretRead.findMany({ where: { environmentId: envId }, orderBy: { seq: 'asc' } })).map((row) => [row.kind, row.names])
+    const withoutApproval = await exported(protectedEnv)
+    await grantRead(admin.token, [protectedEnv])
+    expect({ withoutApproval, approved: await exported(protectedEnv), logged: await kinds(protectedEnv), plain: await exported(plainEnv), plainLogged: await kinds(plainEnv) }).toEqual({
+      withoutApproval: { status: 403, code: 'STEP_UP_REQUIRED', environmentIds: [protectedEnv], chains: false },
+      approved: { status: 200, code: null, environmentIds: null, chains: true },
+      logged: [['protected', []], ['audit', []]],
+      plain: { status: 200, code: null, environmentIds: null, chains: true },
+      plainLogged: [],
+    })
   })
 
   test('a read that can\'t be recorded fails instead of returning values', async () => {

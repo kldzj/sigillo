@@ -1012,7 +1012,10 @@ export const apiApp = new Spiceflow()
 
   // ── Audit ────────────────────────────────────────────────────────
   // Both hash chains of an environment, for `sigillo audit verify` (see
-  // audit.ts). Org admins only: the read log shows who read what.
+  // audit.ts). Org admins only: the read log shows who read what. For a
+  // protected environment with their passkey, like its values, since the
+  // digests show whether a value was set back to an earlier one; the export
+  // is then a row of its read log.
   .route({
     method: 'GET',
     path: '/api/v0/projects/:projectId/environments/:environmentId/audit',
@@ -1024,6 +1027,7 @@ export const apiApp = new Spiceflow()
       const orgId = await getOrgIdForEnvironment(auth.environmentId)
       const member = await requireApiOrgMember(auth.userId, orgId!)
       if (member.role !== 'admin') throw json({ error: 'only org admins can read the audit chains' }, { status: 403 })
+      await recordSecretRead({ request, environment: { id: auth.environmentId, protected: auth.protected }, author: auth, kind: 'audit', names: [] })
       return { environmentId: auth.environmentId, ...await getAuditChains(auth.environmentId) }
     },
   })

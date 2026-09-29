@@ -319,8 +319,10 @@ export const secretEvent = sqliteCore.sqliteTable('secret_event', {
 // leave the server. A hash chain per environment like secret_event's. Also
 // records protection being turned on and off, so a gap in the log shows.
 // value: one or more values revealed or fetched; event-log: an old value
-// revealed there; copy: copied into another environment on the server
-export const SECRET_READ_KINDS = ['list', 'value', 'download', 'event-log', 'copy', 'protected', 'unprotected'] as const
+// revealed there; copy: copied into another environment on the server;
+// audit: the history's chains exported, whose digests show whether a value
+// was set back to an earlier one
+export const SECRET_READ_KINDS = ['list', 'value', 'download', 'event-log', 'copy', 'protected', 'unprotected', 'audit'] as const
 
 export const secretRead = sqliteCore.sqliteTable('secret_read', {
   id: sqliteCore.text('id').primaryKey().notNull().$defaultFn(() => ulid()),

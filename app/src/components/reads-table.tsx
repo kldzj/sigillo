@@ -36,6 +36,7 @@ const KIND_LABELS: Record<string, string> = {
   copy: "Copied",
   protected: "Protection on",
   unprotected: "Protection off",
+  audit: "Exported history",
 };
 
 export function ReadsTable() {
