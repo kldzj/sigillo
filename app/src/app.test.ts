@@ -29,6 +29,7 @@ import { createTrustRule, deleteTrustRule, renewTrustRule, replaceTrustRuleKeys,
 import { createToken, deleteToken, expiringCredentials, expiryBanner, regenerateToken, stopPreviousValue } from './tokens.js'
 import * as jose from 'jose'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode, describeExpiry, GITHUB_ISSUER } from './lib/utils.js'
+import { asId, asString, asText, asBool, asOneOf, asList, asObject, asStringRecord, optional, nullable } from './lib/input.js'
 
 // ── Test helpers ────────────────────────────────────────────────────
 
@@ -5265,5 +5266,104 @@ describe('renewals', () => {
       },
       noSecrets: [],
     })
+  })
+})
+
+describe('inputs from the client', () => {
+  const outcome = async (run: () => Promise<unknown>) => run().then(() => 'ok', (error) => (error as Error).message)
+
+  test('an invitation is found only by its exact id', async () => {
+    const admin = await createTestUser({ name: 'Invite Admin' })
+    const invitee = await createTestUser({ name: 'Invitee' })
+    const intruder = await createTestUser({ name: 'Invite Intruder' })
+    const af = authedFetch(admin.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Invite Org' } })).id
+    const [invite] = await getDb().insert(schema.orgInvitation)
+      .values({ orgId, createdBy: admin.user.id, expiresAt: Date.now() + 60_000 })
+      .returning({ id: schema.orgInvitation.id })
+
+    const memberCount = async () => (await getDb().query.orgMember.findMany({ where: { orgId } })).length
+    const before = await memberCount()
+
+    // An operator object where the id belongs would reach the relational
+    // `where` as a filter and match the live invitation without the link
+    const byGt = await outcome(() => joinOrgByInvite({ invitationId: { gt: '0' } as unknown as string, userId: intruder.user.id }))
+    const byIsNotNull = await outcome(() => joinOrgByInvite({ invitationId: { isNotNull: true } as unknown as string, userId: intruder.user.id }))
+    const afterOperators = await memberCount()
+    const intruderJoined = !!(await getDb().query.orgMember.findFirst({ where: { orgId, userId: intruder.user.id } }))
+
+    // The exact id still works
+    const joined = await joinOrgByInvite({ invitationId: invite!.id, userId: invitee.user.id })
+    const inviteeJoined = !!(await getDb().query.orgMember.findFirst({ where: { orgId, userId: invitee.user.id } }))
+
+    expect({ byGt, byIsNotNull, addedNoMember: afterOperators === before, intruderJoined, joined, inviteeJoined }).toEqual({
+      byGt: 'Invalid input',
+      byIsNotNull: 'Invalid input',
+      addedNoMember: true,
+      intruderJoined: false,
+      joined: orgId,
+      inviteeJoined: true,
+    })
+  })
+
+  test('an API route refuses an object where a string belongs, and creates nothing', async () => {
+    const user = await createTestUser({ name: 'Object Body' })
+    const before = (await getDb().select().from(schema.org)).length
+    // Spiceflow validates the route's request schema when the handler reads the
+    // body, so a non-string name is rejected before the handler runs
+    const result = await authedFetch(user.token)('/api/v0/orgs', { method: 'POST', body: { name: { gt: '0' } as unknown as string } })
+    assertErrorStatus(result, 422)
+    const after = (await getDb().select().from(schema.org)).length
+    expect(after).toBe(before)
+  })
+})
+
+describe('checking the shapes of client inputs', () => {
+  test('ids are non-empty strings in the id charset', () => {
+    expect(asId('01J9Z8ABCDEFGHJKMNPQRSTVWX')).toBe('01J9Z8ABCDEFGHJKMNPQRSTVWX')
+    for (const bad of [{ gt: '0' }, { isNotNull: true }, '', ' has space', 'a'.repeat(65), 42, null, undefined, ['id'], 'no/slash']) {
+      expect(() => asId(bad as unknown as string)).toThrow('Invalid input')
+    }
+  })
+
+  test('required strings are non-empty and bounded; text may be empty', () => {
+    expect(asString('hello')).toBe('hello')
+    expect(() => asString('')).toThrow('Invalid input')
+    expect(() => asString({} as unknown as string)).toThrow('Invalid input')
+    expect(() => asString('x'.repeat(4097))).toThrow('Invalid input')
+    // A secret value or a typed confirmation may be empty
+    expect(asText('')).toBe('')
+    expect(asText('value')).toBe('value')
+    expect(() => asText(123 as unknown as string)).toThrow('Invalid input')
+  })
+
+  test('booleans, enums and numbers only accept their own values', () => {
+    expect(asBool(true)).toBe(true)
+    expect(() => asBool('true' as unknown as boolean)).toThrow('Invalid input')
+    expect(asOneOf('admin', ['admin', 'member'] as const)).toBe('admin')
+    expect(() => asOneOf('owner', ['admin', 'member'] as const)).toThrow('Invalid input')
+    expect(asOneOf(90, [7, 30, 90, 365] as const)).toBe(90)
+    expect(() => asOneOf(45, [7, 30, 90, 365] as const)).toThrow('Invalid input')
+    expect(() => asOneOf({ gt: 0 } as unknown as number, [7] as const)).toThrow('Invalid input')
+  })
+
+  test('lists, objects and records check their items', () => {
+    expect(asList(['01J9Z8ABCDEFGHJKMNPQRSTVWX'], asId)).toEqual(['01J9Z8ABCDEFGHJKMNPQRSTVWX'])
+    expect(asList([], asId)).toEqual([])
+    expect(() => asList({ gt: '0' } as unknown as unknown[], asId)).toThrow('Invalid input')
+    expect(() => asList([{ gt: '0' }], asId)).toThrow('Invalid input')
+    expect(asObject({ a: 1 })).toEqual({ a: 1 })
+    for (const bad of [null, ['a'], 'str', 3]) expect(() => asObject(bad)).toThrow('Invalid input')
+    expect(asStringRecord({ repository: 'acme/api' })).toEqual({ repository: 'acme/api' })
+    expect(() => asStringRecord({ repository: { gt: '0' } })).toThrow('Invalid input')
+  })
+
+  test('optional passes undefined and nullable passes null, else they check', () => {
+    expect(optional(undefined, asId)).toBeUndefined()
+    expect(optional('01J9Z8ABCDEFGHJKMNPQRSTVWX', asId)).toBe('01J9Z8ABCDEFGHJKMNPQRSTVWX')
+    expect(() => optional({ gt: '0' }, asId)).toThrow('Invalid input')
+    expect(nullable(null, (v) => asList(v, asId))).toBeNull()
+    expect(nullable(['01J9Z8ABCDEFGHJKMNPQRSTVWX'], (v) => asList(v, asId))).toEqual(['01J9Z8ABCDEFGHJKMNPQRSTVWX'])
+    expect(() => nullable({ gt: '0' }, (v) => asList(v, asId))).toThrow('Invalid input')
   })
 })

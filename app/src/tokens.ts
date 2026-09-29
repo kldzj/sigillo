@@ -104,6 +104,7 @@ export async function createToken({ userId, sessionId, request = null, name, pro
 // admin. Someone outside its organization gets the same answer as for a token
 // that doesn't exist.
 async function changeableToken({ userId, sessionId, tokenId }: Login & { tokenId: string }) {
+  if (typeof tokenId !== 'string') throw new Error('Invalid input')
   const token = await getDb().query.apiToken.findFirst({
     // A workload's token of an hour is its trust rule's
     where: { id: tokenId, workload: { isNull: true } },

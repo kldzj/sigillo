@@ -438,6 +438,7 @@ export async function readSecretValues({ request, userId, sessionId, environment
   names: string[] | null
   kind: 'value' | 'download'
 }): Promise<Record<string, string>> {
+  if (typeof environmentId !== 'string') throw new InvalidInputError('Invalid input')
   const env = await getUserEnvironmentAccess({ userId, environmentRef: environmentId })
   if (!env) throw new Error('Environment not found')
   const secrets = (await deriveSecrets(env.id)).filter((secret) => !names || names.includes(secret.name))
@@ -452,6 +453,7 @@ export async function readEventValue({ request, userId, sessionId, eventId }: {
   sessionId: string
   eventId: string
 }): Promise<string | null> {
+  if (typeof eventId !== 'string') throw new InvalidInputError('Invalid input')
   const event = await getDb().query.secretEvent.findFirst({ where: { id: eventId } })
   if (!event) throw new Error('Event not found')
   const env = await getUserEnvironmentAccess({ userId, environmentRef: event.environmentId })

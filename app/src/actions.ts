@@ -11,7 +11,8 @@
 'use server'
 
 import { ulid } from 'ulid'
-import { getEnvSlugError, getSecretNameError } from './lib/utils.ts'
+import { getEnvSlugError, getSecretNameError, TOKEN_EXPIRY_DAYS, GRACE_DAYS } from './lib/utils.ts'
+import { asId, asString, asText, asBool, asOneOf, asList, asObject, asStringRecord, optional, nullable } from './lib/input.ts'
 import * as orm from 'drizzle-orm'
 import { schema } from 'db'
 import { getActionRequest, redirect } from 'spiceflow'
@@ -80,8 +81,9 @@ async function ensureAnotherAdminExists(orgId: string, userId: string) {
 }
 
 export async function createProjectAction({ name, orgId }: { name: string; orgId: string }) {
+  asText(name)
+  asId(orgId)
   requireValidName(name)
-  if (!orgId) throw new Error('No org selected')
   const session = await requireSession()
   await requireOrgMember(session.userId, orgId)
   const db = getDb()
@@ -102,6 +104,8 @@ export async function deleteSecretAction({ name, environmentIds }: {
   name: string
   environmentIds: string[]
 }) {
+  asText(name)
+  asList(environmentIds, asId)
   return stepUpOr(async () => {
     const unique = Array.from(new Set(environmentIds))
     if (!unique.length) throw new Error('No environments selected')
@@ -137,7 +141,9 @@ export async function revealSecretsAction({ environmentId, names, download }: {
   names: string[] | null
   download?: boolean
 }) {
-  if (names !== null && !(Array.isArray(names) && names.every((name) => typeof name === 'string'))) throw new Error('Secret names must be a list')
+  asId(environmentId)
+  nullable(names, (value) => asList(value, asText))
+  optional(download, asBool)
   const session = await requireSession()
   return stepUpOr(async () => ({
     values: await readSecretValues({
@@ -150,6 +156,7 @@ export async function revealSecretsAction({ environmentId, names, download }: {
 // An admin removes an environment's old values, all but each secret's
 // current one (audit.ts)
 export async function purgeOldValuesAction({ environmentId }: { environmentId: string }) {
+  asId(environmentId)
   const session = await requireSession()
   return stepUpOr(async () => {
     await requireOldValuesPurge({ ...session, environmentId })
@@ -158,6 +165,7 @@ export async function purgeOldValuesAction({ environmentId }: { environmentId: s
 }
 
 export async function revealEventValueAction({ eventId }: { eventId: string }) {
+  asId(eventId)
   const session = await requireSession()
   return stepUpOr(async () => ({
     value: await readEventValue({ request: getActionRequest(), userId: session.userId, sessionId: session.sessionId, eventId }),
@@ -168,6 +176,8 @@ export async function revealEventValueAction({ eventId }: { eventId: string }) {
 
 // Asks this browser session's own approval: the passkey challenge to sign
 export async function startStepUpAction({ purpose, environmentIds }: { purpose: 'access' | 'admin'; environmentIds: string[] }) {
+  asOneOf(purpose, ['access', 'admin'] as const)
+  asList(environmentIds, asId)
   const session = await requireSession()
   const request = getActionRequest()
   const row = await createStepUpRequest({ request, userId: session.userId, sessionId: session.sessionId, environmentIds, withCode: false, purpose })
@@ -180,6 +190,8 @@ export async function startStepUpAction({ purpose, environmentIds }: { purpose: 
 }
 
 export async function finishStepUpAction({ requestId, response }: { requestId: string; response: AuthenticationResponseJSON }) {
+  asId(requestId)
+  asObject(response)
   const session = await requireSession()
   return { approved: await approveStepUpRequest({ request: getActionRequest(), requestId, userId: session.userId, response }) }
 }
@@ -187,6 +199,7 @@ export async function finishStepUpAction({ requestId, response }: { requestId: s
 // ── Passkeys ────────────────────────────────────────────────────────
 
 export async function removePasskeyAction({ passkeyId }: { passkeyId: string }) {
+  asId(passkeyId)
   return stepUpOr(async () => {
     const session = await requireSession()
     const db = getDb()
@@ -202,6 +215,7 @@ export async function removePasskeyAction({ passkeyId }: { passkeyId: string }) 
 // An org admin removes a member's passkeys, for a member who lost them: the
 // member then adds new ones after a fresh sign-in
 export async function removeMemberPasskeysAction({ memberId }: { memberId: string }) {
+  asId(memberId)
   return stepUpOr(async () => {
     const session = await requireSession()
     const db = getDb()
@@ -215,6 +229,7 @@ export async function removeMemberPasskeysAction({ memberId }: { memberId: strin
 // Adding a passkey that someone approves first: on another device of yours
 // with a code, or, for a first passkey, by an admin
 export async function requestEnrollmentAction({ viaCode }: { viaCode: boolean }) {
+  asBool(viaCode)
   const session = await requireSession()
   const request = getActionRequest()
   const row = await requestEnrollment({ request, ...session, viaCode })
@@ -222,12 +237,14 @@ export async function requestEnrollmentAction({ viaCode }: { viaCode: boolean })
 }
 
 export async function enrollmentStatusAction({ requestId }: { requestId: string }) {
+  asId(requestId)
   const session = await requireSession()
   return { status: await stepUpRequestStatus({ requestId, sessionId: session.sessionId }) }
 }
 
 // An admin answers a member's request for their first passkey
 export async function approveEnrollmentAction({ requestId }: { requestId: string }) {
+  asId(requestId)
   return stepUpOr(async () => {
     const session = await requireSession()
     return approveEnrollment({ requestId, approver: session })
@@ -235,6 +252,7 @@ export async function approveEnrollmentAction({ requestId }: { requestId: string
 }
 
 export async function declineEnrollmentAction({ requestId }: { requestId: string }) {
+  asId(requestId)
   return stepUpOr(async () => {
     const session = await requireSession()
     await declineEnrollment({ requestId, approver: session })
@@ -244,11 +262,13 @@ export async function declineEnrollmentAction({ requestId }: { requestId: string
 
 // /approve: a CLI request of the signed-in user, found by the code typed there
 export async function findApprovalAction({ userCode }: { userCode: string }) {
+  asString(userCode)
   const session = await requireSession()
   return findStepUpRequest({ userId: session.userId, userCode })
 }
 
 export async function approvalOptionsAction({ requestId }: { requestId: string }) {
+  asId(requestId)
   const session = await requireSession()
   try {
     return { options: await approvalOptions({ request: getActionRequest(), requestId, userId: session.userId }) }
@@ -267,6 +287,13 @@ export async function saveSecretsAction(args: {
   edits: { name: string; originalName?: string; value?: string }[]
   environmentIds: string[]
 }) {
+  asList(args.edits, (edit) => {
+    const fields = asObject(edit)
+    asText(fields.name)
+    optional(fields.originalName, asText)
+    optional(fields.value, asText)
+  })
+  asList(args.environmentIds, asId)
   return stepUpOr(() => saveSecrets(args))
 }
 
@@ -336,6 +363,8 @@ async function saveSecrets({ edits: requested, environmentIds }: {
 }
 
 export async function deleteEnvAction({ id, typedSlug }: { id: string; typedSlug?: string }) {
+  asId(id)
+  optional(typedSlug, asText)
   return stepUpOr(async () => {
     const session = await requireSession()
     await requireEnvironmentAccess(session.userId, id)
@@ -351,6 +380,9 @@ export async function createEnvAction({ name, slug, projectId }: {
   slug: string
   projectId: string
 }) {
+  asText(name)
+  asText(slug)
+  asId(projectId)
   if (!name || !slug) throw new Error('Name and slug are required')
   requireValidName(name)
   const slugError = getEnvSlugError(slug)
@@ -367,6 +399,9 @@ export async function renameEnvAction({ id, name, slug }: {
   name?: string
   slug?: string
 }) {
+  asId(id)
+  optional(name, asText)
+  optional(slug, asText)
   return stepUpOr(async () => {
     if (!name && !slug) throw new Error('At least one of name or slug is required')
     if (name) requireValidName(name)
@@ -387,8 +422,9 @@ export async function renameEnvAction({ id, name, slug }: {
 const INVITE_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
 
 export async function createInviteAction({ orgId, projectIds }: { orgId: string; projectIds?: string[] }) {
+  asId(orgId)
+  optional(projectIds, (value) => asList(value, asId))
   return stepUpOr(async () => {
-    if (!orgId) throw new Error('No org selected')
     const session = await requireSession()
     await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId })
 
@@ -417,7 +453,7 @@ export async function createInviteAction({ orgId, projectIds }: { orgId: string;
 }
 
 export async function acceptInviteAction({ invitationId }: { invitationId: string }) {
-  if (!invitationId) throw new Error('Invitation ID is required')
+  asId(invitationId)
   const session = await requireSession()
   const orgId = await joinOrgByInvite({ invitationId, userId: session.userId })
   throw redirect(router.href('/dash/orgs/:orgId', { orgId }))
@@ -427,6 +463,7 @@ export async function updateOrgMemberRoleAction({ memberId, role }: {
   memberId: string
   role: 'admin' | 'member'
 }) {
+  asId(memberId)
   if (role !== 'admin' && role !== 'member') throw new Error('Unknown role')
   return stepUpOr(async () => {
     const session = await requireSession()
@@ -454,6 +491,7 @@ export async function updateOrgMemberRoleAction({ memberId, role }: {
 }
 
 export async function removeOrgMemberAction({ memberId }: { memberId: string }) {
+  asId(memberId)
   return stepUpOr(async () => {
     const session = await requireSession()
     const db = getDb()
@@ -477,7 +515,7 @@ export async function removeOrgMemberAction({ memberId }: { memberId: string }) 
 // ── Session actions ─────────────────────────────────────────────────
 
 export async function endSessionAction({ sessionId }: { sessionId: string }) {
-  if (!sessionId) throw new Error('Session ID is required')
+  asId(sessionId)
   await requireSession()
   await endUserSession(getActionRequest(), sessionId)
 }
@@ -504,12 +542,17 @@ export async function createTokenAction({ name, projectId, environmentIds, expir
   // A machine token, which reads protected environments without a passkey
   protectedAccess?: boolean
 }) {
+  asText(name)
+  asId(projectId)
+  optional(environmentIds, (value) => asList(value, asId))
+  asOneOf(expiresInDays, TOKEN_EXPIRY_DAYS)
+  optional(protectedAccess, asBool)
   return stepUpOr(async () => createToken({ ...await tokenLogin(), name, projectId, environmentIds, expiresInDays, protectedAccess }))
 }
 
 export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
+  asId(tokenId)
   return stepUpOr(async () => {
-    if (!tokenId) throw new Error('Token ID is required')
     await deleteToken({ ...await tokenLogin(), tokenId })
     return { ok: true }
   })
@@ -518,10 +561,15 @@ export async function deleteTokenAction({ tokenId }: { tokenId: string }) {
 // A new value and expiry for the same token; the value before keeps working
 // for graceDays. Shows the new key once, like making one.
 export async function regenerateTokenAction({ tokenId, prefix, expiresInDays, graceDays }: { tokenId: string; prefix: string; expiresInDays: number; graceDays: number }) {
+  asId(tokenId)
+  asString(prefix)
+  asOneOf(expiresInDays, TOKEN_EXPIRY_DAYS)
+  asOneOf(graceDays, GRACE_DAYS)
   return stepUpOr(async () => regenerateToken({ ...await tokenLogin(), tokenId, prefix, expiresInDays, graceDays }))
 }
 
 export async function stopPreviousValueAction({ tokenId }: { tokenId: string }) {
+  asId(tokenId)
   return stepUpOr(async () => {
     await stopPreviousValue({ ...await tokenLogin(), tokenId })
     return { ok: true }
@@ -532,13 +580,27 @@ export async function stopPreviousValueAction({ tokenId }: { tokenId: string }) 
 // Trust rules (workload.ts), each change an org admin's with their passkey
 
 export async function createTrustRuleAction(rule: TrustRuleInput) {
+  const fields = asObject(rule)
+  const checked: TrustRuleInput = {
+    projectId: asId(fields.projectId),
+    name: asText(fields.name),
+    issuer: asText(fields.issuer),
+    jwks: optional(fields.jwks, asText),
+    audience: asText(fields.audience),
+    subject: asText(fields.subject),
+    claims: asStringRecord(fields.claims),
+    environmentIds: asList(fields.environmentIds, asId),
+    protectedAccess: asBool(fields.protectedAccess),
+    expiresInDays: asOneOf(fields.expiresInDays, TOKEN_EXPIRY_DAYS),
+  }
   return stepUpOr(async () => {
     const session = await requireSession()
-    return createTrustRule({ userId: session.userId, sessionId: session.sessionId, request: getActionRequest(), ownHost: new URL(getActionRequest().url).hostname, rule })
+    return createTrustRule({ userId: session.userId, sessionId: session.sessionId, request: getActionRequest(), ownHost: new URL(getActionRequest().url).hostname, rule: checked })
   })
 }
 
 export async function deleteTrustRuleAction({ ruleId }: { ruleId: string }) {
+  asId(ruleId)
   return stepUpOr(async () => {
     const session = await requireSession()
     await deleteTrustRule({ userId: session.userId, sessionId: session.sessionId, request: getActionRequest(), ruleId })
@@ -547,6 +609,8 @@ export async function deleteTrustRuleAction({ ruleId }: { ruleId: string }) {
 }
 
 export async function replaceTrustRuleKeysAction({ ruleId, jwks }: { ruleId: string; jwks: string }) {
+  asId(ruleId)
+  asText(jwks)
   return stepUpOr(async () => {
     const session = await requireSession()
     await replaceTrustRuleKeys({ userId: session.userId, sessionId: session.sessionId, request: getActionRequest(), ruleId, jwks })
@@ -556,6 +620,8 @@ export async function replaceTrustRuleKeysAction({ ruleId, jwks }: { ruleId: str
 
 // A new expiry for the same rule, which becomes the renewing admin's
 export async function renewTrustRuleAction({ ruleId, expiresInDays }: { ruleId: string; expiresInDays: number }) {
+  asId(ruleId)
+  asOneOf(expiresInDays, TOKEN_EXPIRY_DAYS)
   return stepUpOr(async () => {
     const session = await requireSession()
     const request = getActionRequest()
@@ -565,6 +631,7 @@ export async function renewTrustRuleAction({ ruleId, expiresInDays }: { ruleId: 
 
 // What the renewal dialog shows about a rule's use, for org admins
 export async function trustRuleEvidenceAction({ ruleId }: { ruleId: string }) {
+  asId(ruleId)
   const session = await requireSession()
   return trustRuleEvidence({ userId: session.userId, ruleId })
 }
@@ -574,6 +641,9 @@ export async function syncMissingSecretsAction(args: {
   targetEnvironmentId: string
   names: string[]
 }) {
+  asId(args.sourceEnvironmentId)
+  asId(args.targetEnvironmentId)
+  asList(args.names, asText)
   return stepUpOr(() => syncMissingSecrets(args))
 }
 
@@ -624,6 +694,8 @@ async function syncMissingSecrets({
 }
 
 export async function createOrgAction({ name, enableAutoJoin }: { name: string; enableAutoJoin?: boolean }) {
+  asText(name)
+  optional(enableAutoJoin, asBool)
   requireValidName(name)
   const session = await requireSession()
 
@@ -644,8 +716,9 @@ export async function createOrgAction({ name, enableAutoJoin }: { name: string; 
 }
 
 export async function updateAutoJoinDomainAction({ orgId, enabled }: { orgId: string; enabled: boolean }) {
+  asId(orgId)
+  asBool(enabled)
   return stepUpOr(async () => {
-    if (!orgId) throw new Error('Org ID is required')
     const session = await requireSession()
     await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: orgId })
 
@@ -675,6 +748,8 @@ export async function updateMemberAccessAction({ memberId, projectIds }: {
   memberId: string
   projectIds: string[] | null
 }) {
+  asId(memberId)
+  nullable(projectIds, (value) => asList(value, asId))
   return stepUpOr(async () => {
     const session = await requireSession()
     const db = getDb()
@@ -721,6 +796,7 @@ export async function updateEnvironmentAccessRoleAction({ environmentId, accessR
   environmentId: string
   accessRole: 'admin' | 'member'
 }) {
+  asId(environmentId)
   if (accessRole !== 'admin' && accessRole !== 'member') throw new Error('Unknown role')
   return stepUpOr(async () => {
     const session = await requireSession()
@@ -740,6 +816,8 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
   environmentId: string
   protect: boolean
 }) {
+  asId(environmentId)
+  asBool(protect)
   return stepUpOr(async () => {
     const session = await requireSession()
     const orgId = await getOrgIdForEnvironment(environmentId)
@@ -753,6 +831,8 @@ export async function updateEnvironmentProtectionAction({ environmentId, protect
 }
 
 export async function renameProjectAction({ projectId, name }: { projectId: string; name: string }) {
+  asId(projectId)
+  asText(name)
   return stepUpOr(async () => {
     requireValidName(name)
     const session = await requireSession()
@@ -765,6 +845,8 @@ export async function renameProjectAction({ projectId, name }: { projectId: stri
 // Deleting a project deletes its environments and secrets: it takes its
 // name, typed out
 export async function deleteProjectAction({ projectId, typedName }: { projectId: string; typedName: string }) {
+  asId(projectId)
+  asText(typedName)
   return stepUpOr(async () => {
     const session = await requireSession()
     await requireProjectChange({ ...session, projectId })
@@ -778,6 +860,7 @@ export async function deleteProjectAction({ projectId, typedName }: { projectId:
 // A member leaves an organization, as if an admin removed them: auto-join
 // doesn't add them back. The last admin can't leave.
 export async function leaveOrgAction({ orgId }: { orgId: string }) {
+  asId(orgId)
   const session = await requireSession()
   const member = await getDb().query.orgMember.findFirst({
     where: { orgId, userId: session.userId },
@@ -793,8 +876,9 @@ export async function leaveOrgAction({ orgId }: { orgId: string }) {
 }
 
 export async function deleteOrgAction({ orgId, typedName }: { orgId: string; typedName: string }) {
+  asId(orgId)
+  asText(typedName)
   return stepUpOr(async () => {
-    if (!orgId) throw new Error('Org ID is required')
     const session = await requireSession()
     await requireOrgAdmin({ userId: session.userId, sessionId: session.sessionId, orgId: orgId })
     await requireOrgDeletionTyped({ orgId, typed: typedName })

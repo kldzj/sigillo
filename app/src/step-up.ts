@@ -15,7 +15,7 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
 } from '@simplewebauthn/server'
 import { getDb, schema } from 'db'
-import { ForbiddenError, getOrgIdForProject, getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
+import { ForbiddenError, InvalidInputError, getOrgIdForProject, getRequestOrigin, getUserEnvironmentAccess, getProjectMemberAccess, requireOrgMember } from './db.ts'
 import { MACHINE_TOKEN_MAX_DAYS, formatUserCode } from './lib/utils.ts'
 import { securityEvent, userName } from './security-log.ts'
 
@@ -285,6 +285,7 @@ export async function createStepUpRequest({ request, userId, sessionId, environm
   purpose?: 'access' | 'admin'
 }) {
   if (purpose !== 'access' && purpose !== 'admin') throw new Error('Unknown approval')
+  if (!Array.isArray(environmentIds) || environmentIds.some((id) => typeof id !== 'string')) throw new InvalidInputError('Invalid input')
   const ids = [...new Set(environmentIds)]
   if (purpose === 'access' && ids.length === 0) throw new Error('No environments to approve')
   // Only environments the user may read at all
@@ -318,6 +319,10 @@ async function insertRequest({ request, userId, sessionId, environmentIds, withC
 }
 
 async function pendingRequest(where: { id?: string; userCode?: string; userId: string }) {
+  // These name one exact row; a non-string would reach the relational `where`
+  // as filter operators.
+  if (where.id !== undefined && typeof where.id !== 'string') throw new InvalidInputError('Invalid input')
+  if (where.userCode !== undefined && typeof where.userCode !== 'string') throw new InvalidInputError('Invalid input')
   const row = await getDb().query.stepUpRequest.findFirst({ where: { ...where, status: 'pending', expiresAt: { gt: Date.now() } } })
   return row ?? null
 }
@@ -379,6 +384,7 @@ export async function approveStepUpRequest({ request, requestId, userId, respons
 
 // For the CLI polling its own request
 export async function stepUpRequestStatus({ requestId, sessionId }: { requestId: string; sessionId: string }) {
+  if (typeof requestId !== 'string') throw new InvalidInputError('Invalid input')
   const row = await getDb().query.stepUpRequest.findFirst({ where: { id: requestId, sessionId }, columns: { status: true, expiresAt: true } })
   if (!row) return null
   return row.status === 'approved' ? 'approved' : row.expiresAt > Date.now() ? 'pending' : 'expired'
@@ -471,6 +477,7 @@ export async function requestEnrollment({ request, userId, sessionId, signedIn, 
 // of one organization, maybe one made for the purpose, can't approve it for
 // the others. Returns the organizations this approver answers for.
 async function enrollmentForAdmin({ requestId, approver }: { requestId: string; approver: { userId: string; sessionId: string } }) {
+  if (typeof requestId !== 'string') throw new InvalidInputError('Invalid input')
   const db = getDb()
   const row = await db.query.stepUpRequest.findFirst({
     where: { id: requestId, purpose: 'enroll', userCode: { isNull: true }, status: 'pending', expiresAt: { gt: Date.now() } },

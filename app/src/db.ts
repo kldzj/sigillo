@@ -506,6 +506,7 @@ export async function isSessionFresh(request: Request, sessionCreatedAt: number)
 }
 
 export async function endUserSession(request: Request, sessionId: string) {
+  if (typeof sessionId !== 'string') throw new InvalidInputError('Invalid input')
   const auth = await getAuth(request)
   const sessions = await auth.api.listSessions({ headers: request.headers })
   const token = sessions.find((session) => session.id === sessionId)?.token
@@ -703,6 +704,10 @@ export async function listFormerMembers(orgId: string) {
 // expires, for everyone it was shared with. An invitation made before someone
 // left or was removed doesn't bring them back: that takes a new one.
 export async function joinOrgByInvite({ invitationId, userId }: { invitationId: string; userId: string }) {
+  // The id names one exact invitation. A non-string here would reach drizzle's
+  // relational `where` as filter operators and match a live invite by something
+  // other than its id, so refuse it before the lookup.
+  if (typeof invitationId !== 'string') throw new InvalidInputError('Invalid input')
   const db = getDb()
   const invite = await db.query.orgInvitation.findFirst({ where: { id: invitationId } })
   if (!invite || invite.expiresAt < Date.now()) throw new Error('Invitation not found or expired')

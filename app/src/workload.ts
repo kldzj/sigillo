@@ -216,6 +216,11 @@ export async function exchangeWorkloadToken({ jwt, project, ruleId, ownHost, ipA
   ipAddress: string | null
 }): Promise<{ key: string; tokenId: string; expiresAt: number; projectId: string; environmentIds: string[]; ruleId: string; ruleExpiresAt: number; ruleLifetimeStart: number }> {
   if (typeof jwt !== 'string' || jwt.length > MAX_JWT_LENGTH || jwt.split('.').length !== 3) throw new WorkloadError('Not a JWT', 400)
+  // The rule id and project narrow which rules to try, and reach drizzle's
+  // relational `where`: a non-string there would filter by operators instead
+  // of matching one exact value.
+  if (ruleId !== undefined && typeof ruleId !== 'string') throw new WorkloadError('Not a JWT', 400)
+  if (project !== undefined && typeof project !== 'string') throw new WorkloadError('The project must be an id', 400)
   let header: jose.ProtectedHeaderParameters
   let unverified: jose.JWTPayload
   try {
@@ -360,6 +365,7 @@ export async function createTrustRule({ userId, sessionId, request = null, ownHo
 // rule that doesn't exist. Its callers check for an org admin next, before
 // they look at the rule, so a member learns nothing about it either.
 async function findRule({ userId, ruleId }: { userId: string; ruleId: string }) {
+  if (typeof ruleId !== 'string') throw new InvalidInputError('Trust rule not found')
   const rule = await getDb().query.trustRule.findFirst({ where: { id: ruleId }, with: { creator: { columns: { id: true, name: true } } } })
   if (!rule || !await getProjectMemberAccess(userId, rule.projectId)) throw new InvalidInputError('Trust rule not found')
   return rule
