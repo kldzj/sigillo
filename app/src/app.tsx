@@ -36,9 +36,10 @@ import {
 } from './db.ts'
 import { apiApp } from './api.ts'
 import { countOldValues } from './audit.ts'
+import { expiryBanner } from './tokens.ts'
 import { isFreshSignIn, enrollmentState, pendingEnrollments, requirePasskeyOnceEnrolled, StepUpRequiredError } from './step-up.ts'
 import { rememberCacheOrigin } from './lib/memoize.ts'
-import { cn, loginErrorMessage, DOCS_URL, ENV_SLUG_REGEX } from 'sigillo-app/src/lib/utils'
+import { cn, loginErrorMessage, describeExpiry, DOCS_URL, ENV_SLUG_REGEX, EXPIRY_BANNER_COOKIE } from 'sigillo-app/src/lib/utils'
 import { CreateOrgForm } from 'sigillo-app/src/components/create-org-form'
 import { SigilloLogo } from 'sigillo-app/src/components/logo'
 // Tailwind and the base styles, which the docs site loads with its pages
@@ -220,6 +221,12 @@ export const app = new Spiceflow({ tracer })
       id: m.org!.id!, name: m.org!.name!, role: m.role,
       createdAt: m.org!.createdAt!, updatedAt: m.org!.updatedAt!,
     }))
+    // Tokens and trust rules that expire soon, unless dismissed for them
+    const expiring = await expiryBanner({
+      userId: session.userId,
+      orgs,
+      dismissed: getCookie(request.headers.get('cookie') ?? '', EXPIRY_BANNER_COOKIE),
+    })
 
     return {
       orgs,
@@ -227,6 +234,7 @@ export const app = new Spiceflow({ tracer })
       pathname,
       currentProjectEnvSlug: null,
       user: { name: session.user.name || 'User', email: session.user.email || '' },
+      expiring,
     }
   })
 
@@ -405,9 +413,11 @@ export const app = new Spiceflow({ tracer })
   // ── Layout 2: Authenticated app shell with sidebar ─────────────
   .layout('/dash/*', async ({ children, loaderData }) => {
     const { Sidebar, MobileDrawer } = await import('sigillo-app/src/components/sidebar')
+    const { ExpiryBanner } = await import('sigillo-app/src/components/expiry')
     const projectId = loaderData.projectId
     return (
       <>
+        {loaderData.expiring && <ExpiryBanner banner={loaderData.expiring} />}
         {projectId && (
           <>
             <TabBar
@@ -793,7 +803,7 @@ export const app = new Spiceflow({ tracer })
     )
   })
 
-  // ── Tokens page ────────────────────────────────────────────────────
+  // ── Machines page ──────────────────────────────────────────────────
   .loader('/dash/projects/:projectId/machines', async ({ params, request }) => {
     const db = getDb()
     const { projectId } = params
@@ -801,12 +811,19 @@ export const app = new Spiceflow({ tracer })
     const access = await requirePageProjectAccess(session.userId, projectId)
 
     const isAdmin = access?.role === 'admin'
+    const now = Date.now()
+    // How long it lasts from its start, in days, and when it stops working
+    const lifetime = (expiresAt: number | null, lifetimeStart: number) => ({
+      lifetimeDays: expiresAt === null ? null : Math.round((expiresAt - lifetimeStart) / 86_400_000),
+      expiry: describeExpiry({ expiresAt, lifetimeStart, now }),
+    })
     const [tokens, rules] = await Promise.all([
       // Tokens workloads got for their JWTs show under their trust rule
       db.query.apiToken.findMany({
         where: { projectId, workload: { isNull: true } },
         with: {
           creator: { columns: { id: true, name: true } },
+          regenerator: { columns: { name: true } },
           environments: { with: { environment: { columns: { id: true, name: true } } } },
         },
         orderBy: { createdAt: 'desc' },
@@ -838,9 +855,13 @@ export const app = new Spiceflow({ tracer })
         claims: rule.claims,
         environmentIds: rule.environmentIds,
         protectedAccess: rule.protectedAccess,
+        // Its owner: its tokens act for them. Renewing makes it the renewer's.
         createdBy: rule.creator?.name ?? '—',
         createdAt: rule.createdAt,
+        renewedAt: rule.renewedAt,
+        renewals: rule.renewals,
         expiresAt: rule.expiresAt,
+        ...lifetime(rule.expiresAt, rule.renewedAt ?? rule.createdAt),
         lastUsedAt: rule.lastUsedAt,
         exchanges: rule.tokens,
       })),
@@ -852,13 +873,20 @@ export const app = new Spiceflow({ tracer })
           .map((row) => row.environment?.name)
           .filter((name): name is string => Boolean(name)),
         createdBy: t.creator?.name ?? '—',
-        // Its creator or an admin deletes it
+        // Its creator or an admin deletes or regenerates it
         deletable: access?.role === 'admin' || t.createdBy === session.userId,
         createdAt: t.createdAt,
         expiresAt: t.expiresAt,
+        ...lifetime(t.expiresAt, t.regeneratedAt ?? t.createdAt),
+        regeneratedAt: t.regeneratedAt,
+        regeneratedBy: t.regenerator?.name ?? null,
         lastUsedAt: t.lastUsedAt,
         lastUsedIp: t.lastUsedIp,
         protectedAccess: t.protectedAccess,
+        // The value before the last regeneration, while it still works
+        previous: t.previousHashedKey !== null && t.previousExpiresAt !== null && t.previousExpiresAt > now
+          ? { expiresAt: t.previousExpiresAt, lastUsedAt: t.previousLastUsedAt, lastUsedIp: t.previousLastUsedIp }
+          : null,
       })),
     }
   })

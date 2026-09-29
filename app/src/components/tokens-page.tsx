@@ -1,12 +1,14 @@
-// The Machines tab: API tokens with create/delete, and workload identities.
-// Each token is scoped to a project and optionally to an env allowlist
-// (zero rows = all envs), and expires after a lifetime picked at creation.
-// The full key is only shown once at creation (never stored), so the
-// create dialog has a "copy key" step before closing. Admins can make a
-// machine token, which uses protected environments without a passkey: it
-// takes their own passkey approval for those environments first, and expires
-// after 90 days at most. Below, admins manage workload identities
-// (trust-rules.tsx).
+// The Machines tab: API tokens with create/regenerate/delete, and workload
+// identities. Each token is scoped to a project and optionally to an env
+// allowlist (zero rows = all envs), and expires after a lifetime picked at
+// creation. The full key is only shown once (never stored), so the create
+// and regenerate dialogs have a "copy key" step before closing. Regenerating
+// keeps the token and gives it a new value and expiry; its value before keeps
+// working for a grace period, shown under its key with its last use.
+// Admins can make a machine token, which uses protected environments without
+// a passkey: it takes their own passkey approval for those environments
+// first, and expires after 90 days at most. Below, admins manage workload
+// identities (trust-rules.tsx).
 
 "use client"
 
@@ -14,7 +16,8 @@ import { useState } from "react"
 import { z } from "zod"
 import { parseFormData } from "spiceflow"
 import { useLoaderData } from "spiceflow/react"
-import { KeyIcon, TrashIcon, PlusIcon, CopyIcon, CheckIcon } from "lucide-react"
+import type * as React from "react"
+import { KeyIcon, TrashIcon, PlusIcon, CopyIcon, CheckIcon, RotateCwIcon } from "lucide-react"
 import { EmptyState } from "sigillo-app/src/components/ui/empty-state"
 import { Button } from "sigillo-app/src/components/ui/button"
 import { Badge } from "sigillo-app/src/components/ui/badge"
@@ -28,9 +31,12 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
-import { cn, DOCS_URL, DEFAULT_TOKEN_EXPIRY_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatIp } from "sigillo-app/src/lib/utils"
-import { createTokenAction, deleteTokenAction } from "../actions.ts"
+import {
+  cn, DOCS_URL, DEFAULT_GRACE_DAYS, DEFAULT_TOKEN_EXPIRY_DAYS, GRACE_DAYS, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatAbsoluteDate, formatIp,
+} from "sigillo-app/src/lib/utils"
+import { createTokenAction, deleteTokenAction, regenerateTokenAction, stopPreviousValueAction } from "../actions.ts"
 import { withStepUp } from "./step-up.ts"
+import { ExpiryBadge, utcDate } from "./expiry.tsx"
 import { WorkloadIdentities } from "./trust-rules.tsx"
 
 
@@ -88,19 +94,32 @@ function tokenScopeLabel(environmentNames: string[]) {
   return environmentNames.join(", ")
 }
 
+type Token = ReturnType<typeof useTokens>[number]
+
+function useTokens() {
+  return useLoaderData('/dash/projects/:projectId/machines').tokens
+}
+
+// Who made it, and who regenerated it last
+function tokenTitle(token: Token) {
+  const regenerated = token.regeneratedAt === null ? "" : `, regenerated ${utcDate(token.regeneratedAt)} by ${token.regeneratedBy ?? "a former member"}`
+  return `Made by ${token.createdBy}${regenerated}`
+}
+
 function TokensTable() {
-  const { tokens } = useLoaderData('/dash/projects/:projectId/machines')
+  const tokens = useTokens()
+  const [regenerating, setRegenerating] = useState<Token | null>(null)
   return (
     <Frame className="w-full">
-      <Table className="table-fixed">
+      <Table className="table-fixed min-w-3xl">
         <colgroup>
           <col className="w-1/5" />
-          <col className="w-1/5" />
+          <col className="w-1/4" />
           <col className="w-1/6" />
+          <col className="w-24" />
           <col className="w-28" />
           <col className="w-28" />
-          <col className="w-28" />
-          <col className="w-12" />
+          <col className="w-16" />
         </colgroup>
         <TableHeader>
           <TableRow className="hover:bg-transparent">
@@ -118,7 +137,7 @@ function TokensTable() {
             <TableRow key={token.id}>
               <TableCell>
                 <span className="flex items-center gap-2 text-sm font-medium">
-                  <span className="truncate">{token.name}</span>
+                  <span className="truncate" title={tokenTitle(token)}>{token.name}</span>
                   {token.protectedAccess && (
                     <Badge variant="secondary" title="Reads and changes protected environments without a passkey">Machine</Badge>
                   )}
@@ -128,6 +147,7 @@ function TokensTable() {
                 <code className="text-xs text-muted-foreground mono-sm">
                   sig_{token.prefix}••••
                 </code>
+                {token.previous && <PreviousValue token={token} previous={token.previous} />}
               </TableCell>
               <TableCell>
                 <span className="text-sm text-muted-foreground">
@@ -141,7 +161,7 @@ function TokensTable() {
                 />
               </TableCell>
               <TableCell>
-                <TokenExpiry expiresAt={token.expiresAt} />
+                <ExpiryBadge expiresAt={token.expiresAt} expiry={token.expiry} />
               </TableCell>
               <TableCell>
                 {token.lastUsedAt === null ? (
@@ -161,39 +181,254 @@ function TokensTable() {
                 )}
               </TableCell>
               <TableCell className="p-0">
-                {token.deletable && <button
-                  onClick={async () => {
-                    if (confirm(`Delete token "${token.name}"? This cannot be undone.`)) {
-                      try {
-                        await withStepUp(() => deleteTokenAction({ tokenId: token.id }))
-                      } catch (e: any) {
-                        alert(e?.message || "Failed to delete token")
-                      }
-                    }
-                  }}
-                  className="text-muted-foreground hover:text-destructive cursor-pointer"
-                  title="Delete token"
-                >
-                  <TrashIcon className="size-3.5" />
-                </button>}
+                {token.deletable && (
+                  <span className="flex items-center gap-2.5">
+                    <button
+                      onClick={() => setRegenerating(token)}
+                      className="text-muted-foreground hover:text-foreground cursor-pointer"
+                      title="Regenerate: a new value and expiry for the same token"
+                    >
+                      <RotateCwIcon className="size-3.5" />
+                    </button>
+                    <button
+                      onClick={async () => {
+                        if (confirm(`Delete token "${token.name}"? This cannot be undone.`)) {
+                          try {
+                            await withStepUp(() => deleteTokenAction({ tokenId: token.id }))
+                          } catch (e: any) {
+                            alert(e?.message || "Failed to delete token")
+                          }
+                        }
+                      }}
+                      className="text-muted-foreground hover:text-destructive cursor-pointer"
+                      title="Delete token"
+                    >
+                      <TrashIcon className="size-3.5" />
+                    </button>
+                  </span>
+                )}
               </TableCell>
             </TableRow>
           ))}
         </TableBody>
       </Table>
+      <RegenerateTokenDialog token={regenerating} onClose={() => setRegenerating(null)} />
     </Frame>
   )
 }
 
-// Tokens made before expiry existed have none; they are flagged, not hidden
-function TokenExpiry({ expiresAt }: { expiresAt: number | null }) {
-  if (expiresAt === null) {
-    return <span className="text-warning text-xs" title="Made before tokens expired. Replace it with one that expires.">Never</span>
+// A regenerated token's value before, while it still works: its last use
+// tells whether CI has switched over
+function PreviousValue({ token, previous }: { token: Token; previous: NonNullable<Token["previous"]> }) {
+  return (
+    <span className="mt-1 block text-xs leading-snug whitespace-normal text-muted-foreground">
+      previous value until <TimeAgo ts={previous.expiresAt} className="tabular-nums" />
+      {" · "}
+      {previous.lastUsedAt === null ? "never used" : (
+        <>
+          last used <TimeAgo ts={previous.lastUsedAt} className="tabular-nums" />
+          {previous.lastUsedIp && <> from <span className="mono-sm" title={previous.lastUsedIp}>{formatIp(previous.lastUsedIp)}</span></>}
+        </>
+      )}
+      {token.deletable && (
+        <>
+          {" · "}
+          <button
+            className="underline underline-offset-2 cursor-pointer hover:text-foreground"
+            title="Stop the previous value now"
+            onClick={async () => {
+              if (!confirm(`Stop the previous value of "${token.name}" now? Whatever still uses it is refused from then on.`)) return
+              try {
+                await withStepUp(() => stopPreviousValueAction({ tokenId: token.id }))
+              } catch (e: any) {
+                alert(e?.message || "Failed to stop the previous value")
+              }
+            }}
+          >
+            Stop
+          </button>
+        </>
+      )}
+    </span>
+  )
+}
+
+function localDate(ts: number) {
+  return formatAbsoluteDate({ ts, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone })
+}
+
+// The expiry closest to the token's own lifetime, as far as it may have one
+function nearestExpiry(days: number | null, machine: boolean): number {
+  if (days === null) return DEFAULT_TOKEN_EXPIRY_DAYS
+  const options = TOKEN_EXPIRY_DAYS.filter((option) => !machine || option <= MACHINE_TOKEN_MAX_DAYS)
+  return options.reduce((best, option) => Math.abs(option - days) < Math.abs(best - days) ? option : best)
+}
+
+// Only open after a click, so reading the clock here is safe for hydration
+function RegenerateTokenDialog({ token, onClose }: { token: Token | null; onClose: () => void }) {
+  const [expiresInDays, setExpiresInDays] = useState<number | null>(null)
+  const [graceDays, setGraceDays] = useState<number>(DEFAULT_GRACE_DAYS)
+  const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [created, setCreated] = useState<{ key: string; previousExpiresAt: number | null } | null>(null)
+
+  function close() {
+    setExpiresInDays(null)
+    setGraceDays(DEFAULT_GRACE_DAYS)
+    setError(null)
+    setCreated(null)
+    onClose()
   }
-  if (expiresAt <= Date.now()) {
-    return <span className="text-destructive text-xs">Expired</span>
+
+  // Only Done closes it, as after making a token
+  if (token && created) {
+    return (
+      <Dialog open onOpenChange={() => {}}>
+        <DialogPopup showCloseButton={false}>
+          <NewKey title="Token regenerated" keyValue={created.key} onDone={close}>
+            <p>
+              {created.previousExpiresAt === null || created.previousExpiresAt <= Date.now()
+                ? "Its previous value has stopped working."
+                : `The previous value keeps working until ${localDate(created.previousExpiresAt)}: put the new one where the token is used before then.`}
+            </p>
+          </NewKey>
+        </DialogPopup>
+      </Dialog>
+    )
   }
-  return <TimeAgo ts={expiresAt} className="text-muted-foreground text-xs tabular-nums" />
+
+  const days = token ? expiresInDays ?? nearestExpiry(token.lifetimeDays, token.protectedAccess) : DEFAULT_TOKEN_EXPIRY_DAYS
+  const now = Date.now()
+  // When the current value stops: after the grace, never past its own expiry
+  const currentEnds = !token || (token.expiresAt !== null && token.expiresAt <= now) ? null : Math.min(now + graceDays * 86_400_000, token.expiresAt ?? Infinity)
+  const currentValue = currentEnds === null ? "Its current value has expired, so it stays stopped."
+    : graceDays === 0 ? "Its current value stops working at once."
+    : currentEnds === token?.expiresAt ? `Its current value keeps working until it expires on ${localDate(currentEnds)}.`
+    : `Its current value keeps working until ${localDate(currentEnds)}.`
+
+  return (
+    <Dialog open={token !== null} onOpenChange={(open) => { if (!open) close() }}>
+      <DialogPopup>
+        <DialogHeader>
+          <DialogTitle className="break-words">Regenerate {token?.name}</DialogTitle>
+          <DialogDescription>
+            A new value and expiry for the same token: its name, scope and history stay.
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          className="px-6 pb-2 flex flex-col gap-3"
+          action={async () => {
+            if (!token) return
+            setSaving(true)
+            setError(null)
+            try {
+              const result = await withStepUp(() => regenerateTokenAction({ tokenId: token.id, prefix: token.prefix, expiresInDays: days, graceDays }))
+              if (result) setCreated({ key: result.key, previousExpiresAt: result.previousExpiresAt })
+            } catch (e: any) {
+              setError(e?.message || "Failed to regenerate the token")
+            } finally {
+              setSaving(false)
+            }
+          }}
+        >
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          <div>
+            <p className="text-sm font-medium mb-2">The new value expires in</p>
+            <div className="grid grid-cols-4 gap-1.5">
+              {TOKEN_EXPIRY_DAYS.map((option) => {
+                const disabled = !!token?.protectedAccess && option > MACHINE_TOKEN_MAX_DAYS
+                return (
+                  <label
+                    key={option}
+                    className={cn(
+                      "flex items-center justify-center gap-2 rounded-md px-2 py-2 cursor-pointer transition-colors text-sm font-medium whitespace-nowrap",
+                      days === option ? "bg-primary/5" : "hover:bg-muted/50",
+                      disabled && "opacity-50 cursor-not-allowed",
+                    )}
+                  >
+                    <input type="radio" name="regenerate-expiry" checked={days === option} disabled={disabled} onChange={() => setExpiresInDays(option)} className="accent-primary" />
+                    {option === 365 ? "1 year" : `${option} days`}
+                  </label>
+                )
+              })}
+            </div>
+          </div>
+          <div>
+            <p className="text-sm font-medium mb-2">The current value keeps working for</p>
+            <div className="grid grid-cols-3 gap-1.5">
+              {GRACE_DAYS.map((option) => (
+                <label
+                  key={option}
+                  className={cn(
+                    "flex items-center justify-center gap-2 rounded-md px-2 py-2 cursor-pointer transition-colors text-sm font-medium whitespace-nowrap",
+                    graceDays === option ? "bg-primary/5" : "hover:bg-muted/50",
+                  )}
+                >
+                  <input type="radio" name="regenerate-grace" checked={graceDays === option} onChange={() => setGraceDays(option)} className="accent-primary" />
+                  {option === 0 ? "No time" : option === 1 ? "1 day" : `${option} days`}
+                </label>
+              ))}
+            </div>
+            <p className="text-xs text-muted-foreground mt-2">
+              {currentValue}
+              {token?.previous && " The value before its last regeneration stops at once."}
+            </p>
+          </div>
+          {token?.protectedAccess && (
+            <p className="text-xs text-muted-foreground">A machine token takes your passkey, and expires after {MACHINE_TOKEN_MAX_DAYS} days at most.</p>
+          )}
+          <DialogFooter variant="bare" className="mt-1">
+            <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+            <Button type="submit" disabled={saving}>Regenerate</Button>
+          </DialogFooter>
+        </form>
+      </DialogPopup>
+    </Dialog>
+  )
+}
+
+// A new key, shown once, in the popup that made it: the same popup stays
+// mounted, so closing it animates out. Only Done closes it, so the one copy
+// isn't lost to a stray click or Escape.
+function NewKey({ title, keyValue, onDone, children }: { title: string; keyValue: string; onDone: () => void; children: React.ReactNode }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>{title}</DialogTitle>
+        <DialogDescription>
+          Copy this token now — you won't be able to see it again.
+        </DialogDescription>
+      </DialogHeader>
+      <div className="px-6 pb-2">
+        <div className="flex gap-2">
+          <Input
+            readOnly
+            value={keyValue}
+            className="w-full mono-sm text-xs"
+            onClick={(e) => e.currentTarget.select()}
+          />
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={async () => {
+              await navigator.clipboard.writeText(keyValue)
+              setCopied(true)
+              setTimeout(() => setCopied(false), 2000)
+            }}
+          >
+            {copied ? <CheckIcon className="size-4" /> : <CopyIcon className="size-4" />}
+          </Button>
+        </div>
+        <div className="text-xs text-muted-foreground mt-2 flex flex-col gap-1">{children}</div>
+        <DialogFooter variant="bare" className="mt-4">
+          <Button variant="outline" onClick={onDone}>
+            Done
+          </Button>
+        </DialogFooter>
+      </div>
+    </>
+  )
 }
 
 const tokenSchema = z.object({ name: z.string().min(1, "Name is required") })
@@ -214,7 +449,6 @@ function CreateTokenDialog({
 }) {
   const [creating, setCreating] = useState(false)
   const [createdKey, setCreatedKey] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [scope, setScope] = useState<"all" | "selected">("all")
   const [checked, setChecked] = useState<Record<string, boolean>>({})
@@ -224,7 +458,6 @@ function CreateTokenDialog({
   function handleOpenChange(nextOpen: boolean) {
     if (!nextOpen) {
       setCreatedKey(null)
-      setCopied(false)
       setError(null)
       setScope("all")
       setChecked({})
@@ -234,16 +467,9 @@ function CreateTokenDialog({
     onOpenChange(nextOpen)
   }
 
-  async function handleCopy() {
-    if (!createdKey) return
-    await navigator.clipboard.writeText(createdKey)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
   // After key is created, show the "copy key" step.
   // Ignore close requests from backdrop click / Escape so the only visible
-  // copy of the token is not lost accidentally. showCloseButton=false hides the X.
+  // copy of the token is not lost accidentally.
   if (createdKey) {
     return (
       <Dialog
@@ -253,35 +479,13 @@ function CreateTokenDialog({
         }}
       >
         <DialogPopup showCloseButton={false}>
-          <DialogHeader>
-            <DialogTitle>Token created</DialogTitle>
-            <DialogDescription>
-              Copy this token now — you won't be able to see it again.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="px-6 pb-2">
-            <div className="flex gap-2">
-              <Input
-                readOnly
-                value={createdKey}
-                className="w-full mono-sm text-xs"
-                onClick={(e) => e.currentTarget.select()}
-              />
-              <Button variant="outline" size="icon" onClick={handleCopy}>
-                {copied ? <CheckIcon className="size-4" /> : <CopyIcon className="size-4" />}
-              </Button>
-            </div>
-            <p className="text-xs text-muted-foreground mt-2">
+          <NewKey title="Token created" keyValue={createdKey} onDone={() => handleOpenChange(false)}>
+            <p>
               {machine
                 ? "Store this key securely. It reads and changes this project's protected environments without a passkey."
                 : "Store this key securely. It grants access to secrets in this project."}
             </p>
-            <DialogFooter variant="bare" className="mt-4">
-              <Button variant="outline" onClick={() => handleOpenChange(false)}>
-                Done
-              </Button>
-            </DialogFooter>
-          </div>
+          </NewKey>
         </DialogPopup>
       </Dialog>
     )

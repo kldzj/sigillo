@@ -92,6 +92,11 @@ function durationText(ms: number): string {
   return `${count} ${unit}${count === 1 ? '' : 's'}`
 }
 
+// The dashboard banner about expiring tokens and rules is dismissed for a
+// day with this cookie, whose value names the earliest expiry it showed: an
+// item expiring earlier brings it back
+export const EXPIRY_BANNER_COOKIE = 'sigillo-expiry-banner-dismissed'
+
 // Who may sign up and sign in, from ALLOWED_USERS: comma-separated email
 // addresses and domains. Empty lets in anyone the provider signs in. Only
 // verified emails match; a domain matches exactly, not its subdomains.

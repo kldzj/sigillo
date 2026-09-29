@@ -1,5 +1,5 @@
-// API tokens: making, regenerating and deleting them, and stopping a
-// previous value early.
+// API tokens: making, regenerating and deleting them, stopping a previous
+// value early, and which tokens and trust rules expire soon.
 //
 // Regenerating a token keeps its row, so its id, name, scope, creator and
 // history stay, and gives it a new value and a new expiry. The value before
@@ -19,7 +19,7 @@ import {
 } from './db.ts'
 import { requireMachineTokenApproval, requireMachineTokenDeletion, requirePasskeyOnceEnrolled, requireTokenDeletion } from './step-up.ts'
 import { securityEvent } from './security-log.ts'
-import { GRACE_DAYS, MACHINE_TOKEN_MAX_DAYS, TOKEN_EXPIRY_DAYS } from './lib/utils.ts'
+import { GRACE_DAYS, MACHINE_TOKEN_MAX_DAYS, TOKEN_EXPIRY_DAYS, describeExpiry, warnWindow } from './lib/utils.ts'
 
 const DAY_MS = 86_400_000
 
@@ -205,4 +205,84 @@ export async function stopPreviousValue({ userId, sessionId, request = null, tok
       .where(orm.eq(schema.apiToken.id, token.id)),
     tokenEvent({ userId, request, kind: 'token.previous_stopped', token, details: { machine: token.protectedAccess, previousExpiresAt: token.previousExpiresAt } }),
   ])
+}
+
+// ── Expiring soon ───────────────────────────────────────────────────
+
+export type ExpiringCredential = {
+  kind: 'token' | 'machine token' | 'trust rule'
+  id: string
+  name: string
+  projectId: string
+  projectName: string
+  // Null for a token from before tokens expired
+  expiresAt: number | null
+  // "in 3 days", "never expires"
+  when: string
+}
+
+// Tokens and trust rules that expire soon (describeExpiry), for the
+// dashboard banner: in an organization where the user is an admin, all of
+// them, since admins regenerate machine tokens and renew rules; elsewhere the
+// tokens they made. Soonest first, those that never expire last.
+export async function expiringCredentials({ userId, orgs, now = Date.now() }: {
+  userId: string
+  orgs: { id: string; role: 'admin' | 'member' }[]
+  now?: number
+}): Promise<ExpiringCredential[]> {
+  const orgIds = orgs.map((org) => org.id)
+  const adminOrgIds = orgs.filter((org) => org.role === 'admin').map((org) => org.id)
+  if (orgIds.length === 0) return []
+  const db = getDb()
+  // Not expired yet, and within the longest warning window: describeExpiry
+  // below applies each one's own
+  const soon = (column: typeof schema.apiToken.expiresAt | typeof schema.trustRule.expiresAt) =>
+    orm.and(orm.gt(column, now), orm.lt(column, now + warnWindow(Infinity)))
+  const [tokens, rules] = await Promise.all([
+    db.select({
+      id: schema.apiToken.id, name: schema.apiToken.name, projectId: schema.project.id, projectName: schema.project.name,
+      expiresAt: schema.apiToken.expiresAt, createdAt: schema.apiToken.createdAt, regeneratedAt: schema.apiToken.regeneratedAt,
+      protectedAccess: schema.apiToken.protectedAccess,
+    }).from(schema.apiToken)
+      .innerJoin(schema.project, orm.eq(schema.project.id, schema.apiToken.projectId))
+      .where(orm.and(
+        orm.inArray(schema.project.orgId, orgIds),
+        orm.isNull(schema.apiToken.workload),
+        orm.or(orm.isNull(schema.apiToken.expiresAt), soon(schema.apiToken.expiresAt)),
+        orm.or(orm.inArray(schema.project.orgId, adminOrgIds), orm.eq(schema.apiToken.createdBy, userId)),
+      )),
+    adminOrgIds.length === 0 ? [] : db.select({
+      id: schema.trustRule.id, name: schema.trustRule.name, projectId: schema.project.id, projectName: schema.project.name,
+      expiresAt: schema.trustRule.expiresAt, createdAt: schema.trustRule.createdAt, renewedAt: schema.trustRule.renewedAt,
+    }).from(schema.trustRule)
+      .innerJoin(schema.project, orm.eq(schema.project.id, schema.trustRule.projectId))
+      .where(orm.and(orm.inArray(schema.project.orgId, adminOrgIds), soon(schema.trustRule.expiresAt))),
+  ])
+  const items = [
+    ...tokens.map((token) => ({
+      kind: token.protectedAccess ? 'machine token' as const : 'token' as const,
+      ...token, lifetimeStart: token.regeneratedAt ?? token.createdAt,
+    })),
+    ...rules.map((rule) => ({ kind: 'trust rule' as const, ...rule, lifetimeStart: rule.renewedAt ?? rule.createdAt })),
+  ].flatMap(({ kind, id, name, projectId, projectName, expiresAt, lifetimeStart }) => {
+    const expiry = describeExpiry({ expiresAt, lifetimeStart, now })
+    return expiry.level === 'warning' ? [{ kind, id, name, projectId, projectName, expiresAt, when: expiry.text }] : []
+  })
+  return items.sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity))
+}
+
+// The dashboard banner: up to five items, or null when there are none or
+// the banner was dismissed for the same soonest one (EXPIRY_BANNER_COOKIE)
+export async function expiryBanner({ userId, orgs, dismissed, now = Date.now() }: {
+  userId: string
+  orgs: { id: string; role: 'admin' | 'member' }[]
+  // The cookie's value
+  dismissed: string | null
+  now?: number
+}) {
+  const items = await expiringCredentials({ userId, orgs, now })
+  if (items.length === 0) return null
+  const dismissKey = String(items[0]!.expiresAt ?? 'never')
+  if (dismissed === dismissKey) return null
+  return { items: items.slice(0, 5), more: Math.max(0, items.length - 5), dismissKey }
 }

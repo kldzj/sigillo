@@ -2,31 +2,32 @@
 // Actions job or a Kubernetes pod exchange the JWT its platform issues for a
 // token of one hour (app/src/workload.ts), so no token is stored anywhere.
 // Org admins only, and every change takes their passkey. Presets fill the
-// issuer, subject and claims for GitHub and Kubernetes.
+// issuer, subject and claims for GitHub and Kubernetes. A rule is renewed in
+// place, keeping its id, after the renewal dialog has shown how it was used.
 
 "use client"
 
 import { useState } from "react"
 import type * as React from "react"
 import { useLoaderData } from "spiceflow/react"
-import { PlusIcon, TrashIcon, CopyIcon, CheckIcon, HistoryIcon, KeyRoundIcon } from "lucide-react"
+import { PlusIcon, TrashIcon, CopyIcon, CheckIcon, HistoryIcon, KeyRoundIcon, CalendarPlusIcon } from "lucide-react"
 import { Button } from "sigillo-app/src/components/ui/button"
 import { Badge } from "sigillo-app/src/components/ui/badge"
 import { Frame } from "sigillo-app/src/components/ui/frame"
 import { Input, Textarea } from "sigillo-app/src/components/ui/input"
 import {
   Dialog, DialogPopup, DialogHeader, DialogTitle,
-  DialogDescription, DialogFooter, DialogClose,
+  DialogDescription, DialogFooter, DialogClose, DialogPanel,
 } from "sigillo-app/src/components/ui/dialog"
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "sigillo-app/src/components/ui/table"
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago"
-import { cn, DOCS_URL, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatIp } from "sigillo-app/src/lib/utils"
-import { createTrustRuleAction, deleteTrustRuleAction, replaceTrustRuleKeysAction } from "../actions.ts"
+import { cn, DOCS_URL, GITHUB_ISSUER, TOKEN_EXPIRY_DAYS, MACHINE_TOKEN_MAX_DAYS, formatIp } from "sigillo-app/src/lib/utils"
+import { createTrustRuleAction, deleteTrustRuleAction, renewTrustRuleAction, replaceTrustRuleKeysAction, trustRuleEvidenceAction } from "../actions.ts"
 import { withStepUp } from "./step-up.ts"
+import { ExpiryBadge, utcDate } from "./expiry.tsx"
 
-const GITHUB_ISSUER = "https://token.actions.githubusercontent.com"
 const CLUSTER_ISSUER = "https://kubernetes.default.svc.cluster.local"
 
 type Rule = ReturnType<typeof useRules>[number]
@@ -69,21 +70,32 @@ function RulesTable({ rules }: { rules: Rule[] }) {
   const { environments } = useLoaderData("/dash/projects/:projectId/machines")
   const [history, setHistory] = useState<Rule | null>(null)
   const [keysFor, setKeysFor] = useState<Rule | null>(null)
+  const [renewing, setRenewing] = useState<Renewal | null>(null)
+  // The renewal dialog opens at once, and shows the rule's use once looked up
+  async function renew(rule: Rule) {
+    setRenewing({ rule, evidence: null, error: null })
+    try {
+      const evidence = await trustRuleEvidenceAction({ ruleId: rule.id })
+      setRenewing((current) => current && current.rule.id === rule.id ? { ...current, evidence } : current)
+    } catch (e: any) {
+      setRenewing((current) => current && current.rule.id === rule.id ? { ...current, error: e?.message || "Failed to look up how it was used" } : current)
+    }
+  }
   const [copied, setCopied] = useState<string | null>(null)
   const scope = (rule: Rule) => rule.environmentIds.length === 0
     ? "All environments"
     : rule.environmentIds.map((id) => environments.find((env) => env.id === id)?.name ?? "Deleted").join(", ")
   return (
     <Frame className="w-full">
-      <Table className="table-fixed">
+      <Table className="table-fixed min-w-3xl">
         <colgroup>
+          <col className="w-1/5" />
           <col className="w-1/6" />
           <col className="w-1/5" />
-          <col className="w-1/4" />
-          <col className="w-1/6" />
-          <col className="w-24" />
-          <col className="w-24" />
+          <col className="w-1/8" />
           <col className="w-28" />
+          <col className="w-24" />
+          <col className="w-32" />
         </colgroup>
         <TableHeader>
           <TableRow className="hover:bg-transparent">
@@ -101,7 +113,7 @@ function RulesTable({ rules }: { rules: Rule[] }) {
             <TableRow key={rule.id}>
               <TableCell>
                 <span className="flex items-center gap-2 text-sm font-medium">
-                  <span className="truncate" title={`Made by ${rule.createdBy}`}>{rule.name}</span>
+                  <span className="truncate" title={ruleTitle(rule)}>{rule.name}</span>
                   {rule.protectedAccess && (
                     <Badge variant="secondary" title="Its tokens read and change protected environments">Protected</Badge>
                   )}
@@ -122,9 +134,7 @@ function RulesTable({ rules }: { rules: Rule[] }) {
                 <span className="text-sm text-muted-foreground">{scope(rule)}</span>
               </TableCell>
               <TableCell>
-                {rule.expiresAt <= Date.now()
-                  ? <span className="text-destructive text-xs">Expired</span>
-                  : <TimeAgo ts={rule.expiresAt} className="text-muted-foreground text-xs tabular-nums" />}
+                <ExpiryBadge expiresAt={rule.expiresAt} expiry={rule.expiry} />
               </TableCell>
               <TableCell>
                 {rule.lastUsedAt === null
@@ -146,6 +156,9 @@ function RulesTable({ rules }: { rules: Rule[] }) {
                   </button>
                   <button onClick={() => setHistory(rule)} className="text-muted-foreground hover:text-foreground cursor-pointer" title="Recent tokens">
                     <HistoryIcon className="size-3.5" />
+                  </button>
+                  <button onClick={() => renew(rule)} className="text-muted-foreground hover:text-foreground cursor-pointer" title="Renew: a new expiry for the same rule">
+                    <CalendarPlusIcon className="size-3.5" />
                   </button>
                   {!rule.discovered && (
                     <button onClick={() => setKeysFor(rule)} className="text-muted-foreground hover:text-foreground cursor-pointer" title="Paste new keys">
@@ -174,7 +187,170 @@ function RulesTable({ rules }: { rules: Rule[] }) {
       </Table>
       <HistoryDialog rule={history} onClose={() => setHistory(null)} />
       <KeysDialog rule={keysFor} onClose={() => setKeysFor(null)} />
+      <RenewDialog renewal={renewing} onClose={() => setRenewing(null)} />
     </Frame>
+  )
+}
+
+// Its owner, whose access its tokens act with, and its renewals
+function ruleTitle(rule: Rule) {
+  const renewed = rule.renewedAt === null ? "" : `, renewed ${rule.renewals === 1 ? "once" : `${rule.renewals} times`}, last ${utcDate(rule.renewedAt)}`
+  return `Owned by ${rule.createdBy}, made ${utcDate(rule.createdAt)}${renewed}`
+}
+
+type Evidence = Awaited<ReturnType<typeof trustRuleEvidenceAction>>
+type Renewal = { rule: Rule; evidence: Evidence | null; error: string | null }
+
+// A rule is renewed from what it did, not from memory: first how it was
+// used and by which workloads, and what looks stale, then its new expiry.
+// Renewing keeps its ID, so nothing that uses it changes, and makes it the
+// renewing admin's.
+function RenewDialog({ renewal, onClose }: { renewal: Renewal | null; onClose: () => void }) {
+  const { environments } = useLoaderData("/dash/projects/:projectId/machines")
+  const [expiresInDays, setExpiresInDays] = useState<number | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const rule = renewal?.rule
+  const evidence = renewal?.evidence
+  const maxDays = rule?.protectedAccess ? MACHINE_TOKEN_MAX_DAYS : Infinity
+  // Its lifetime so far, as far as it may have it
+  const days = expiresInDays ?? TOKEN_EXPIRY_DAYS.filter((option) => option <= maxDays)
+    .reduce((best, option) => Math.abs(option - (rule?.lifetimeDays ?? 0)) < Math.abs(best - (rule?.lifetimeDays ?? 0)) ? option : best)
+
+  function close() {
+    setExpiresInDays(null)
+    setError(null)
+    onClose()
+  }
+
+  const scope = !rule ? "" : rule.environmentIds.length === 0
+    ? "All environments"
+    : rule.environmentIds.map((id) => environments.find((env) => env.id === id)?.name ?? "Deleted").join(", ")
+  const facts: Array<[string, React.ReactNode]> = !rule ? [] : [
+    ["Issuer", <>
+      {rule.issuer}
+      <span className="block text-muted-foreground">
+        {rule.discovered
+          ? <>Keys from its discovery document{evidence?.keys.fetchedAt ? <>, last fetched <TimeAgo ts={evidence.keys.fetchedAt} /></> : null}; fetched again on renewal</>
+          : `Pasted keys${rule.keyIds.length ? `: ${rule.keyIds.join(", ")}` : ""}`}
+      </span>
+    </>],
+    ["Audience", rule.audience],
+    ["Subject", rule.subject],
+    ...Object.entries(rule.claims).map(([name, value]): [string, React.ReactNode] => [name, String(value)]),
+    ["Environments", `${scope}${rule.protectedAccess ? ", protected ones too" : ""}`],
+    ["Owner", <>
+      {rule.createdBy}
+      <span className="block text-muted-foreground">
+        made <TimeAgo ts={rule.createdAt} />
+        {rule.renewedAt !== null && <>, renewed {rule.renewals === 1 ? "once" : `${rule.renewals} times`}, last <TimeAgo ts={rule.renewedAt} /></>}
+      </span>
+    </>],
+  ]
+
+  return (
+    <Dialog open={renewal !== null} onOpenChange={(open) => { if (!open) close() }}>
+      <DialogPopup className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="break-words">Renew {rule?.name}</DialogTitle>
+          <DialogDescription>
+            Check that it still names the right workload. Renewing keeps its ID, so nothing that uses it changes, and makes the rule
+            yours: its tokens act for you from then on.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogPanel className="flex flex-col gap-4 text-sm">
+          <dl className="grid gap-x-4 gap-y-2 sm:grid-cols-2">
+            {facts.map(([label, value]) => (
+              <div key={label} className="min-w-0">
+                <dt className="text-xs text-muted-foreground wrap-anywhere">{label}</dt>
+                <dd className="wrap-anywhere">{value}</dd>
+              </div>
+            ))}
+          </dl>
+
+          {renewal?.error && <p className="text-destructive">{renewal.error}</p>}
+          {!evidence && !renewal?.error && <p className="text-muted-foreground">Looking up how it was used…</p>}
+          {evidence && <>
+            {evidence.warnings.length > 0 && (
+              <ul className="flex flex-col gap-1 rounded-md bg-(--warning)/8 px-3 py-2 text-(--warning-foreground)">
+                {evidence.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+              </ul>
+            )}
+            <div className="flex flex-col gap-1.5">
+              <p className="font-medium">Use</p>
+              <p className="text-muted-foreground">
+                {evidence.exchanges.total === 0
+                  ? "No workload has got a token under it."
+                  : `${evidence.exchanges.lastMonth} ${evidence.exchanges.lastMonth === 1 ? "token" : "tokens"} in the last 30 days, ${evidence.exchanges.total} in all.`}
+              </p>
+              {evidence.exchanges.last.map((token) => (
+                <div key={token.id} className="flex items-baseline justify-between gap-3">
+                  <span className="min-w-0 truncate" title={token.name}>{token.name}</span>
+                  <span className="flex shrink-0 items-baseline gap-2 text-xs text-muted-foreground">
+                    <TimeAgo ts={token.createdAt} className="tabular-nums" />
+                    {token.ipAddress && <span className="mono-sm">{formatIp(token.ipAddress)}</span>}
+                  </span>
+                </div>
+              ))}
+            </div>
+            {evidence.seen.length > 0 && (
+              <div className="flex flex-col gap-1">
+                <p className="font-medium">Seen in its last {Math.min(evidence.exchanges.total, 100)} tokens</p>
+                {evidence.seen.map((seen) => (
+                  <p key={seen.label} className="break-words">
+                    <span className="text-muted-foreground">{seen.label}: </span>
+                    {seen.values.slice(0, 10).join(", ")}
+                    {seen.values.length > 10 && `, and ${seen.values.length - 10} more`}
+                  </p>
+                ))}
+              </div>
+            )}
+          </>}
+
+          <div>
+            <p className="font-medium mb-2">Expires in</p>
+            <div className="grid grid-cols-4 gap-1.5">
+              {TOKEN_EXPIRY_DAYS.map((option) => (
+                <label
+                  key={option}
+                  className={cn(
+                    "flex items-center justify-center gap-2 rounded-md px-2 py-2 cursor-pointer transition-colors text-sm font-medium whitespace-nowrap",
+                    days === option ? "bg-primary/5" : "hover:bg-muted/50",
+                    option > maxDays && "opacity-50 cursor-not-allowed",
+                  )}
+                >
+                  <input type="radio" name="renew-expiry" checked={days === option} disabled={option > maxDays} onChange={() => setExpiresInDays(option)} className="accent-primary" />
+                  {option === 365 ? "1 year" : `${option} days`}
+                </label>
+              ))}
+            </div>
+            {rule?.protectedAccess && <p className="text-xs text-muted-foreground mt-2">A rule for protected environments expires after {MACHINE_TOKEN_MAX_DAYS} days at most.</p>}
+          </div>
+          {error && <p className="text-destructive">{error}</p>}
+        </DialogPanel>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+          <Button
+            disabled={saving || !evidence}
+            onClick={async () => {
+              if (!rule) return
+              setSaving(true)
+              setError(null)
+              try {
+                const renewed = await withStepUp(() => renewTrustRuleAction({ ruleId: rule.id, expiresInDays: days }))
+                if (renewed) close()
+              } catch (e: any) {
+                setError(e?.message || "Failed to renew the trust rule")
+              } finally {
+                setSaving(false)
+              }
+            }}
+          >
+            Renew
+          </Button>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
   )
 }
 
@@ -507,7 +683,7 @@ function CreateRuleDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
             </span>
           </label>
           {githubWithoutEnvironment && (
-            <p className="text-xs text-warning">
+            <p className="text-xs text-(--warning-foreground)">
               Without a GitHub environment, anyone who can push to the branch reads these environments. Name an environment with required reviewers.
             </p>
           )}

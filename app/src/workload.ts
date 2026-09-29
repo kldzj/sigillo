@@ -511,7 +511,7 @@ function identitiesSeen(rule: Rule, claims: Record<string, unknown>[]): Array<{ 
   if (claims.some((c) => c['kubernetes.io'])) {
     const pod = (c: Record<string, unknown>) => claimAt(c, '/kubernetes.io/pod/name')
     return found([
-      distinct('pods', (c) => typeof pod(c) === 'string' ? (pod(c) as string).replace(/(-[a-z0-9]{6,10})?-[a-z0-9]{5}$/, '') : undefined),
+      distinct('pods', (c) => typeof pod(c) === 'string' ? (pod(c) as string).replace(/(-[a-z0-9]{5,10})?-[a-z0-9]{5}$/, '') : undefined),
       distinct('nodes', (c) => claimAt(c, '/kubernetes.io/node/name')),
     ])
   }

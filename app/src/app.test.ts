@@ -26,7 +26,7 @@ import { createSoftAuthenticator } from './soft-authenticator.js'
 import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest, approvalOptions, approveStepUpRequest, createStepUpRequest, requireMachineTokenApproval, requireMachineTokenDeletion, requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, resetMemberPasskeys, requestEnrollment, approveEnrollment, passkeyApproverOrgs, requirePasskeyOnceEnrolled, canAddPasskey, claimPasskeyAddition, pendingEnrollments, requireTokenDeletion } from './step-up.js'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { createTrustRule, deleteTrustRule, renewTrustRule, replaceTrustRuleKeys, trustRuleEvidence, type TrustRuleInput } from './workload.js'
-import { createToken, deleteToken, regenerateToken, stopPreviousValue } from './tokens.js'
+import { createToken, deleteToken, expiringCredentials, expiryBanner, regenerateToken, stopPreviousValue } from './tokens.js'
 import * as jose from 'jose'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode, describeExpiry, GITHUB_ISSUER } from './lib/utils.js'
 
@@ -4436,7 +4436,8 @@ describe('workload identity', () => {
 
 // ── Renewals ────────────────────────────────────────────────────────
 // Tokens regenerated and trust rules renewed in place (tokens.ts,
-// workload.ts), the API's expiry headers and the security log
+// workload.ts), the API's expiry headers, the dashboard banner's data and
+// the security log
 
 describe('renewals', () => {
   const ISSUER = 'https://issuer.test'
@@ -4864,6 +4865,53 @@ describe('renewals', () => {
     }).toEqual({
       exchange: { ruleId: id, ruleExpiresAt: expiresAt, keys: ['environmentIds', 'expiresAt', 'projectId', 'ruleExpiresAt', 'ruleId', 'token'], warning: null },
       oidc: ['expires_at', 'success', 'token'],
+    })
+  })
+
+  test('the dashboard banner shows admins what expires in their organization, members the tokens they made', async () => {
+    const bannerAdmin = await createTestUser({ name: 'Banner Admin' })
+    const bannerMember = await createTestUser({ name: 'Banner Member' })
+    const af = authedFetch(bannerAdmin.token)
+    const bannerOrg = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Banner Org' } })).id
+    const bannerProject = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Banner', orgId: bannerOrg } })).id
+    await getDb().insert(schema.orgMember).values({ orgId: bannerOrg, userId: bannerMember.user.id, role: 'member' })
+    const now = Date.now()
+    const insert = async (name: string, createdBy: string, createdAt: number, expiresAt: number | undefined, workload?: boolean) => {
+      const { tokenId } = await insertApiToken({ name, projectId: bannerProject, createdBy, expiresAt })
+      await getDb().update(schema.apiToken).set({ createdAt, ...(workload ? { workload: { kid: null, claims: {} } } : {}) }).where(orm.eq(schema.apiToken.id, tokenId))
+    }
+    await insert('Member CI', bannerMember.user.id, now - 87 * DAY, now + 3 * DAY)
+    await insert('Not yet', bannerAdmin.user.id, now - 30 * DAY, now + 60 * DAY)
+    await insert('Old laptop', bannerAdmin.user.id, now - 400 * DAY, undefined)
+    await insert('Gone', bannerAdmin.user.id, now - 90 * DAY, now - DAY)
+    await insert('Workload', bannerAdmin.user.id, now - 30 * 60_000, now + 30 * 60_000, true)
+    await getDb().insert(schema.trustRule).values({
+      projectId: bannerProject, name: 'k3s pods', issuer: ISSUER, jwks: { keys: [] }, audience: AUDIENCE, subject: 'pods', claims: {}, environmentIds: [],
+      createdBy: bannerAdmin.user.id, createdAt: now - 28 * DAY, expiresAt: now + 2 * DAY,
+    })
+    const orgs = (role: 'admin' | 'member') => [{ id: bannerOrg, role }]
+    const list = async (userId: string, role: 'admin' | 'member') => (await expiringCredentials({ userId, orgs: orgs(role), now }))
+      .map(({ kind, name, projectName, when }) => `${kind} ${name} (${projectName}, ${when})`)
+    const banner = (dismissed: string | null) => expiryBanner({ userId: bannerAdmin.user.id, orgs: orgs('admin'), dismissed, now })
+    const admin = await list(bannerAdmin.user.id, 'admin')
+    const member = await list(bannerMember.user.id, 'member')
+    const shown = (await banner(null))!
+    const dismissedForIt = await banner(shown.dismissKey)
+    // Something expiring sooner brings it back
+    await insert('Sooner', bannerAdmin.user.id, now - 89 * DAY, now + DAY)
+    const afterSooner = await banner(shown.dismissKey)
+    expect({
+      admin,
+      member,
+      shown: { count: shown.items.length, more: shown.more, dismissKey: shown.dismissKey },
+      dismissedForIt,
+      afterSooner: afterSooner?.items.map((item) => item.name),
+    }).toEqual({
+      admin: ['trust rule k3s pods (Banner, in 2 days)', 'token Member CI (Banner, in 3 days)', 'token Old laptop (Banner, never expires)'],
+      member: ['token Member CI (Banner, in 3 days)'],
+      shown: { count: 3, more: 0, dismissKey: String(now + 2 * DAY) },
+      dismissedForIt: null,
+      afterSooner: ['Sooner', 'k3s pods', 'Member CI', 'Old laptop'],
     })
   })
 
