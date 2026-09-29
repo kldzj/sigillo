@@ -1,5 +1,7 @@
 // Page-width hero with an ASCII VideoBackgroundShader, serif title, and two
-// CTAs: self-hosting and the GitHub repo.
+// CTAs: self-hosting and the GitHub repo. The shader follows the cursor on
+// its own container, underneath the text, so the text lets the cursor through
+// and only the buttons take it.
 'use client'
 
 import { useEffect, useState } from 'react'
@@ -38,7 +40,7 @@ export function HeroSection() {
       />
 
       <div
-        className='relative z-[2] flex flex-col items-center justify-center text-center max-w-[820px] w-full px-5 pt-16 sm:pt-24 pb-20 lg:pb-[160px] gap-6'
+        className='relative z-[2] flex flex-col items-center justify-center text-center max-w-[820px] w-full px-5 pt-16 sm:pt-24 pb-20 lg:pb-[160px] gap-6 pointer-events-none'
         style={{
           opacity: fontsReady ? 1 : 0,
           transition: 'opacity 0.3s cubic-bezier(0.23, 1, 0.32, 1)',
@@ -52,7 +54,7 @@ export function HeroSection() {
           <span>open source Doppler alternative</span>
         </h1>
 
-        <div className='flex gap-3 flex-wrap justify-center'>
+        <div className='flex gap-3 flex-wrap justify-center pointer-events-auto'>
           <a href='/docs/self-hosting' className={buttonVariants({ size: 'lg', className: 'no-underline gap-2.5' })}>
             <Server className='size-[16px]' />
             Self-host Sigillo
