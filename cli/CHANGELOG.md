@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.17.0
+
+### Minor Changes
+
+- 09d3f5a: `npx @kldzj/sigillo self-host --backup` saves both databases of an instance in one file, encrypted with age to a backup key kept in `~/.sigillo/selfhost.json`. Sessions and sign-in codes are left out, and no encryption key goes in the file. `--restore <file>` imports a backup into new databases, checks every row of their history, and only then switches both workers to them. The databases from before stay on the account. A key rotation replaces the backup key, since older backups need the retired key.
+- 8c79bf0: Tokens and trust rules are renewed in place, and warn before they expire:
+
+  - **Regenerate a token** on a project's **Machines** tab: a new value and a new expiry for the same token, so its name, scope and history stay. Its creator or an org admin does it, with a passkey once they have one; a machine token takes an org admin with their passkey and lasts 90 days at most. The previous value keeps working for 0, 1 or 7 days, never past its own expiry, and the tab shows until when and whether it is still used, with a **Stop** link to end it early. A token that never expired gets an expiry this way.
+  - **Renew a trust rule** on the same tab: a new expiry for the same rule, so External Secrets Operator and CI keep its ID. The renewal dialog first shows how the rule was used, which workloads got its tokens, and what looks stale. The admin who renews it owns it from then on, an expired rule can be renewed too, and keys from its issuer are fetched again.
+  - **Warnings** start when a quarter of a token's or rule's lifetime is left, 14 days at most: an Expires badge on the Machines tab, a banner on every dashboard page (dismissed for a day), and on API answers the headers `Sigillo-Token-Expires` and `Sigillo-Warning`. `sigillo` prints that warning once per command, on stderr, so it shows in CI logs without touching a download:
+
+    ```
+    warning: this API token expires on 2026-10-13 (in 3 days). Regenerate it on the project's Machines tab; the old value then keeps working for up to 7 days.
+    ```
+
+  - The workload token exchange answers with its rule's `ruleId` and `ruleExpiresAt` too.
+  - Token names can't contain control characters, like other names.
+  - Each change to tokens, trust rules, protection, members and passkeys is written to a security log in the same database batch, for notifications in a later release.
+
+- 1aeca5c: `npx @kldzj/sigillo self-host --rotate-key` gives an instance a new encryption key. It re-encrypts every stored value with it on your machine, through the D1 API, and then removes the old key from the worker and `~/.sigillo/selfhost.json`. Stopped halfway, the next run finishes the same rotation. Deploys keep the key ring in `selfhost.json`, and a recreated worker gets it back.
+- 54af465: Workload identity: GitHub Actions jobs and Kubernetes pods read secrets without a stored token. An org admin adds a trust rule on a project's **Machines** tab, with their passkey: the issuer, the audience, the exact subject and claims, and the environments it grants. A workload exchanges the JWT its platform issues at `POST /api/v0/workload/token` for a token of one hour. `sigillo` does that on its own when no token is set, from `SIGILLO_OIDC_TOKEN_FILE`, `SIGILLO_OIDC_TOKEN` or GitHub Actions' ID token, with the project named by its ID. External Secrets Operator's Doppler provider works against Sigillo too, with its controller's `DOPPLER_BASE_URL` set to the instance. Rules for protected environments follow the rules of machine tokens, and the read log names the job or pod behind each read.
+
+### Patch Changes
+
+- bf57037: Stricter history checks and safer self-hosting:
+
+  - A value removed from the database without a purge now breaks the history: `sigillo audit verify` and a restore report it, and the **History** tab shows it as "value removed without a purge". Before, a value erased with its digest kept looked like a purged one.
+  - Exporting a protected environment's history, as `sigillo audit verify` does, takes a passkey approval and shows in its read log, since the export shows whether a value was set back to an earlier one.
+  - Environment pages no longer tell someone who can't open the project the slug of its first environment.
+  - The Worker refuses an `ENCRYPTION_KEY` that isn't 32 bytes. Keys made by `self-host` always are; a shorter key set by hand in the dashboard stops the instance until it is replaced.
+  - `self-host --rotate-key` gives the Worker its key ring again when it finishes an unfinished rotation, and the check before recreating a worker tries a value under every key in use.
+  - `self-host --restore` needs `--yes` without a terminal, says exactly what it checked, compares the history with what `sigillo audit verify` saw on your machine, and stays unfinished until both workers use the restored databases: `--backup`, `--rotate-key` and `--reset-passkeys` wait for it. Backups no longer hold sign-in ID tokens, and `self-host` no longer drops the backup key when it updates a deployment.
+
+- a777b71: `sigillo run` exits with `128 + N` when its command is killed by signal N. Before, a command stopped by `SIGTERM` or Ctrl+C made sigillo exit `1`, so Docker, turbo and make reported a failure. Now it exits `143` for `SIGTERM` and `130` for Ctrl+C.
+- 53657f3: Safer worker recreation in `self-host`, and two dashboard fixes.
+
+  - When `self-host` creates a new worker for a database that already stores secrets, it now checks that the keys decrypt a stored value first, with the key ring after a rotation. Before, a hand-added `ENCRYPTION_KEY` missing from `~/.sigillo/selfhost.json` made every stored secret unreadable. If you set your own key, pass it again to recover:
+
+    ```bash
+    SIGILLO_ENCRYPTION_KEY='<original key>' npx @kldzj/sigillo self-host
+    ```
+
+  - The **Manage access** dialog could open with **Full access** checked for a restricted member, so saving without changes removed the restriction.
+  - The device login page returns to code entry when Approve or Deny fails, so you can enter the new code.
+
+- e5eba03: The docs no longer promise that Sigillo fits Cloudflare's free plan without a hitch: a dashboard page often takes 10 to 40 ms of CPU, more than the free plan's 10 ms, so on the free plan a page fails now and then with error 1102. Workers Paid, $5 a month, avoids that. `self-host` says so at the end of a new deployment.
+
 ## 0.16.0
 
 ### Minor Changes
@@ -35,6 +82,7 @@
   - `sigillo run` matches the names it skips in any case, as Windows does, so a secret named `node_options` or `Path` is skipped too. It also skips `PS4`, pagers and editors such as `GIT_PAGER` and `EDITOR`, `GIT_EXTERNAL_DIFF`, `LESSOPEN`, every `npm_config_*` setting, package sources such as `PIP_INDEX_URL`, `GOPROXY` or `YARN_NPM_REGISTRY_SERVER`, and `NODE_TLS_REJECT_UNAUTHORIZED`. No such list is complete: it catches the names known to change how programs run.
   - `sigillo login` says which account it logged in as, and how to log out if that isn't you: whoever enters a login code first approves it.
   - Error messages and names from the server print without terminal control characters, including the project name `sigillo setup` saves.
+
 - 0267b89: `self-host` tells the login provider your instance's URL, so its error page links back to your login, and asks about a custom domain before uploading. It stops when the bundle digest file in the package is there but damaged.
 - 40f217a: The **Sessions** page no longer fails for logins older than a day. better-auth 1.7.6 only lists sessions for a login from the last day, so the page now asks you to sign in again and brings you back to it. **End all other sessions** works right away, without signing in again. Run `npx @kldzj/sigillo self-host` to update your instance.
 - 20f6b6a: Security fixes and tighter defaults:
@@ -54,6 +102,7 @@
   - `sigillo login` no longer replaces the server saved for a scope with one that came from `SIGILLO_API_URL` (which a repository's `.envrc` can set): that takes `--api-url`. Saving makes `~/.sigillo/config.json` readable only by you, also when an older copy wasn't.
   - `sigillo login` opens only a plain web address from the server, and on Windows no longer through `cmd.exe`. Names and codes from the server print without terminal control characters.
   - `sigillo audit verify` remembers what it saw by the project and environment you asked for, not by the id the server answers with.
+
 - be49508: Deleting something that can't come back now takes its name, typed out:
 
   - **An organization's settings** moved out of the project tabs into the sidebar, under **Organization settings**: auto-join, leaving it and deleting it. The project's **Settings** tab now renames or deletes that project.
