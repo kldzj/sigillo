@@ -1,0 +1,43 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'The signed history'
+sidebarTitle: 'The signed history'
+description: 'Every secret change, and every read of a protected environment, recorded in hash chains your instance signs, and checked with sigillo audit verify.'
+icon: lucide:scroll-text
+---
+
+Sigillo records every change of a secret, and every read of a value in a [protected environment](./protected-environments.mdx). Each environment's changes and reads form hash chains, and the Worker signs every row. Once `sigillo audit verify` has seen a row, editing, removing or reordering it in the database shows up there.
+
+## What you can see
+
+- The **Event Log** tab lists an environment's changes: the secret, set or delete, when, and who, a person, a token or a workload. See [history and old values](./secrets.mdx#history-and-old-values).
+- The **Read Log** tab, for org admins, lists the reads of a protected environment: when, who, how (listed, read a value, downloaded, read an old value, copied), which secrets, and from which IP address. Protection being turned on and off is recorded there too. It shows the newest 500 rows.
+
+A read is recorded before its values leave the server, and a read that can't be recorded fails.
+
+## Check it
+
+As an org admin, signed in with `sigillo login` (API tokens can't):
+
+```bash
+sigillo audit verify -c prod
+```
+
+```
+✔ changes: 42 rows, intact
+✔ reads: 7 rows, intact
+```
+
+The CLI keeps the newest row of each chain in `~/.sigillo/audit.json`, so the next check also notices rows removed or rewritten since. Run it regularly, from more than one admin's machine: each one is a witness the database can't change.
+
+## What it can't catch
+
+The signing key comes from `BETTER_AUTH_SECRET`, so someone who can deploy code to the Worker, or who has `selfhost.json` and its passphrase, can sign new rows or stop writing them. And the chain only vouches for rows a check has already seen: someone who can edit the database can give an account of theirs access, read a protected environment through the Worker, and delete the newest rows of its read log before the next check. The more often you check, the shorter that window.
+
+Changes from before the history existed join it on their environment's next change, and `audit verify` counts them: the server signed them as it found them in the database. The history makes tampering by a database writer visible; it doesn't replace a [dedicated Cloudflare account](./hardening.mdx#1-give-sigillo-its-own-cloudflare-account) and a [protected deploy file](./updating.mdx#your-deploy-file).
+
+## Old values, restores and rotations
+
+- [Purging old values](./secrets.mdx#history-and-old-values) removes them for good, and the history still verifies: each purged row keeps the digest it was signed with.
+- After going back to an earlier state, with a [backup or time travel](./backups.mdx), an `audit verify` that saw newer rows reports the history as shorter.
+- [Rotating the encryption key](./rotate-key.mdx) re-encrypts values without breaking the history. Changing `BETTER_AUTH_SECRET` changes the signing key: older rows then no longer verify, and `audit verify` reports the new key.

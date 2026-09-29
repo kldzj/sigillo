@@ -55,7 +55,7 @@
           {
             "group": "Security",
             "icon": "lucide:shield-check",
-            "pages": ["docs/hardening"]
+            "pages": ["docs/security", "docs/protected-environments", "docs/history", "docs/hardening", "docs/offboarding"]
           },
           {
             "group": "Run your instance",

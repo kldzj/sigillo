@@ -1,0 +1,84 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Protected environments and passkeys'
+sidebarTitle: 'Protected environments and passkeys'
+description: 'Make reading or changing production take a passkey, in the browser and from the CLI, record every read, and manage the passkeys of your organization.'
+icon: lucide:lock-keyhole
+---
+
+A protected environment doesn't trust a session on its own. Reading or changing its values takes a passkey, so someone who copied a browser cookie or a CLI login from a laptop can neither read it nor swap a value, such as a signing key or a webhook URL, for one of their own.
+
+## Protect an environment
+
+On the project's **Environments** tab, an org admin sets **Protected** to **On**. From then on:
+
+- Reading or changing its values takes a passkey approval, in the browser or from the CLI.
+- Every read is recorded before the values leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see them on the **Read Log** tab: see [the signed history](./history.mdx).
+- API tokens stop working for it: only [machine tokens and workload identity](./ci.mdx) reach it.
+- Deleting or renaming it, or the project it belongs to, is up to an org admin with their passkey, so nobody else can move it aside and let an unprotected one take over its slug or name, or delete it along with its read log.
+
+Turning protection off takes a passkey as well, and is recorded too. Protection covers the values: which secrets an environment has is visible to everyone who can open it.
+
+## Approve in the browser
+
+Revealing, copying, downloading, saving or deleting a value asks for your passkey on the spot.
+
+## Approve from the CLI
+
+`sigillo run`, `secrets set` and the other commands that read or change values print a link and a code, and wait:
+
+```
+$ sigillo run -c prod -- ./deploy.sh
+This environment is protected: approve with your passkey.
+  Open https://secrets.acme.com/approve and enter BCDF-GHJK
+Waiting for your approval...
+✔ Approved for 15 minutes
+```
+
+Open `/approve` on your instance, type the code your terminal shows, and approve with your passkey. The CLI then continues. The page shows which environments the request is for, and the device, IP address and country it came from. The code is typed, never part of the link, so a link someone sends you approves nothing. A passkey on your phone works through the browser's own **Use a phone or tablet** option, which shows a QR code.
+
+## What an approval covers
+
+An approval lets that one browser or CLI login read and change those environments for 15 minutes. Other logins of the same person still have to ask.
+
+## Logins and tokens
+
+Once you have a passkey, approving a CLI login on `/device` and creating an API token take it too. Both keep working after the session that made them ends, so a stolen browser session could otherwise turn itself into one. The `/device` page takes the code typed from your terminal, never from the link, like `/approve`.
+
+## Admin actions
+
+Once an organization has a protected environment, every admin action in it takes a passkey as well: inviting someone, changing a role or a member's projects, removing a member, auto-join, an environment's **Min Role** or protection, deleting or renaming a protected environment or its project, resetting passkeys, making or deleting a machine token, and deleting the organization. Otherwise someone with an admin's session could invite an account of their own, or open production to one. One approval covers admin actions for 5 minutes. Organizations without a protected environment work as before.
+
+Some actions take the admin's passkey in every organization: making a machine token, changing [trust rules](./workload-identity.mdx), and [purging old values](./secrets.mdx#history-and-old-values).
+
+## Passkeys
+
+### Add yours
+
+Everyone adds theirs under **user menu → Passkeys**: a laptop's fingerprint reader, a phone, or a security key. Add two, so losing one doesn't lock you out. The first passkey takes a Google sign-in from the last 5 minutes, in that browser; a CLI login doesn't count, since any session can approve one.
+
+### A member's first passkey
+
+Once your organization has an admin with a passkey, an admin also approves each member's first passkey on a project's **Access** tab, where they see the device and IP address it comes from; nobody approves their own. A member of several organizations with protected environments needs an approval from an admin of each, since a passkey works in all of them.
+
+Leaving doesn't get around that: someone who left an organization or was removed still needs its approval for a first passkey, and its admins see the request marked as from someone who left. An invite link made before they left doesn't bring them back, and neither does auto-join. So someone who got into a member's Google account still can't add a passkey unnoticed.
+
+### More passkeys, and removing one
+
+Adding or removing one after that takes an approval with a passkey you already have: in the same browser, or, for a new device such as your phone, with a code you type on `/approve` on a device that has one, like approving the CLI. Asking for that code also takes a fresh Google sign-in. Someone who only has your session can't swap in their own.
+
+### Reset a member's passkeys
+
+On a project's **Access** tab, org admins see how many passkeys each member has and every passkey added or removed. **Reset** removes a member's passkeys, for someone who lost theirs, and signs them out everywhere; they add new ones after signing in again. Passkeys belong to the person, so only an admin of every organization they're in can reset them.
+
+### Lost every passkey
+
+If you are the only admin and lost every passkey, remove them from the machine that deployed Sigillo:
+
+```bash
+npx @kldzj/sigillo self-host --reset-passkeys you@acme.com
+```
+
+## Machines
+
+CI and servers can't use a passkey. A [machine token](./ci.mdx#machine-tokens) or a [trust rule](./workload-identity.mdx) made by an org admin, with their passkey, reads and changes protected environments for them, for 90 days at most.

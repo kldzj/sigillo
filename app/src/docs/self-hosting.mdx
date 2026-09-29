@@ -110,7 +110,7 @@ CLOUDFLARE_API_TOKEN=xxx SIGILLO_SELFHOST_PASSPHRASE=xxx npx @kldzj/sigillo self
 | `--release-url <url>` | Download this version's bundle from a custom URL, checked like a download |
 | `--allow-downgrade` | Deploy even if the instance runs a newer version |
 | `--change-passphrase` | Encrypt `~/.sigillo/selfhost.json` with a new passphrase, then stop. See [your deploy file](./updating.mdx#your-deploy-file) |
-| `--reset-passkeys <email>` | Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop. See [Hardening](./hardening.mdx#5-require-a-passkey-for-production) |
+| `--reset-passkeys <email>` | Remove every passkey of this user and sign them out, for a sole admin who lost theirs, then stop. See [Lost every passkey](./protected-environments.mdx#lost-every-passkey) |
 | `--rotate-key` | Give the instance a new encryption key, re-encrypt every stored value with it and retire the old key, then stop. See [Rotate the encryption key](./rotate-key.mdx) |
 | `--backup [file]` | Save an encrypted backup of both databases, then stop. See [Back up and restore](./backups.mdx) |
 | `--restore <file>` | Restore both databases from a backup into new ones, check their history and switch the workers to them |

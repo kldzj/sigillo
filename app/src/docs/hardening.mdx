@@ -1,24 +1,12 @@
 ---
 $schema: https://holocron.so/frontmatter.json
 title: 'Harden your self-hosted Sigillo'
-sidebarTitle: 'Hardening'
-description: 'Who can reach the secrets on a self-hosted Sigillo, and the steps that narrow it: the Cloudflare account, the deploy file, sign-in, access inside the app, passkeys for production, and a history you can verify.'
+sidebarTitle: 'Hardening checklist'
+description: 'The steps that narrow who can reach the secrets on a self-hosted Sigillo, most important first: the Cloudflare account, the deploy file, sign-in, access inside the app, passkeys for production, machine credentials, the history, and backups.'
 icon: lucide:shield-check
 ---
 
-Sigillo encrypts every secret, but the key lives in the Worker that decrypts them. Whoever controls **your Cloudflare account**, **your deploy file**, **who can sign in** or **an admin role** can get at the secrets. The steps below narrow each of those, most important first.
-
-## Who can reach your secrets
-
-| Who | What they can do | What limits it |
-|-----|------------------|----------------|
-| Anyone who can edit Workers on the Cloudflare account | Deploy code that reads every secret | [A dedicated account](#1-give-sigillo-its-own-cloudflare-account) |
-| Anyone who can edit the D1 databases | Make any account that can sign in an org admin, change the history | A dedicated account, [protected environments](#4-limit-access-inside-sigillo), [the signed history](#6-check-the-history) |
-| Anyone with `~/.sigillo/selfhost.json` and its passphrase | Decrypt a database export or backup and use the sessions in an export, sign history rows, and with a saved login deploy to the account | [The passphrase](#2-protect-the-deploy-file) |
-| Anyone who can sign in | What their org role and project access allow | [The sign-in allowlist](#3-decide-who-can-sign-in) |
-| A CI job or pod that a trust rule accepts | What the rule grants, with a token of one hour | [Narrow trust rules](./workload-identity.mdx) |
-| Anyone with a stolen browser session or CLI login | What that person can read and change, except protected environments, and admin actions in an org that has one | [Passkeys](#5-require-a-passkey-for-production) |
-| Org admins | Every project and environment of their org | [Few admins](#4-limit-access-inside-sigillo) |
+Sigillo encrypts every secret, but the key lives in the Worker that decrypts them. [How Sigillo protects your secrets](./security.mdx) shows who can reach them; these steps narrow each of those, most important first.
 
 ## 1. Give Sigillo its own Cloudflare account
 
@@ -30,100 +18,30 @@ Cloudflare hides a secret's value once it's set, in the dashboard and in Wrangle
 
 ## 2. Protect the deploy file
 
-`npx @kldzj/sigillo self-host` saves everything it needs to update your instance in `~/.sigillo/selfhost.json` on the machine that ran it:
-
-- `BETTER_AUTH_SECRET`, which signs every session and the history
-- `ENCRYPTION_KEY`, or the key ring of a [rotation](./rotate-key.mdx), which decrypts every secret
-- the login provider's secret and your Google OAuth client
-- the key your [backups](./backups.mdx) are encrypted to
-- the Cloudflare login, if you signed in with the browser
-
-It is the only copy outside the Workers: Cloudflare doesn't hand secrets back. The file is encrypted with a passphrase you choose on the first run, and each run asks for it once. Keep the passphrase in your password manager and a backup of the file somewhere else: without both, a lost worker means lost secrets. Runs without a terminal read the passphrase from `SIGILLO_SELFHOST_PASSPHRASE`. A file from before encryption is encrypted on the next run, if you agree.
-
-Deploy with an API token instead of the browser login, and the file holds no Cloudflare login:
-
-```bash
-CLOUDFLARE_API_TOKEN=xxx npx @kldzj/sigillo self-host
-```
-
-When you create the token under **My Profile → API Tokens**, set a **TTL** so it stops working on its own, and **Client IP Address Filtering** for the machine you deploy from. A browser login you saved before stays in the file, encrypted, and is used again unless you pass a token.
+`~/.sigillo/selfhost.json` holds the keys that decrypt every secret and sign every session. Keep its passphrase in your password manager and a backup of the file somewhere else: without both, a lost worker means lost secrets. Deploy with a Cloudflare API token that has a TTL and an IP filter rather than a saved browser login. See [your deploy file](./updating.mdx#your-deploy-file) and [deploying with an API token](./updating.mdx#deploy-with-an-api-token).
 
 ## 3. Decide who can sign in
 
-By default anyone with a Google account can create an account on your instance. Pass the addresses and domains that may sign in:
-
-```bash
-npx @kldzj/sigillo self-host --allowed-users acme.com,ops@partner.io
-```
-
-The app and its login provider both check the list, and someone taken off it is signed out on their next request. See [Who can sign in](./self-hosting.mdx#who-can-sign-in).
-
-If your team is a Google Cloud organization, through Google Workspace or Cloud Identity, create the Google OAuth client in a project that belongs to it and set its audience to **Internal** (**Google Auth Platform → Audience**). Google then only signs in members of your organization, before Sigillo's own list is checked.
-
-Everyone can see and end their own sessions under **user menu → Sessions**: every browser and CLI login, with its device, IP address and sign-in time. Seeing them takes a login from the last day; **End all other sessions** works from any login. A login ends after 7 days without use, and 30 days after its sign-in however often it's used; the CLI then asks you to run `sigillo login` again.
+By default anyone with a Google account can create an account on your instance. Limit it to your addresses and domains with the [sign-in allowlist](./self-hosting.mdx#who-can-sign-in), and, for a Google Workspace, make the OAuth client **Internal**: see [who can sign in](./access.mdx#who-can-sign-in).
 
 ## 4. Limit access inside Sigillo
 
-- **Few admins.** An org admin reaches every project and environment of the org, and manages its members.
-- **Project access.** On a project's **Access** tab, limit a member to selected projects. Invitations can be limited to projects too.
-- **Admin-only environments.** On the **Environments** tab, set **Min Role** to **Admin** for production. Members then can't open it, and an API token for it works only while its creator is still an admin.
-- **Protected environments.** On the **Environments** tab, set **Protected** to **On**. Reading or changing its values then takes a passkey, see [step 5](#5-require-a-passkey-for-production). Every read is recorded before the values leave the server, with who, when, which secrets, how and from which IP, and a read that can't be recorded fails. Org admins see the reads on the **Read Log** tab. Turning protection off takes a passkey as well, and is recorded too. Protection covers the values: which secrets an environment has is visible to everyone who can open it.
-- **API tokens.** Anyone who can open a project's environments can create tokens for them. Only a token's creator or an org admin deletes it. A token belongs to one project, optionally only some of its environments, and expires after 7, 30, 90 or 365 days. The **Tokens** tab shows when and from which IP each was last used, to the hour. Tokens made before expiry existed never expire and show **Never**: replace them. Prefer one token per machine or pipeline, scoped to the environment it needs. An API token can't read or change a protected environment; a machine token can.
+Keep org admins few: an admin reaches every project and environment of the organization. Limit members to the projects they work on, and make production [admin-only](./access.mdx#admin-only-environments). See [Teams and access](./access.mdx).
 
-The secrets page never loads values up front: a value reaches the browser when someone reveals, downloads or copies it, and in a protected environment that is what the Read Log shows.
+## 5. Protect production with passkeys
 
-## 5. Require a passkey for production
+Set **Protected** to **On** for production. Reading or changing it then takes a passkey, every read is recorded, and admin actions in the organization take a passkey too. Have everyone add two passkeys. See [protected environments and passkeys](./protected-environments.mdx).
 
-A protected environment doesn't trust a session on its own. Reading or changing its values takes a passkey, so someone who copied a browser cookie or a CLI login from a laptop can neither read it nor swap a value, such as a signing key or a webhook URL, for one of their own. Deleting or renaming a protected environment, or the project it belongs to, is up to an org admin with their passkey, so nobody else can move it aside and let an unprotected one take over its slug or name, or delete it along with its read log.
+## 6. Give machines the narrowest credential
 
-- **In the browser**, revealing, copying, downloading, saving or deleting a value asks for your passkey on the spot.
-- **In the CLI**, `sigillo run`, `secrets set` and the other commands print a link and a code. Open `/approve` on your instance, type the code your terminal shows, and approve with your passkey. The CLI then continues. The page shows which environments the request is for, and the device, IP address and country it came from. The code is typed, never part of the link, so a link someone sends you approves nothing. A passkey on your phone works through the browser's own **Use a phone or tablet** option, which shows a QR code.
+Use [workload identity](./workload-identity.mdx) for GitHub Actions and Kubernetes, so nothing is stored. Elsewhere, make one [token](./ci.mdx) per machine or pipeline, scoped to the environments it needs, and a machine token only where it must reach a protected environment.
 
-An approval lets that one browser or CLI login read and change those environments for 15 minutes. Other logins of the same person still have to ask.
+## 7. Check the history regularly
 
-**Logins and tokens.** Once you have a passkey, approving a CLI login on `/device` and creating an API token take it too. Both keep working after the session that made them ends, so a stolen browser session could otherwise turn itself into one. The `/device` page takes the code typed from your terminal, never from the link, like `/approve`.
+Run `sigillo audit verify` for your protected environments, from more than one admin's machine. See [the signed history](./history.mdx).
 
-**Admin actions.** Once an organization has a protected environment, every admin action in it takes a passkey as well: inviting someone, changing a role or a member's projects, removing a member, auto-join, an environment's **Min Role** or protection, deleting or renaming a protected environment or its project, resetting passkeys, making or deleting a machine token, and deleting the organization. Otherwise someone with an admin's session could invite an account of their own, or open production to one. One approval covers admin actions for 5 minutes. Organizations without a protected environment work as before.
+## 8. Keep your own backups
 
-**Passkeys.** Everyone adds theirs under **user menu → Passkeys**: a laptop's fingerprint reader, a phone, or a security key. Add two, so losing one doesn't lock you out. The first passkey takes a Google sign-in from the last 5 minutes, in that browser; a CLI login doesn't count, since any session can approve one. Once your organization has an admin with a passkey, an admin also approves each member's first passkey on a project's **Access** tab, where they see the device and IP address it comes from; nobody approves their own. A member of several organizations with protected environments needs an approval from an admin of each, since a passkey works in all of them. Leaving doesn't get around that: someone who left an organization or was removed still needs its approval for a first passkey, and its admins see the request marked as from someone who left. An invite link made before they left doesn't bring them back, and neither does auto-join. So someone who got into a member's Google account still can't add a passkey unnoticed. Adding or removing one after that takes an approval with a passkey you already have: in the same browser, or, for a new device such as your phone, with a code you type on `/approve` on a device that has one, like approving the CLI. Asking for that code also takes a fresh Google sign-in. Someone who only has your session can't swap in their own. On a project's **Access** tab, org admins see how many passkeys each member has and every passkey added or removed. **Reset** removes a member's passkeys, for someone who lost theirs, and signs them out everywhere; they add new ones after signing in again. Passkeys belong to the person, so only an admin of every organization they're in can reset them.
+Make [encrypted backups](./backups.mdx) with `self-host --backup` and keep them outside Cloudflare, next to a copy of your deploy file. Make a new one after every [key rotation](./rotate-key.mdx).
 
-If you are the only admin and lost every passkey, remove them from the machine that deployed Sigillo:
-
-```bash
-npx @kldzj/sigillo self-host --reset-passkeys you@acme.com
-```
-
-**Machine tokens.** CI and servers can't use a passkey. For them, an org admin creates a token on the **Tokens** tab with **Machine token** checked. Making it takes the admin's passkey, also before the organization has a protected environment, so a stolen admin session can't leave one behind that reads environments protected later. It expires after 90 days at most, reads and changes protected environments without a passkey, and stops working when its creator is no longer an admin. The **Tokens** tab marks it **Machine**. Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
-
-**Workload identity.** Better than a machine token for GitHub Actions and Kubernetes: nothing is stored. A trust rule accepts the JWT a job or pod gets from its platform and gives it a token of one hour. Rules take the same approval as machine tokens, may read protected environments on the same terms, and expire after 90 days at most when they do. See [Workload identity](./workload-identity.mdx).
-
-## 6. Check the history
-
-The secret changes and the reads of each environment form hash chains, and the Worker signs every row. Once `sigillo audit verify` has seen a row, editing, removing or reordering it in the database shows up there. Check an environment as an org admin:
-
-```bash
-sigillo audit verify -c prod
-```
-
-```
-✔ changes: 42 rows, intact
-✔ reads: 7 rows, intact
-```
-
-The CLI keeps the newest row of each chain in `~/.sigillo/audit.json`, so the next check also notices rows removed or rewritten since. Run it regularly, from more than one admin's machine: each one is a witness the database can't change.
-
-What it can't catch: the signing key comes from `BETTER_AUTH_SECRET`, so someone who can deploy code to the Worker, or who has `selfhost.json` and its passphrase, can sign new rows or stop writing them. And the chain only vouches for rows a check has already seen: someone who can edit the database can give an account of theirs access, read a protected environment through the Worker, and delete the newest rows of its read log before the next check. The more often you check, the shorter that window. Changes from before the history existed join it on their environment's next change, and `audit verify` counts them: the server signed them as it found them in the database. The history makes tampering by a database writer visible; it doesn't replace [steps 1](#1-give-sigillo-its-own-cloudflare-account) and [2](#2-protect-the-deploy-file).
-
-## 7. When someone leaves
-
-1. On any project's **Access** tab, remove them. That removes them from the organization: every project at once, the API tokens and machine tokens they created there, and their open invitations. Auto-join doesn't add them back, and neither does an invite link made before; only a new invitation does.
-2. Take their address off the allowlist if it's listed, and remove them from your Google Workspace.
-3. Rotate the secrets they could read. They may have copies. In protected environments, the **Read Log** shows which values they read.
-4. If they could reach the Cloudflare account, or knew the passphrase of `selfhost.json`, remove their account membership, choose a new passphrase (`self-host --change-passphrase`), and rotate the secrets of every environment. A new passphrase doesn't lock them out of a copy of the file they already have, so the secrets have to change. Give the instance a new encryption key too (`self-host --rotate-key`), so a copy of the database taken later doesn't open with the key they know. `self-host` can't rotate `BETTER_AUTH_SECRET` yet.
-
-## 8. Know what else keeps data
-
-- **Workers Logs.** Both workers have Cloudflare's Workers Logs on, and `self-host` turns them on again with every deploy. A request's log holds its method, URL and headers: the name of a secret fetched on its own, and the client's IP address. Cloudflare replaces credentials such as the `Authorization` header with `REDACTED`, as `wrangler tail` shows. Logs are kept for 3 days on the Free plan or 7 on Workers Paid, and anyone who can read logs on the account can see them.
-- **Old values.** The event log keeps every value a secret ever had, so an org admin can look up or restore an old one. On an environment's **Event Log** tab, **Purge old values** removes all of them but each secret's current one, with the admin's passkey. The rows stay with who changed what and when, and the history still verifies.
-- **`workers.dev`.** Both workers keep their `workers.dev` URLs, also with a custom domain (`--domain`): `self-host` uses them, and the login provider only has that one.
-- **Backups.** Cloudflare keeps a point-in-time history of each D1 database for 30 days on Workers Paid, 7 on Free. `wrangler d1 time-travel restore sigillo-db --timestamp=<unix time>` overwrites the database with that point and prints a bookmark that undoes it. Restored data is only readable with the keys in `selfhost.json`: a point from before a key rotation holds values under the old key, which the rotation removed. If the last `sigillo audit verify` came after the point you restored, it then reports the history as shorter. For copies outside Cloudflare, `self-host --backup` saves both databases in an encrypted file, and `--restore` checks its history before the workers use it: see [Back up and restore](./backups.mdx).
+When someone leaves your team, follow [when someone leaves](./offboarding.mdx).

@@ -9,4 +9,4 @@ This repository is a fork of [remorses/sigillo](https://github.com/remorses/sigi
 
 If the issue is in upstream's code too, say so in your report: fixes that suit both go upstream as well.
 
-What Sigillo protects against, and what it doesn't, is in the [hardening guide](https://sigillo.kldzj.dev/docs/hardening).
+What Sigillo protects against, and what it doesn't, is in [How Sigillo protects your secrets](https://sigillo.kldzj.dev/docs/security).

@@ -35,7 +35,7 @@ On **Organization settings**, in the sidebar:
 | Invite, change roles, remove people, set project access | No | Yes |
 | Auto-join, an environment's Min Role and protection, deleting the organization | No | Yes |
 
-Admins always reach every project. In an organization with a protected environment, admin actions also take the admin's passkey: see [admin actions](./hardening.mdx#5-require-a-passkey-for-production).
+Admins always reach every project. In an organization with a protected environment, admin actions also take the admin's passkey: see [admin actions](./protected-environments.mdx#admin-actions).
 
 ## Invite people
 
@@ -70,7 +70,7 @@ Set **Min Role** to **Admin** on the **Environments** tab, and members can't ope
 
 On the **Access** tab, an admin changes a role in the **Role** column. An organization always keeps at least one admin. When an admin becomes a member, the invite links they made are deleted, their machine tokens no longer reach protected environments, and their trust rules stop working.
 
-The trash icon removes someone from the organization. Their API tokens and trust rules for its projects go with them, and so do the invite links they made; the secrets they wrote stay. For everything else to do when someone leaves, see [when someone leaves](./hardening.mdx#7-when-someone-leaves).
+The trash icon removes someone from the organization. Their API tokens and trust rules for its projects go with them, and so do the invite links they made; the secrets they wrote stay. For everything else to do when someone leaves, see [when someone leaves](./offboarding.mdx).
 
 ## Who can sign in
 
@@ -80,4 +80,4 @@ If your team is a Google Cloud organization, through Google Workspace or Cloud I
 
 ## Your sessions
 
-**Sessions**, in the user menu, lists the browsers and CLI logins signed in as you, with their device, IP address and sign-in time. **End** signs one out, **End all other sessions** all but the current one. Every session ends 30 days after its sign-in. The list only shows for a sign-in less than a day old: sign in again to see it.
+**Sessions**, in the user menu, lists the browsers and CLI logins signed in as you, with their device, IP address and sign-in time. **End** signs one out, **End all other sessions** all but the current one. A login ends after 7 days without use, and 30 days after its sign-in however often it's used; the CLI then asks you to run `sigillo login` again. The list only shows for a sign-in less than a day old: sign in again to see it.

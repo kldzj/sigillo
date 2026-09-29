@@ -1,0 +1,109 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'How Sigillo protects your secrets'
+sidebarTitle: 'How Sigillo protects your secrets'
+description: 'Where a self-hosted Sigillo runs, who can reach its secrets, how values are encrypted, how people sign in, and what else keeps data.'
+icon: lucide:shield
+---
+
+Sigillo encrypts every secret, but the key lives in the Worker that decrypts them. Whoever controls **your Cloudflare account**, **your deploy file**, **who can sign in** or **an admin role** can get at the secrets. This page explains where each of those is; the [hardening checklist](./hardening.mdx) narrows them, most important first.
+
+## Where everything runs
+
+Every instance is two Cloudflare Workers on your account, each with its own D1 (SQLite) database:
+
+```diagram
+┌─────────────────────────────────────────────────────────────────┐
+│                         Your Machine                            │
+│                                                                 │
+│  sigillo run -- next dev                                        │
+│       │                                                         │
+│       │  device flow login (RFC 8628)                           │
+│       │  or bearer token                                        │
+│       ▼                                                         │
+│  ┌──────────┐                                                   │
+│  │ Sigillo  │                                                   │
+│  │   CLI    │                                                   │
+│  └────┬─────┘                                                   │
+│       │                                                         │
+└───────┼─────────────────────────────────────────────────────────┘
+        │ REST API
+        ▼
+┌──────────────────────┐         ┌──────────────────────┐
+│   App Worker         │         │  Provider Worker     │
+│   (self-hosted)      │────────▶│  (self-hosted)       │
+│                      │  OAuth  │                      │
+│  • Secrets CRUD      │  PKCE   │  • Google login      │
+│  • AES-256-GCM       │         │  • OAuth2 / OIDC     │
+│  • Audit log         │◀────────│  • Dynamic client    │
+│  • API tokens        │  token  │    registration      │
+│  • Device flow       │         │                      │
+│  ┌────────────┐      │         │  ┌────────────┐      │
+│  │  D1 (app)  │      │         │  │ D1 (auth)  │      │
+│  └────────────┘      │         │  └────────────┘      │
+└──────────────────────┘         └──────────────────────┘
+```
+
+- **The app** is the secret manager: encryption, organizations, projects, environments, the web UI and the REST API.
+- **The provider** is the instance's own OAuth provider, deployed next to the app as `<name>-auth`. People sign in with Google through it. The app registers itself with it on its first request via [RFC 7591](https://tools.ietf.org/html/rfc7591) dynamic client registration, as a public PKCE client that needs no client secret.
+
+Nothing depends on anyone else's servers.
+
+## Who can reach your secrets
+
+| Who | What they can do | What limits it |
+|-----|------------------|----------------|
+| Anyone who can edit Workers on the Cloudflare account | Deploy code that reads every secret | [A dedicated account](./hardening.mdx#1-give-sigillo-its-own-cloudflare-account) |
+| Anyone who can edit the D1 databases | Make any account that can sign in an org admin, change the history | A dedicated account, [protected environments](./protected-environments.mdx), [the signed history](./history.mdx) |
+| Anyone with `~/.sigillo/selfhost.json` and its passphrase | Decrypt a database export or backup and use the sessions in an export, sign history rows, and with a saved login deploy to the account | [The passphrase](./updating.mdx#your-deploy-file) |
+| Anyone who can sign in | What their org role and project access allow | [The sign-in allowlist](./self-hosting.mdx#who-can-sign-in) |
+| A CI job or pod that a trust rule accepts | What the rule grants, with a token of one hour | [Narrow trust rules](./workload-identity.mdx) |
+| Anyone with a stolen browser session or CLI login | What that person can read and change, except protected environments, and admin actions in an org that has one | [Passkeys](./protected-environments.mdx) |
+| Org admins | Every project and environment of their org | [Few admins](./access.mdx) |
+
+## Encryption
+
+Every secret value is **AES-256-GCM** encrypted before it's stored. Each write gets a random 12-byte IV, and binds the value to its environment and name, so a copy elsewhere in the database doesn't decrypt.
+
+- **Key 0** is the Worker's `ENCRYPTION_KEY`, 32 random bytes. Deployments made before there was one derive it from `BETTER_AUTH_SECRET` with SHA-256.
+- **After a [key rotation](./rotate-key.mdx)**, the Worker's `ENCRYPTION_KEYS` holds the newer keys and names the current one. Every value names the key it was encrypted with.
+- The keys are never in the database, and a [backup](./backups.mdx) doesn't hold them either: they are in the Worker and in `~/.sigillo/selfhost.json`.
+
+Secrets are stored as a log of changes, and a secret's value is its latest one. That gives the full history of every change, with who made it, and the [signed history](./history.mdx) makes an edited or removed row visible. The web UI never loads values up front: a value reaches the browser when someone reveals, downloads or copies it.
+
+## Signing in
+
+People sign in with Google through your provider. The CLI signs in with the device flow: the terminal shows a code, and you approve it in the browser.
+
+```diagram
+CLI/Agent                    App (self-hosted)              Provider (self-hosted)
+   │                              │                                │
+   │  POST /api/auth/device/code  │                                │
+   │─────────────────────────────▶│                                │
+   │  { user_code, device_code }  │                                │
+   │◀─────────────────────────────│                                │
+   │                              │                                │
+   │  User opens /device          │                                │
+   │  and enters user_code        │                                │
+   │         ┌────────────────────┼────── redirect ───────────────▶│
+   │         │                    │                                │
+   │         │                    │              Google sign-in ──▶│ Google
+   │         │                    │              ◀── callback ─────│
+   │         │                    │                                │
+   │         │                    │◀── auth code (PKCE) ───────────│
+   │         └────────────────────┼────── approved ───────────────▶│
+   │                              │                                │
+   │  Poll /api/auth/device/token │                                │
+   │─────────────────────────────▶│                                │
+   │  { access_token }            │                                │
+   │◀─────────────────────────────│                                │
+```
+
+A login lasts until it ends, or you end it on your [sessions page](./access.mdx#your-sessions). Machines use [tokens or workload identity](./ci.mdx) instead.
+
+## What else keeps data
+
+- **Workers Logs.** Both workers have Cloudflare's Workers Logs on, and `self-host` turns them on again with every deploy. A request's log holds its method, URL and headers: the name of a secret fetched on its own, and the client's IP address. Cloudflare replaces credentials such as the `Authorization` header with `REDACTED`, as `wrangler tail` shows. Logs are kept for 3 days on the Free plan or 7 on Workers Paid, and anyone who can read logs on the account can see them.
+- **Old values.** The event log keeps every value a secret ever had, until an admin [purges them](./secrets.mdx#history-and-old-values).
+- **`workers.dev`.** Both workers keep their `workers.dev` URLs, also with a custom domain (`--domain`): `self-host` uses them, and the login provider only has that one.
+- **Cloudflare's time travel** keeps the last 30 days of each database (7 on the Free plan): see [back up and restore](./backups.mdx#cloudflares-time-travel).
