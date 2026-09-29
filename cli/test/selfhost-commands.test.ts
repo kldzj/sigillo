@@ -2,10 +2,14 @@
 // databases are SQLite databases, the state file lives in memory, and there
 // is no terminal, so nothing prompts.
 
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { afterEach, describe, expect, test, vi } from 'vitest'
-import type { CfClient, SelfhostState } from '../src/selfhost/cloudflare.js'
-import { openValue, sealValue, type KeyRing } from '../src/selfhost/rotate.js'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import type { CfClient, DeploymentState, SelfhostState } from '../src/selfhost/cloudflare.js'
+import { baseKeyOf, openValue, sealValue, type KeyRing } from '../src/selfhost/rotate.js'
+import { keyFingerprint, newBackupIdentity, sealBackup, type Backup } from '../src/selfhost/backup.js'
 
 const fake = vi.hoisted(() => ({ state: {} as SelfhostState, client: undefined as unknown, logs: [] as string[] }))
 
@@ -41,9 +45,17 @@ vi.mock('@clack/prompts', () => {
   }
 })
 
-const { rotateKey } = await import('../src/selfhost/cli.js')
+const { restoreDeployment, rotateKey } = await import('../src/selfhost/cli.js')
 
+// A home of its own, for the files the commands read there
+const home = process.env.HOME
+let dir = ''
+beforeEach(() => {
+  dir = mkdtempSync(path.join(tmpdir(), 'sigillo-commands-'))
+  process.env.HOME = dir
+})
 afterEach(() => {
+  process.env.HOME = home
   vi.useRealTimers()
   vi.restoreAllMocks()
   fake.logs = []
@@ -115,5 +127,82 @@ describe('rotating the key', () => {
       values: ['under key 0', 'under k1'],
       saved: { accountId: 'acc', workerName: 'sigillo', databaseId: 'db', betterAuthSecret: 'secret', encryptionKeys: ring },
     })
+  })
+})
+
+// A real history, written by the Worker in the app's test suite with this BETTER_AUTH_SECRET
+const fixture = JSON.parse(readFileSync(new URL('./fixtures/history.json', import.meta.url), 'utf8'))
+const secret = 'test-secret-at-least-32-characters-long!!'
+const APP_SCHEMA = `CREATE TABLE environment (id text PRIMARY KEY, project_id text, slug text);
+CREATE TABLE secret_event (id text PRIMARY KEY, environment_id text, name text, operation text, value_encrypted text, iv text, value_digest text,
+  user_id text, api_token_id text, created_at integer, actor text, seq integer, hash text, signature text, adopted integer);
+CREATE TABLE secret_read (id text PRIMARY KEY, environment_id text, actor text, kind text, names text, ip_address text, created_at integer, seq integer, hash text, signature text);`
+const PROVIDER_SCHEMA = 'CREATE TABLE jwks (id text PRIMARY KEY, public_key text, private_key text, created_at integer);'
+
+// Rows as D1's export writes them, every value quoted by SQLite
+function exportRows(db: DatabaseSync, table: string): string {
+  const columns = (db.prepare(`SELECT name FROM pragma_table_info('${table}')`).all() as Array<{ name: string }>).map((row) => `quote("${row.name}")`)
+  return (db.prepare(`SELECT 'INSERT INTO "${table}" VALUES(' || ${columns.join(" || ',' || ")} || ');' AS statement FROM "${table}"`).all() as Array<{ statement: string }>)
+    .map((row) => row.statement).join('\n')
+}
+
+// The deployment the fixture's history comes from, with its backup key
+function deployment(backupIdentity: string): DeploymentState {
+  return {
+    accountId: 'acc',
+    workerName: 'sigillo',
+    databaseId: 'app-before',
+    betterAuthSecret: secret,
+    backupIdentity,
+    providerWorkerName: 'sigillo-auth',
+    providerDatabaseId: 'auth-before',
+    providerAuthSecret: 'provider-secret',
+    googleClientId: 'google-id',
+    googleClientSecret: 'google-secret',
+    allowedUsers: '',
+    deployedVersion: '0.16.0',
+    url: 'https://sigillo.acme.workers.dev',
+  }
+}
+
+// A backup of both databases, saved in the test's home, and the state it restores with
+async function backupOf(): Promise<{ file: string; saved: DeploymentState }> {
+  const app = new DatabaseSync(':memory:')
+  app.exec(APP_SCHEMA)
+  app.prepare("INSERT INTO environment VALUES (?, 'p1', 'prod')").run(fixture.environmentId)
+  for (const e of fixture.events) {
+    app.prepare('INSERT INTO secret_event VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(e.id, e.environmentId, e.name, e.operation, e.valueEncrypted, e.iv, e.valueDigest,
+      e.userId, e.apiTokenId, e.createdAt, e.actor, e.seq, e.hash, e.signature, e.adopted ? 1 : 0)
+  }
+  for (const r of fixture.reads) {
+    app.prepare('INSERT INTO secret_read VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(r.id, r.environmentId, r.actor, r.kind, JSON.stringify(r.names), r.ipAddress, r.createdAt, r.seq, r.hash, r.signature)
+  }
+  const identity = await newBackupIdentity()
+  const backup: Backup = {
+    format: 'sigillo-backup',
+    version: 1,
+    createdAt: '2026-09-29T10:00:00.000Z',
+    workerName: 'sigillo',
+    sigilloVersion: '0.16.0',
+    keys: { '0': keyFingerprint('0', { ring: undefined, baseKey: baseKeyOf({ betterAuthSecret: secret }) })! },
+    databases: {
+      app: { schema: APP_SCHEMA, data: ['environment', 'secret_event', 'secret_read'].map((table) => exportRows(app, table)).join('\n'), tables: ['environment', 'secret_event', 'secret_read'], migrations: [] },
+      provider: { schema: PROVIDER_SCHEMA, data: `INSERT INTO "jwks" VALUES('j1','public','sealed private',1);`, tables: ['jwks'], migrations: [] },
+    },
+  }
+  const file = path.join(dir, 'sigillo.backup.age')
+  writeFileSync(file, await sealBackup(backup, identity))
+  return { file, saved: deployment(identity) }
+}
+
+describe('restoring a backup', () => {
+  test('needs --yes without a terminal, since it discards every change since the backup', async () => {
+    const { file, saved } = await backupOf()
+    fake.state = { deployments: { 'acc/sigillo': saved } }
+    fake.client = {} as CfClient
+    await expect(restoreDeployment({ restore: file })).rejects.toThrow(
+      'A restore discards every change made to sigillo since the backup of 2026-09-29T10:00:00.000Z. Without a terminal to confirm that, pass --yes.',
+    )
+    expect(fake.state).toEqual({ deployments: { 'acc/sigillo': saved } })
   })
 })

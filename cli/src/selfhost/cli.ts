@@ -280,7 +280,7 @@ async function backupDeployment(options: SelfHostOptions) {
 
 // Into fresh databases, whose history is checked before both workers switch
 // to them. The databases from before stay, for the operator to delete.
-async function restoreDeployment(options: SelfHostOptions) {
+export async function restoreDeployment(options: SelfHostOptions) {
   if (!options.restore) throw new Error('Pass the backup file: --restore sigillo-<time>.backup.age')
   const { key, deployment } = savedDeployment(options)
   if (!deployment.backupIdentity) throw new Error('~/.sigillo/selfhost.json has no backup key for this deployment, so it has no backups to restore')
@@ -297,7 +297,8 @@ async function restoreDeployment(options: SelfHostOptions) {
   const witnesses = auditWitnesses([deployment.url, deployment.customDomain && `https://${deployment.customDomain}`].filter((url): url is string => !!url))
   const retired = Object.entries(backup.keys).filter(([id, fingerprint]) => keyFingerprint(id, { ring, baseKey }) !== fingerprint).map(([id]) => `key ${id}`)
   if (retired.length) throw new Error(`This backup's values are encrypted with ${retired.join(', ')}, which a key rotation has since retired from ~/.sigillo/selfhost.json`)
-  if (interactive() && !options.yes) {
+  if (!options.yes) {
+    if (!interactive()) throw new Error(`A restore discards every change made to ${deployment.workerName} since the backup of ${backup.createdAt}. Without a terminal to confirm that, pass --yes.`)
     const sure = await clack.confirm({ message: `Restore ${deployment.workerName} to its backup of ${backup.createdAt}? Changes since are lost and everyone signs in again.` })
     if (clack.isCancel(sure) || !sure) process.exit(0)
   }
