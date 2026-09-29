@@ -3,7 +3,7 @@
 // The full deploy path is exercised manually/e2e against a real Cloudflare
 // account (network + credentials required), not here.
 
-import { createHash } from 'node:crypto'
+import { createHash, webcrypto } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -12,7 +12,7 @@ import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { CloudflareApiError, parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL, type CfClient, type DeploymentState } from '../src/selfhost/cloudflare.js'
 import {
-  appCompatibilityFlags, assertNoStoredSecrets, checkBundle, fetchReleaseInfo, isOlderVersion, isSigilloProviderWorker, normalizeAllowedUsers, parseBundle,
+  appCompatibilityFlags, assertNoStoredSecrets, assertSecretsDecryptDatabase, checkBundle, fetchReleaseInfo, isOlderVersion, isSigilloProviderWorker, normalizeAllowedUsers, parseBundle,
   providerSecretsForDeploy, readExpectedBundle, resolveDeploySecrets, updateAllowedUsersSecret, uploadWorker,
   type SelfhostBundle, type WorkerBundle,
 } from '../src/selfhost/deploy.js'
@@ -869,6 +869,43 @@ describe('backups', () => {
         'import ingest',
         'import poll',
       ],
+    })
+  })
+})
+
+describe('keys for a new worker', () => {
+  // A database holding one stored value, as the D1 API answers
+  const holding = (row: Record<string, string> | null) => ({
+    async d1Query({ sql }: { sql: string }) {
+      if (sql.includes('sqlite_master')) return [{ results: [{ name: 'secret_event' }] }]
+      return [{ results: row ? [row] : [] }]
+    },
+  }) as unknown as CfClient
+  const slot = { environmentId: '01ENV', name: 'API_KEY' }
+  const outcome = (client: CfClient, keys: { betterAuthSecret: string; encryptionKey?: string; encryptionKeys?: KeyRing }) =>
+    assertSecretsDecryptDatabase({ client, accountId: 'acc', databaseId: 'db', ...keys }).then(() => 'ok', (error: Error) => error.message.slice(0, 60))
+
+  test('must decrypt a stored value, v2 under the ring or from before v2 under key 0', async () => {
+    const ring: KeyRing = { current: 'abc123', keys: { abc123: Buffer.alloc(32, 7).toString('base64') } }
+    const v2 = await sealValue({ keyId: 'abc123', key: ring.keys.abc123!, slot, plaintext: 'secret' })
+    // From before v2: key 0 derived from BETTER_AUTH_SECRET, no additional data
+    const iv = Buffer.alloc(12, 1)
+    const key0 = await webcrypto.subtle.importKey('raw', new Uint8Array(baseKeyOf({ betterAuthSecret: 'auth-secret' })), { name: 'AES-GCM' }, false, ['encrypt'])
+    const v1 = Buffer.from(await webcrypto.subtle.encrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, key0, new TextEncoder().encode('secret'))).toString('base64')
+    const v2Row = holding({ environment_id: slot.environmentId, name: slot.name, value_encrypted: v2.encrypted, iv: v2.iv })
+    const v1Row = holding({ environment_id: slot.environmentId, name: slot.name, value_encrypted: v1, iv: iv.toString('base64') })
+    expect({
+      v2WithRing: await outcome(v2Row, { betterAuthSecret: 'auth-secret', encryptionKeys: ring }),
+      v2WithoutRing: await outcome(v2Row, { betterAuthSecret: 'auth-secret' }),
+      v1WithSecret: await outcome(v1Row, { betterAuthSecret: 'auth-secret' }),
+      v1WithNewSecret: await outcome(v1Row, { betterAuthSecret: 'fresh-secret' }),
+      nothingStored: await outcome(holding(null), { betterAuthSecret: 'fresh-secret' }),
+    }).toEqual({
+      v2WithRing: 'ok',
+      v2WithoutRing: 'This D1 database already stores secrets that the keys for th',
+      v1WithSecret: 'ok',
+      v1WithNewSecret: 'This D1 database already stores secrets that the keys for th',
+      nothingStored: 'ok',
     })
   })
 })

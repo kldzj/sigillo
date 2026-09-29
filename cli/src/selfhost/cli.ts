@@ -33,6 +33,7 @@ import {
   appCompatibilityFlags,
   applyMigrations,
   assertNoStoredSecrets,
+  assertSecretsDecryptDatabase,
   ensureDatabase,
   fetchReleaseInfo,
   isSigilloProviderWorker,
@@ -473,6 +474,10 @@ async function selfHost(options: SelfHostOptions) {
     saved?.databaseId ??
     (await ensureDatabase({ client, accountId, name: `${workerName}-db`, firstMigrationName }))
   if (generated) await assertNoStoredSecrets({ client, accountId, databaseId })
+  // A new worker gets its keys from scratch: they must decrypt what's stored
+  if (secrets.betterAuthSecret) {
+    await assertSecretsDecryptDatabase({ client, accountId, databaseId, betterAuthSecret: secrets.betterAuthSecret, encryptionKey: secrets.encryptionKey, encryptionKeys: saved?.encryptionKeys })
+  }
   const applied = await applyMigrations({ client, accountId, databaseId, migrations: bundle.app.migrations })
   spinner.stop(
     applied.length > 0

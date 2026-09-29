@@ -1526,10 +1526,7 @@ fn runChildProcessImpl(
         if (stdout_result.err) |err| return err;
         if (stderr_result.err) |err| return err;
 
-        return switch (term) {
-            .Exited => |code| code,
-            else => 1,
-        };
+        return exitCode(term);
     }
 
     const term = child.wait() catch |err| {
@@ -1537,8 +1534,14 @@ fn runChildProcessImpl(
         return err;
     };
     child_spawned = false;
+    return exitCode(term);
+}
+
+/// Shell convention: a child killed by signal N exits with 128 + N.
+fn exitCode(term: std.process.Child.Term) u8 {
     return switch (term) {
         .Exited => |code| code,
+        .Signal => |sig| 128 +| (std.math.cast(u8, sig) orelse 0),
         else => 1,
     };
 }
@@ -3884,6 +3887,11 @@ test "runChildProcess forwards SIGTERM to the child and returns its exit code" {
     const code = try runChildProcessWithWriters(allocator, &env_map, &.{}, argv, File.stdout(), File.stderr());
     try std.testing.expectEqual(@as(u8, 42), code);
     try std.testing.expectEqual(@as(i32, 0), forward_signal_pid.load(.seq_cst));
+
+    // Regression: a child killed by the forwarded signal used to report exit 1.
+    const untrapped_argv = try shellCommandArgv(allocator, "kill -TERM $PPID; for i in 1 2 3 4 5; do sleep 1 & wait $!; done; exit 1");
+    const untrapped = try runChildProcessWithWriters(allocator, &env_map, &.{}, untrapped_argv, File.stdout(), File.stderr());
+    try std.testing.expectEqual(@as(u8, 128 + std.posix.SIG.TERM), untrapped);
 
     // A signal before the child exists (e.g. while writing the mount file)
     // stops the run without spawning, so runAction's cleanup still happens.

@@ -239,12 +239,17 @@ export function AccessTable() {
       {canManage ? <PasskeyRequests /> : null}
       {canManage ? <PasskeyChanges /> : null}
 
-      <ManageAccessDialog
-        member={editingMember}
-        orgProjects={orgProjects}
-        open={!!editingMember}
-        onClose={() => setEditingMemberId(null)}
-      />
+      {/* Keyed + mounted per member: dialog state is initialized from the
+          member, so a shared instance kept "Full access" from a null member. */}
+      {editingMember && (
+        <ManageAccessDialog
+          key={editingMember.id}
+          member={editingMember}
+          orgProjects={orgProjects}
+          open
+          onClose={() => setEditingMemberId(null)}
+        />
+      )}
     </div>
   )
 }
