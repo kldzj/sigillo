@@ -24,13 +24,33 @@ On the project's **Machines** tab, click **Create token**, name it, pick the env
 - It acts for the person who made it. It stops working when they can no longer sign in or open its project, and for an admin-only environment when they are no longer an org admin.
 - Anyone who can open a project's environments can create tokens for them. Once you have a passkey, creating one takes it, since a token outlives the session that made it.
 - The **Machines** tab shows when and from which IP each token was last used, to the hour. An expired token gets `401 API token expired`.
-- Only a token's creator or an org admin deletes it. Tokens made before expiry existed never expire and show **Never**: replace them.
+- Only a token's creator or an org admin deletes it. Tokens made before expiry existed never expire and show **Never**: [regenerate](#regenerate-a-token) them to give them one.
 
 ## Machine tokens
 
 CI and servers can't use a passkey. For them, an org admin creates a token on the **Machines** tab with **Machine token** checked. Making it takes the admin's passkey, also before the organization has a protected environment, so a stolen admin session can't leave one behind that reads environments protected later. It expires after 90 days at most, reads and changes protected environments without a passkey, and stops working when its creator is no longer an admin. The **Machines** tab marks it **Machine**.
 
 Keep it on the machine it's for, and scope it to the environments it needs: it also reads environments of its scope that are protected after it was made.
+
+## Before a token expires
+
+A token warns before it stops working, in the last quarter of its lifetime and at most its last 14 days: the last 42 hours of a 7-day token, the last 14 days of a 90-day one.
+
+- The **Machines** tab marks it, and a banner on the dashboard lists what expires soon: an org admin sees the organization's tokens and trust rules, a member their own tokens.
+- Every API response to a token says when it expires, and warns inside that window, in two headers: see [expiry headers](./api.mdx#expiry-headers).
+- The CLI prints one line on stderr, so it shows in the CI log without touching the command's output:
+
+```
+warning: this API token expires on 2026-10-13 (in 3 days). Regenerate it on the project's Machines tab; the old value then keeps working for up to 7 days.
+```
+
+### Regenerate a token
+
+The regenerate button on the **Machines** tab gives a token a new value and a new expiry. It stays the same token, with its name, scope and history, and it keeps acting for the person who made it.
+
+The old value keeps working for the grace period you pick, none, a day or seven days, but never past the expiry it had, so CI keeps running while you update it. The **Machines** tab shows when and from which IP the old value was last used, so you can tell whether anything still sends it, and **Stop** ends it early. Deleting the token ends both. An old value used after its grace gets `401 API token expired: it was regenerated, use the new value`.
+
+The token's creator or an org admin regenerates it, with their passkey once they have one; a machine token takes an admin with their passkey, as creating one does, and lasts 90 days at most. A token whose creator can no longer use it can't be regenerated: make a new one.
 
 ## Use a token
 

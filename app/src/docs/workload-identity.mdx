@@ -18,7 +18,13 @@ Org admins add rules on a project's **Machines** tab, under **Workload identitie
 - the environments its tokens may use, and whether they may use protected ones
 - when it expires: after 7 to 365 days, and 90 at most when it reaches protected environments
 
-A token from a rule acts for the admin who made it, for as long as they are an admin. Workloads name the project by its ID in `SIGILLO_PROJECT`, not by its name: names repeat across organizations, and another organization's admin could otherwise make a rule for your workload in a project named like yours. Deleting the rule ends its tokens at once. The read log names the job or pod behind each read, such as `Deploy · acme/api environment production run 8123.1 (workload)`, and the rule's history button lists its last 20 tokens.
+A token from a rule acts for the admin who made or last renewed it, for as long as they are an admin. Workloads name the project by its ID in `SIGILLO_PROJECT`, not by its name: names repeat across organizations, and another organization's admin could otherwise make a rule for your workload in a project named like yours. Deleting the rule ends its tokens at once. The read log names the job or pod behind each read, such as `Deploy · acme/api environment production run 8123.1 (workload)`, and the rule's history button lists its last 20 tokens.
+
+### Renew a rule
+
+Before a rule expires, the **Machines** tab and the dashboard say so, and the CLI prints a warning in the job's log. An org admin renews it with **Renew** and their passkey: it keeps its ID, so nothing changes for the workloads or in External Secrets Operator, and it gets a new expiry, 90 days at most when it reaches protected environments. An expired rule can be renewed too.
+
+The renewal first shows how the rule has been used: its last tokens, the jobs or pods seen, and warnings such as never used, not used in 60 days, or made by someone who is no longer an admin. For a rule whose keys Sigillo discovers, it fetches them again, and a renewal fails when the issuer doesn't answer. Read the rule before renewing it: a renewal vouches for it as it is. The admin who renews it becomes the admin its tokens act for, which is also how an admin takes over a rule from someone who is no longer one.
 
 ## GitHub Actions
 

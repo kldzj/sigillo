@@ -34,7 +34,7 @@ Set **Protected** to **On** for production. Reading or changing it then takes a 
 
 ## 6. Give machines the narrowest credential
 
-Use [workload identity](./workload-identity.mdx) for GitHub Actions and Kubernetes, so nothing is stored. Elsewhere, make one [token](./ci.mdx) per machine or pipeline, scoped to the environments it needs, and a machine token only where it must reach a protected environment.
+Use [workload identity](./workload-identity.mdx) for GitHub Actions and Kubernetes, so nothing is stored. Elsewhere, make one [token](./ci.mdx) per machine or pipeline, scoped to the environments it needs, and a machine token only where it must reach a protected environment. Prefer 90 days to 365, and when one expires, [regenerate](./ci.mdx#regenerate-a-token) it rather than making a new one, so its history stays with it.
 
 ## 7. Check the history regularly
 

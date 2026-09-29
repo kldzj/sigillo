@@ -44,6 +44,17 @@ curl -X PUT -H "Authorization: Bearer sig_xxx" \
 
 `{environmentId}` also takes the environment's slug. The download takes the same formats as [`sigillo secrets download`](./secrets.mdx#download-all-secrets), but defaults to JSON.
 
+## Expiry headers
+
+Every response to a request with a `sig_` token that expires says when, in RFC 3339. For a workload's token it's the trust rule's expiry, since the workload gets a new token every hour on its own. In the last quarter of the credential's lifetime, and at most its last 14 days, a second header warns:
+
+```
+Sigillo-Token-Expires: 2026-10-13T12:00:00Z
+Sigillo-Warning: token-expiry; expires=2026-10-13T12:00:00Z; days=3
+```
+
+The kinds are `token-expiry`, `rule-expiry` (with `rule=<id>`), and `token-regenerated`, which the old value of a [regenerated token](./ci.mdx#regenerate-a-token) gets during its grace. `days` rounds up. The CLI prints the warning on stderr. `POST /api/v0/workload/token` also answers the rule's `ruleId` and `ruleExpiresAt`.
+
 ## Doppler-compatible routes
 
 For [External Secrets Operator](./workload-identity.mdx#external-secrets-operator)'s Doppler provider, the instance also answers three of Doppler's routes, at its root rather than under `/api/v0`: `POST /v3/auth/oidc`, `GET /v3/projects` and `GET /v3/configs/config/secrets/download`. They take the token as Basic auth user name, as that provider sends it, and answer in Doppler's shape. They exist for ESO; use `/api/v0` for anything else.
