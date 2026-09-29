@@ -3,6 +3,7 @@
 
 import { spawnSync } from 'node:child_process'
 import { existsSync, chmodSync } from 'node:fs'
+import { constants } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -54,6 +55,16 @@ const result = spawnSync(binaryPath, process.argv.slice(2), { stdio: 'inherit' }
 if (result.error) {
   process.stderr.write(`error: failed to run ${binaryPath}: ${result.error.message}\n`)
   process.exit(1)
+}
+
+// Killed by a signal: exit as a shell does, 128 + its number, and name a
+// crash, such as SIGILL on a CPU the binary wasn't built for. Ctrl+C and a
+// closed pipe aren't crashes.
+if (result.signal) {
+  if (!['SIGINT', 'SIGTERM', 'SIGPIPE', 'SIGHUP'].includes(result.signal)) {
+    process.stderr.write(`error: sigillo was killed by ${result.signal}\n`)
+  }
+  process.exit(128 + (constants.signals[result.signal] ?? 0))
 }
 
 process.exit(result.status ?? 1)
