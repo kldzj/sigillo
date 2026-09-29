@@ -3030,6 +3030,70 @@ test "an error message from the server comes without control characters" {
     try std.testing.expectEqualStrings("no access?2K", client.parseError(allocator, "{\"error\":\"no access\\u009b2K\"}").?);
 }
 
+test "each kind of expiry warning says what to do" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "this API token expires on 2026-10-13 (in 3 days). Regenerate it on the project's Machines tab; the old value then keeps working for up to 7 days.",
+        (try client.expiryWarning(allocator, "token-expiry; expires=2026-10-13T12:00:00Z; days=3")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "the trust rule this workload uses expires on 2026-10-13 (in 3 days). An org admin renews it on the project's Machines tab.",
+        (try client.expiryWarning(allocator, "rule-expiry; rule=01K5ZJ8Q7X3V2N4M6P8R0T2W4Y; expires=2026-10-13T12:00:00Z; days=3")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "this token was regenerated; this value stops working on 2026-10-06 (in 6 days). Switch to the new value.",
+        (try client.expiryWarning(allocator, "token-regenerated; expires=2026-10-06T08:00:00Z; days=6")).?,
+    );
+}
+
+test "an expiry warning for the last day says within a day" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings(
+        "this API token expires on 2026-10-13 (within a day). Regenerate it on the project's Machines tab; the old value then keeps working for up to 7 days.",
+        (try client.expiryWarning(arena.allocator(), "token-expiry; expires=2026-10-13T12:00:00Z; days=1")).?,
+    );
+}
+
+test "a malformed or unknown expiry warning is not shown" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const unreadable = [_][]const u8{
+        "",
+        "token-expiry",
+        "token-expiry; days=3",
+        "token-expiry; expires=2026-10-13T12:00:00Z",
+        "token-expiry; expires=2026-10; days=3",
+        "token-expiry; expires=2026-10-13T12:00:00Z; days=three",
+        "token-expiry; expires=2026-10-13T12:00:00Z; days=-1",
+        "token-expiry; expires=2026-10-13T12:00:00Z; 3 days",
+        "token-expiry expires=2026-10-13T12:00:00Z days=3",
+        "password-expiry; expires=2026-10-13T12:00:00Z; days=3",
+        "Token-Expiry; expires=2026-10-13T12:00:00Z; days=3",
+    };
+    for (unreadable) |value| {
+        try std.testing.expect(try client.expiryWarning(allocator, value) == null);
+    }
+}
+
+test "an expiry warning can't put a control character on the terminal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "this API token expires on 2026-10?[2 (in 3 days). Regenerate it on the project's Machines tab; the old value then keeps working for up to 7 days.",
+        (try client.expiryWarning(allocator, "token-expiry; expires=2026-10\x1b[2J; days=3")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "this token was regenerated; this value stops working on 2026-1?0- (in 6 days). Switch to the new value.",
+        (try client.expiryWarning(allocator, "token-regenerated; expires=2026-1\xc2\x9b0-13; days=6")).?,
+    );
+    try std.testing.expect(try client.expiryWarning(allocator, "token-expiry; expires=2026-10-13T12:00:00Z; days=3\x07") == null);
+}
+
 test "redaction masks a secret that contains another one, when a write ends between them" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4739,4 +4803,109 @@ test "a pod's JWT goes to the server with the project, and a refusal says what t
         (try outcome).failed,
     );
     try std.testing.expect(std.mem.endsWith(u8, server.request(), "\r\n\r\n{\"token\":\"pod-jwt\",\"project\":\"payments\"}"));
+}
+
+// Sends what the code under test writes to stderr to a file, to read back
+const StderrCapture = struct {
+    tmp: std.testing.TmpDir,
+    file: std.fs.File,
+    saved: std.posix.fd_t,
+
+    fn start() !StderrCapture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const file = try tmp.dir.createFile("stderr", .{});
+        errdefer file.close();
+        const saved = try std.posix.dup(std.posix.STDERR_FILENO);
+        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+        return .{ .tmp = tmp, .file = file, .saved = saved };
+    }
+
+    fn stop(self: *StderrCapture, allocator: std.mem.Allocator) ![]const u8 {
+        std.posix.dup2(self.saved, std.posix.STDERR_FILENO) catch {};
+        std.posix.close(self.saved);
+        self.file.close();
+        defer self.tmp.cleanup();
+        return self.tmp.dir.readFileAlloc(allocator, "stderr", 64 * 1024);
+    }
+};
+
+fn warningResponse(allocator: std.mem.Allocator, warning: []const u8, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nSigillo-Warning: {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ warning, body.len, body });
+}
+
+test "the server's expiry warning shows once, on stderr, however many answers carry it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    client.expiry_warned = false;
+    defer client.expiry_warned = false;
+    var server = try ScriptedServer.init();
+    defer server.inner.server.deinit();
+    const base = try server.inner.baseUrl(allocator);
+
+    // As a download looks up the project first
+    const warning = "token-expiry; expires=2026-10-13T12:00:00Z; days=3";
+    const responses = [_][]const u8{
+        try warningResponse(allocator, warning, "{}"),
+        try warningResponse(allocator, warning, "A=\"b\"\n"),
+    };
+    const thread = try std.Thread.spawn(.{}, ScriptedServer.serve, .{ &server, &responses });
+    var stderr = try StderrCapture.start();
+    const first = client.request(.{ .allocator = allocator, .method = .GET, .base_url = base, .path = "/api/v0/projects/p", .token = "sig_abc" });
+    const second = client.request(.{ .allocator = allocator, .method = .GET, .base_url = base, .path = "/api/v0/projects/p/environments/e/secrets/download?format=env", .token = "sig_abc", .accept = "*/*" });
+    const written = stderr.stop(allocator);
+    std.posix.shutdown(server.inner.server.stream.handle, .both) catch {};
+    thread.join();
+    try std.testing.expectEqualStrings("{}", (try first).body);
+    try std.testing.expectEqualStrings("A=\"b\"\n", (try second).body);
+    try std.testing.expectEqualStrings(
+        "warning: this API token expires on 2026-10-13 (in 3 days). Regenerate it on the project's Machines tab; the old value then keeps working for up to 7 days.\n",
+        try written,
+    );
+}
+
+test "the workload exchange's answer warns that the trust rule expires" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    client.expiry_warned = false;
+    defer client.expiry_warned = false;
+    var server = try OneShotServer.init();
+    defer server.server.deinit();
+
+    const response = try warningResponse(allocator, "rule-expiry; rule=01K5ZJ8Q7X3V2N4M6P8R0T2W4Y; expires=2026-10-13T12:00:00Z; days=1", "{\"token\":\"sig_workload\",\"expiresAt\":1}");
+    const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, response });
+    var stderr = try StderrCapture.start();
+    const outcome = workload.exchange(allocator, .{ .token = "pod-jwt" }, try server.baseUrl(allocator), null);
+    const written = stderr.stop(allocator);
+    thread.join();
+    try std.testing.expectEqualStrings("sig_workload", (try outcome).token);
+    try std.testing.expectEqualStrings(
+        "warning: the trust rule this workload uses expires on 2026-10-13 (within a day). An org admin renews it on the project's Machines tab.\n",
+        try written,
+    );
+}
+
+test "a malformed expiry warning shows nothing" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    client.expiry_warned = false;
+    defer client.expiry_warned = false;
+    var server = try OneShotServer.init();
+    defer server.server.deinit();
+
+    const response = try warningResponse(allocator, "token-expiry; expires=soon; days=3", "{}");
+    const thread = try std.Thread.spawn(.{}, OneShotServer.serve, .{ &server, response });
+    var stderr = try StderrCapture.start();
+    const result = client.request(.{ .allocator = allocator, .method = .GET, .base_url = try server.baseUrl(allocator), .path = "/api/v0/me", .token = "sig_abc" });
+    const written = stderr.stop(allocator);
+    thread.join();
+    try std.testing.expectEqual(@as(u16, 200), (try result).status);
+    try std.testing.expectEqualStrings("", try written);
+    try std.testing.expect(!client.expiry_warned);
 }

@@ -57,50 +57,119 @@ fn sendWith(http_client: *std.http.Client, args: RequestArgs) !ApiResult {
     var response_body: std.io.Writer.Allocating = .init(args.allocator);
     defer response_body.deinit();
 
-    const accept_header = [_]std.http.Header{.{ .name = "accept", .value = args.accept }};
     var headers: std.http.Client.Request.Headers = .{ .user_agent = .{ .override = user_agent } };
     if (args.json_body != null) {
         headers.content_type = .{ .override = "application/json" };
     }
 
-    const result = if (args.token) |value| blk: {
-        const auth_header = try std.fmt.allocPrint(args.allocator, "Bearer {s}", .{value});
-        defer args.allocator.free(auth_header);
+    // The token goes in extra_headers: std.http 0.15 never writes
+    // privileged_headers, so a token there was not sent at all. Since
+    // extra_headers would follow any redirect, never follow one with a
+    // token: 3xx comes back as a status.
+    const auth_header = if (args.token) |value| try std.fmt.allocPrint(args.allocator, "Bearer {s}", .{value}) else null;
+    defer if (auth_header) |value| args.allocator.free(value);
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "accept", .value = args.accept },
+        .{ .name = "authorization", .value = auth_header orelse "" },
+    };
+    // Only a request with neither a token nor a body follows redirects, up
+    // to 3, as fetch did
+    const redirect_behavior: std.http.Client.Request.RedirectBehavior = if (args.token == null and args.json_body == null) .init(3) else .unhandled;
+    var redirect_buffer: [8 * 1024]u8 = undefined;
 
-        // The token goes in extra_headers: std.http 0.15 never writes
-        // privileged_headers, so a token there was not sent at all. Since
-        // extra_headers would follow any redirect, never follow one with a
-        // token: 3xx comes back as a status.
-        const extra_headers = [_]std.http.Header{
-            .{ .name = "accept", .value = args.accept },
-            .{ .name = "authorization", .value = auth_header },
-        };
-        break :blk try http_client.fetch(.{
-            .location = .{ .url = url },
-            .method = args.method,
-            .payload = args.json_body,
-            .headers = headers,
-            .extra_headers = &extra_headers,
-            .redirect_behavior = .unhandled,
-            .response_writer = &response_body.writer,
-        });
-    } else try http_client.fetch(.{
-        .location = .{ .url = url },
-        .method = args.method,
-        .payload = args.json_body,
+    // What http_client.fetch does, which returns no response headers
+    var req = try http_client.request(args.method, try std.Uri.parse(url), .{
         .headers = headers,
-        .extra_headers = &accept_header,
-        .response_writer = &response_body.writer,
+        .extra_headers = if (auth_header == null) extra_headers[0..1] else &extra_headers,
+        .redirect_behavior = redirect_behavior,
     });
+    defer req.deinit();
+
+    if (args.json_body) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(payload);
+        try body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var response = try req.receiveHead(if (redirect_behavior == .unhandled) &.{} else &redirect_buffer);
+    warnOfExpiry(args.allocator, response.head);
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try args.allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try args.allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer args.allocator.free(decompress_buffer);
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(&response_body.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
 
     // Point --api-url / api-url at the final URL (e.g. https://) instead.
-    if (args.token != null and @intFromEnum(result.status) >= 300 and @intFromEnum(result.status) < 400) {
+    const status = @intFromEnum(response.head.status);
+    if (args.token != null and status >= 300 and status < 400) {
         return error.ApiUrlRedirected;
     }
 
     return .{
-        .status = @intFromEnum(result.status),
+        .status = status,
         .body = try args.allocator.dupe(u8, response_body.written()),
+    };
+}
+
+// ── Expiry warning ──────────────────────────────────────────────────
+
+// The server says in Sigillo-Warning when the token or the trust rule behind
+// a request stops working soon. A command makes several requests, so this
+// prints the first warning only, and on stderr: stdout can be a download or
+// a command's output.
+pub var expiry_warned = false;
+
+fn warnOfExpiry(allocator: std.mem.Allocator, head: std.http.Client.Response.Head) void {
+    if (expiry_warned) return;
+    var headers = head.iterateHeaders();
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "sigillo-warning")) continue;
+        const message = (expiryWarning(allocator, header.value) catch return) orelse continue;
+        expiry_warned = true;
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        color.yellow(stderr, "warning") catch {};
+        stderr.print(": {s}\n", .{message}) catch {};
+        return;
+    }
+}
+
+// The warning for a header like `token-expiry; expires=2026-10-13T12:00:00Z;
+// days=3`, cleaned for the terminal, or null for one it can't read
+pub fn expiryWarning(allocator: std.mem.Allocator, value: []const u8) !?[]const u8 {
+    const Kind = enum { @"token-expiry", @"rule-expiry", @"token-regenerated" };
+    var items = std.mem.splitScalar(u8, value, ';');
+    const kind = std.meta.stringToEnum(Kind, std.mem.trim(u8, items.first(), " \t")) orelse return null;
+    var expires: ?[]const u8 = null;
+    var days: ?u32 = null;
+    while (items.next()) |item| {
+        const pair = std.mem.trim(u8, item, " \t");
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return null;
+        if (std.mem.eql(u8, pair[0..eq], "expires")) expires = pair[eq + 1 ..];
+        if (std.mem.eql(u8, pair[0..eq], "days")) days = std.fmt.parseInt(u32, pair[eq + 1 ..], 10) catch return null;
+    }
+    const expiry = expires orelse return null;
+    if (expiry.len < 10) return null;
+    const date = try color.plain(allocator, expiry[0..10]);
+    const left = days orelse return null;
+    const when = if (left <= 1) "within a day" else try std.fmt.allocPrint(allocator, "in {d} days", .{left});
+    return switch (kind) {
+        .@"token-expiry" => try std.fmt.allocPrint(allocator, "this API token expires on {s} ({s}). Regenerate it on the project's Machines tab; the old value then keeps working for up to 7 days.", .{ date, when }),
+        .@"rule-expiry" => try std.fmt.allocPrint(allocator, "the trust rule this workload uses expires on {s} ({s}). An org admin renews it on the project's Machines tab.", .{ date, when }),
+        .@"token-regenerated" => try std.fmt.allocPrint(allocator, "this token was regenerated; this value stops working on {s} ({s}). Switch to the new value.", .{ date, when }),
     };
 }
 
