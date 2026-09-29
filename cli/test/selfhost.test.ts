@@ -6,7 +6,7 @@
 import { gzipSync } from 'node:zlib'
 import { describe, expect, test } from 'vitest'
 import { parseWranglerToml, serializeWranglerToml, TOKEN_TEMPLATE_URL } from '../src/selfhost/cloudflare.js'
-import { parseBundle, resolveDeploySecrets, type SelfhostBundle } from '../src/selfhost/deploy.js'
+import { canDecryptStoredSecret, parseBundle, resolveDeploySecrets, type SelfhostBundle } from '../src/selfhost/deploy.js'
 
 describe('parseWranglerToml', () => {
   const sample = [
@@ -171,6 +171,37 @@ describe('resolveDeploySecrets', () => {
           "betterAuthSecret": "saved",
           "encryptionKey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
         },
+      }
+    `)
+  })
+})
+
+describe('canDecryptStoredSecret', () => {
+  // Encrypt exactly like app/src/db.ts encrypt(), so a drift in derivation fails here.
+  async function appEncrypt(keyBytes: Uint8Array, plaintext: string) {
+    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt'])
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(plaintext))
+    return { encrypted: Buffer.from(ct).toString('base64'), iv: Buffer.from(iv).toString('base64') }
+  }
+
+  test('accepts only the key that encrypted the stored value', async () => {
+    const derived = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('auth-secret')))
+    const fromAuth = await appEncrypt(derived, 'v')
+    const manualKey = Buffer.alloc(32, 3).toString('base64')
+    const fromManual = await appEncrypt(Buffer.from(manualKey, 'base64'), 'v')
+
+    expect({
+      derivedOk: await canDecryptStoredSecret({ betterAuthSecret: 'auth-secret', ...fromAuth }),
+      newSecret: await canDecryptStoredSecret({ betterAuthSecret: 'fresh', ...fromAuth }),
+      manualKeyMissing: await canDecryptStoredSecret({ betterAuthSecret: 'auth-secret', ...fromManual }),
+      manualKeyGiven: await canDecryptStoredSecret({ betterAuthSecret: 'fresh', encryptionKey: manualKey, ...fromManual }),
+    }).toMatchInlineSnapshot(`
+      {
+        "derivedOk": true,
+        "manualKeyGiven": true,
+        "manualKeyMissing": false,
+        "newSecret": false,
       }
     `)
   })

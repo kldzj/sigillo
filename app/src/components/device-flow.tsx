@@ -30,14 +30,14 @@ export function DeviceFlow({ initialCode = '' }: { initialCode?: string }) {
 
   function decide(approve: boolean) {
     if (step.kind !== 'confirm') return
-    setDecisionError(null)
     startTransition(async () => {
       const { error } = await (approve
         ? authClient.device.approve({ userCode: step.userCode })
         : authClient.device.deny({ userCode: step.userCode })
       ).catch(() => ({ error: true }))
       if (error) {
-        setDecisionError('Invalid or expired code. Please start the login again.')
+        setDecisionError('Invalid or expired code. Start the login again and enter the new code.')
+        setStep({ kind: 'enter' })
         return
       }
       setStep({ kind: 'done', approved: approve })
@@ -72,7 +72,6 @@ export function DeviceFlow({ initialCode = '' }: { initialCode?: string }) {
             Approve only if <strong>you</strong> started this login and the code above matches
             the one shown in your own terminal. If someone sent you this link, deny it.
           </p>
-          {decisionError && <p className="text-red-500 text-sm">{decisionError}</p>}
           <div className="flex gap-3 justify-center">
             <Button type="button" variant="outline" size="lg" disabled={pending} onClick={() => decide(false)}>
               Deny
@@ -91,6 +90,7 @@ export function DeviceFlow({ initialCode = '' }: { initialCode?: string }) {
       <div className="text-center max-w-sm">
         <h1 className="text-2xl font-bold mb-2">Device Login</h1>
         <p className="text-muted-foreground mb-6">Enter the code shown on your CLI or agent:</p>
+        {decisionError && <p className="text-red-500 text-sm mb-4">{decisionError}</p>}
         <ErrorBoundary
           above
           fallback={<ErrorBoundary.ErrorMessage className="text-red-500 text-sm mb-4" />}
@@ -102,12 +102,13 @@ export function DeviceFlow({ initialCode = '' }: { initialCode?: string }) {
               const { data, error } = await authClient.device({ query: { user_code: userCode } })
                 .catch(() => ({ data: null, error: true }))
               if (error || !data) throw new Error('Invalid or expired code. Please try again.')
+              setDecisionError(null)
               setStep({ kind: 'confirm', userCode })
             }}
           >
             <Input
               name={codeFields.userCode}
-              defaultValue={initialCode}
+              defaultValue={decisionError ? '' : initialCode}
               placeholder="ABCD-EFGH"
               maxLength={12}
               required
