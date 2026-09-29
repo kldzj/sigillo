@@ -114,11 +114,14 @@ async function buildTarget({ target }: { target: Target }): Promise<void> {
   fs.rmSync(path.join(rootDirectory, 'zig-out'), { recursive: true, force: true })
 
   // When building for the host platform, omit -Dtarget so Zig uses the
-  // native system include/lib paths.
+  // native system include/lib paths. Every build targets its architecture's
+  // baseline CPU, the host build too: Zig's default there is the build
+  // machine's own CPU, and CI's runner has AVX-512, so the published
+  // linux-x64 binary died with SIGILL on CPUs without it.
   const isNativeBuild = target.name === hostTarget
   const zigArgs = isNativeBuild
-    ? ['build', '-Doptimize=ReleaseFast', `-Dversion=${packageVersion}`]
-    : ['build', '-Doptimize=ReleaseFast', `-Dtarget=${target.zigTarget}`, `-Dversion=${packageVersion}`]
+    ? ['build', '-Doptimize=ReleaseFast', '-Dcpu=baseline', `-Dversion=${packageVersion}`]
+    : ['build', '-Doptimize=ReleaseFast', `-Dtarget=${target.zigTarget}`, '-Dcpu=baseline', `-Dversion=${packageVersion}`]
 
   await runCommand({
     command: 'zig',
