@@ -18,24 +18,27 @@ on:
       - '.github/workflows/cli-ci.yml'
   workflow_dispatch:
 
+# Actions are pinned to commits, so a moved tag can't change what runs with
+# the release's OIDC token. A push to main never cancels a running release:
+# cut off between uploading the bundle and staging npm, the next run would
+# find a release asset it can't replace.
 concurrency:
   group: sigillo-cli-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
         with:
           version: 0.15.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
@@ -56,7 +59,7 @@ jobs:
       - name: Check package.json needs no npm fixes
         working-directory: cli
         run: |
-          npx --yes npm@^11.15.0 pkg fix
+          npx --yes npm@11.20.0 pkg fix
           git diff --exit-code -- package.json
 
       - name: Build all targets
@@ -68,7 +71,7 @@ jobs:
         run: pnpm build
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: cli/dist/
@@ -93,10 +96,9 @@ jobs:
       RELEASE_ENABLED: ${{ vars.RELEASE_ENABLED == 'true' }}
 
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -119,7 +121,7 @@ jobs:
         run: pnpm --dir provider build && pnpm --dir app build && pnpm --dir app bundle:selfhost
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: cli/dist/
@@ -225,10 +227,10 @@ jobs:
       # OIDC token (no npm token is stored anywhere) and the version waits in
       # npm's stage queue until a maintainer approves it with 2FA:
       #   npm stage approve <stage-id>   (or npmjs.com → Staged Packages)
-      # npm stage needs npm 11.15.0 or later.
+      # npm stage needs npm 11.15.0 or later; the exact version is pinned.
       - name: Stage npm release
         if: env.RELEASE_ENABLED == 'true' && steps.version-check.outputs.skip == 'false'
         working-directory: cli
         run: |
-          npm install -g npm@^11.15.0
+          npm install -g npm@11.20.0
           npm stage publish --access public --provenance
