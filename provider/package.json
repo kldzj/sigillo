@@ -14,7 +14,8 @@
     "db:migrate:prod": "echo \"D1 pre-migration timestamp: $(date +%s)\" && wrangler d1 migrations apply DB --remote",
     "db:migrate:preview": "echo \"D1 pre-migration timestamp: $(date +%s)\" && wrangler d1 migrations apply DB --remote --env preview",
     "deployment": "pnpm db:migrate:preview && CLOUDFLARE_ENV=preview pnpm build && wrangler deploy --env preview",
-    "deployment:prod": "pnpm db:migrate:prod && pnpm build && wrangler deploy"
+    "deployment:prod": "pnpm db:migrate:prod && pnpm build && wrangler deploy",
+    "test": "vitest run"
   },
   "dependencies": {
     "@better-auth/oauth-provider": "1.7.6",
@@ -33,6 +34,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.47.0",
+    "@cloudflare/vitest-pool-workers": "^0.18.8",
     "@types/node": "^25.6.0",
     "@types/react": "latest",
     "@types/react-dom": "latest",
@@ -40,6 +42,7 @@
     "drizzle-kit": "1.0.0-rc.1",
     "typescript": "latest",
     "vite": "latest",
+    "vitest": "^4.1.11",
     "wrangler": "latest"
   }
 }

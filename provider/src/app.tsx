@@ -140,41 +140,21 @@ function getRedirectDomain(redirectUri: string | null) {
 }
 
 // Resolves where /sign-out sends the browser once the provider session is
-// gone. The caller proposes a URL, but it is only honoured when it shares an
-// origin with one of the calling client's registered redirect_uris — otherwise
-// /sign-out would be an open redirect on the domain that holds everyone's
-// login session. Self-hosted instances each register their own client, so a
-// client can only ever bounce back to itself.
-async function resolvePostLogoutRedirect(args: {
-  clientId: string | null
-  requested: string | null
-  origin: string
-}) {
-  const fallback = new URL('/', args.origin).toString()
-  if (!args.clientId || !args.requested) return fallback
-
-  let requestedUrl: URL
+// gone: only ever back to the app this provider signs in for (APP_URL).
+// Anyone can register a client with redirect URIs of their choosing, so a
+// client's own redirect URIs can't vouch for a target, and /sign-out would
+// otherwise be an open redirect on the domain that holds the login session.
+// Anything else lands on the app's /login.
+function resolvePostLogoutRedirect(requested: string | null, origin: string) {
+  const app = env.APP_URL ? new URL(env.APP_URL) : null
+  const fallback = app ? new URL('/login', app).toString() : new URL('/', origin).toString()
+  if (!app || !requested) return fallback
   try {
-    requestedUrl = new URL(args.requested)
+    const url = new URL(requested)
+    return url.origin === app.origin ? url.toString() : fallback
   } catch {
     return fallback
   }
-
-  const db = getDb()
-  const client = await db.query.oauthClient.findFirst({
-    where: { clientId: args.clientId },
-    columns: { redirectUris: true },
-  })
-  if (!client) return fallback
-
-  const allowed = client.redirectUris.some((uri) => {
-    try {
-      return new URL(uri).origin === requestedUrl.origin
-    } catch {
-      return false
-    }
-  })
-  return allowed ? requestedUrl.toString() : fallback
 }
 
 // Starts the Google sign-in redirect. Uses returnHeaders so we get both the
@@ -291,15 +271,11 @@ export const app = new Spiceflow()
   // and pre-registered `post_logout_redirect_uris`. Our clients are registered
   // dynamically at first boot and genericOAuth does not retain the id_token,
   // so every existing client would have to be re-registered. The redirect
-  // target is validated against the client's registered redirect_uris instead,
-  // which gives the same open-redirect protection with none of that setup.
+  // target is only ever the app's own URL (APP_URL) instead, which needs none
+  // of that setup.
   .get('/sign-out', async ({ request }) => {
     const url = new URL(request.url)
-    const target = await resolvePostLogoutRedirect({
-      clientId: url.searchParams.get('client_id'),
-      requested: url.searchParams.get('post_logout_redirect_uri'),
-      origin: url.origin,
-    })
+    const target = resolvePostLogoutRedirect(url.searchParams.get('post_logout_redirect_uri'), url.origin)
 
     const auth = getAuth()
     const redirect = new Response(null, { status: 302, headers: { Location: target } })
