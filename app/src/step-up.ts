@@ -64,6 +64,9 @@ export async function verifyPasskey({ userId, response, expectedChallenge, origi
   origin: string
   rpID: string
 }): Promise<boolean> {
+  // The id names one of the user's passkeys; anything but a string would reach
+  // the relational `where` as filter operators instead
+  if (typeof response?.id !== 'string') return false
   const db = getDb()
   const passkey = await db.query.passkey.findFirst({ where: { credentialID: response.id, userId } })
   if (!passkey) return false

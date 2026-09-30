@@ -3293,7 +3293,9 @@ describe('passkeys', () => {
       otherChallenge: await verify(alice.user.id, () => authenticator.authenticate({ challenge: 'c29tZXRoaW5nIGVsc2U' })),
       otherOrigin: await verify(alice.user.id, (o) => authenticator.authenticate(o, { origin: 'https://evil.example' })),
       someoneElsesUser: await verify(bob.user.id, (o) => authenticator.authenticate(o)),
-    }).toEqual({ verified: true, counterAdvanced: true, withoutUserVerification: false, otherChallenge: false, otherOrigin: false, someoneElsesUser: false })
+      // An id that isn't a string names no passkey
+      notAnId: await verify(alice.user.id, async (o) => ({ ...await authenticator.authenticate(o), id: { isNotNull: true } as unknown as string })),
+    }).toEqual({ verified: true, counterAdvanced: true, withoutUserVerification: false, otherChallenge: false, otherOrigin: false, someoneElsesUser: false, notAnId: false })
   })
 })
 
