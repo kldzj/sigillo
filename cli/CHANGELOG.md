@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.2
+
+### Patch Changes
+
+- 0e3998e: Check the types of every server action's and API handler's arguments before they reach a database query, so a client value can only ever be looked up by its exact id. This release fixes security issues: update your instance with `npx @kldzj/sigillo@latest self-host`.
+
 ## 0.17.1
 
 ### Patch Changes

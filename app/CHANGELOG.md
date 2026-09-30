@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1
+
+### Patch Changes
+
+- 0e3998e: Check the types of every server action's and API handler's arguments before they reach a database query, so a client value can only ever be looked up by its exact id. This release fixes security issues: update your instance with `npx @kldzj/sigillo@latest self-host`.
+- da53509: More checks on sign-out, deletes and approvals:
+
+  - The login provider's sign-out sends the browser only back to its own app, never to an address a registered client names.
+  - Deleting a secret takes only a name the set routes accept, or the name of a secret that already has one from before names had rules.
+  - Only a login from signing in with Google approves or denies a CLI login: a CLI login can no longer approve the next one. A browser login from before sign-ins were told apart needs signing in again for it.
+  - A passkey approval looks a passkey up only by an id that is a string.
+
 ## 0.4.0
 
 ### Minor Changes
