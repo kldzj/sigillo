@@ -5,7 +5,7 @@
     "outDir": "dist",
     "noEmit": true,
     "lib": ["ESNext", "DOM"],
-    "types": [],
+    "types": ["@cloudflare/vitest-pool-workers/types"],
     // Vite-bundled worker like app/ — bundler resolution with the workerd
     // condition. The inherited nodenext resolution caused TS2883 "type cannot
     // be named" errors through better-auth's symlinked pnpm deps.
