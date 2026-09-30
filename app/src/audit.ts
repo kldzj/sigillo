@@ -24,6 +24,7 @@ import type { BatchItem } from 'drizzle-orm/batch'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import { actorOf, encrypt, decrypt, deriveSecrets, getUserEnvironmentAccess, InvalidInputError } from './db.ts'
+import { getSecretNameError } from './lib/utils.ts'
 import { requireStepUp, requireProtectedAccess, requireAdminApproval, StepUpRequiredError, type Reader } from './step-up.ts'
 import { securityEvent } from './security-log.ts'
 
@@ -197,6 +198,20 @@ export type NewSecretEvent = {
   operation: 'set' | 'delete'
   // Plaintext of a set event
   value?: string
+}
+
+// Where a secret may be deleted: a name the set routes would refuse only
+// where a secret has it, one made before names had rules, so nothing else
+// such a name reaches the signed history
+export async function environmentsToDeleteFrom(environmentIds: string[], name: string): Promise<string[]> {
+  const nameError = getSecretNameError(name)
+  if (!nameError) return environmentIds
+  const holding: string[] = []
+  for (const environmentId of environmentIds) {
+    if ((await deriveSecrets(environmentId)).some((secret) => secret.name === name)) holding.push(environmentId)
+  }
+  if (holding.length === 0) throw new InvalidInputError(nameError)
+  return holding
 }
 
 // The only way secret_event rows are written. Changing a protected

@@ -31,7 +31,7 @@ import {
   endUserSession,
   endOtherUserSessions,
 } from './db.ts'
-import { appendSecretEvents, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, purgeOldValues, type NewSecretEvent } from './audit.ts'
+import { appendSecretEvents, environmentsToDeleteFrom, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, purgeOldValues, type NewSecretEvent } from './audit.ts'
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
   requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, resetMemberPasskeys, type Purpose,
@@ -114,9 +114,10 @@ export async function deleteSecretAction({ name, environmentIds }: {
     if (envs.some((env) => env.projectId !== envs[0]!.projectId)) {
       throw new Error('All environments must belong to the same project')
     }
+    const environments = await environmentsToDeleteFrom(unique, name)
     await appendSecretEvents({
       author: authorOf(session),
-      events: unique.map((environmentId) => ({ environmentId, name, operation: 'delete' as const })),
+      events: environments.map((environmentId) => ({ environmentId, name, operation: 'delete' as const })),
     })
     return { ok: true }
   })

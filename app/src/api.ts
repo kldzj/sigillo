@@ -43,7 +43,7 @@ import {
   deleteProject,
   type CredentialExpiry,
 } from './db.ts'
-import { appendSecretEvents, recordSecretRead, getAuditChains } from './audit.ts'
+import { appendSecretEvents, environmentsToDeleteFrom, recordSecretRead, getAuditChains } from './audit.ts'
 import { StepUpRequiredError, createStepUpRequest, stepUpRequestStatus, requireProtectedAccess, requireAdminForProtected, requireProjectChange } from './step-up.ts'
 import { memoize } from './lib/memoize.ts'
 import { exchangeWorkloadToken } from './workload.ts'
@@ -921,9 +921,10 @@ export const apiApp = new Spiceflow()
     response: secretDeleteResponseSchema,
     async handler({ params, request }) {
       const auth = await requireSecretsApiAuth({ request, environmentRef: params.environmentId, projectId: params.projectId })
+      const [environmentId] = await environmentsToDeleteFrom([auth.environmentId], params.name)
       await appendSecretEvents({
         author: auth,
-        events: [{ environmentId: auth.environmentId, name: params.name, operation: 'delete' }],
+        events: [{ environmentId: environmentId!, name: params.name, operation: 'delete' }],
       })
       return { ok: true, name: params.name }
     },

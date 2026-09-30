@@ -403,9 +403,11 @@ describe('secrets — core flow', () => {
   let af: ReturnType<typeof authedFetch>
   let projectId: string
   let envId: string
+  let owner: Awaited<ReturnType<typeof createTestUser>>
 
   beforeAll(async () => {
     const user = await createTestUser({ name: 'SecretUser' })
+    owner = user
     af = authedFetch(user.token)
     const org = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Secret Org' } }))
     const proj = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Secret Project', orgId: org.id } }))
@@ -456,6 +458,27 @@ describe('secrets — core flow', () => {
       params: { pid: projectId, eid: envId, name: 'TO_DELETE' },
     })
     expect(gone).toBeInstanceOf(Error)
+  })
+
+  test('deleting takes a name the set routes accept, or one a secret already has', async () => {
+    const rows = async (name: string) => (await getDb().select({ id: schema.secretEvent.id }).from(schema.secretEvent)
+      .where(orm.and(orm.eq(schema.secretEvent.environmentId, envId), orm.eq(schema.secretEvent.name, name)))).length
+    const del = (name: string) => app.handle(new Request(`http://e.ly/api/v0/projects/${projectId}/environments/${envId}/secrets/${encodeURIComponent(name)}`, {
+      method: 'DELETE', headers: { authorization: `Bearer ${owner.token}` },
+    }))
+    // A newline and an escape: nothing a secret name may hold
+    const refused = 'BAD\n\u001b[2JNAME'
+    const refusedAnswer = await del(refused)
+    // A secret from before names had rules keeps its name, and can be deleted
+    await appendSecretEvents({ author: { userId: owner.user.id, apiTokenId: null }, events: [{ environmentId: envId, name: 'legacy-name', operation: 'set', value: 'old' }] })
+    const legacyAnswer = await del('legacy-name')
+    expect({
+      refused: refusedAnswer.status,
+      refusedRows: await rows(refused),
+      legacy: legacyAnswer.status,
+      // Its set and its delete
+      legacyRows: await rows('legacy-name'),
+    }).toEqual({ refused: 400, refusedRows: 0, legacy: 200, legacyRows: 2 })
   })
 
   test('event sourcing: set → update → delete → set yields final value', async () => {
