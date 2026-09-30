@@ -4223,6 +4223,22 @@ describe('passkey enrollment', () => {
     expect({ status: res.status, location: res.headers.get('location') }).toEqual({ status: 302, location: `${origin}/login?redirect=/approve` })
   })
 
+  test('only a Google sign-in approves a CLI login: a login the device flow made can\'t make another', async () => {
+    // A login ends 30 days after its sign-in. If a CLI login could approve
+    // another device login, one taken from a machine would approve a fresh
+    // one before it ended, and the next, for as long as its user has no
+    // passkey: the 30 days would end nothing
+    const user = await createTestUser()
+    const cli = await deviceLogin(user.token)
+    const code = await (await send('/api/auth/device/code', { body: { client_id: 'sigillo-cli' } })).json() as { device_code: string; user_code: string }
+    await send(`/api/auth/device?user_code=${code.user_code}`, { token: cli })
+    const approved = await send('/api/auth/device/approve', { token: cli, body: { userCode: code.user_code } })
+    const issued = await (await send('/api/auth/device/token', {
+      body: { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: code.device_code, client_id: 'sigillo-cli' },
+    })).json() as { access_token?: string }
+    expect({ approve: approved.status, successor: issued.access_token ?? null }).toEqual({ approve: 403, successor: null })
+  })
+
   test('a CLI login approved by an old session is no fresh sign-in for a first passkey', async () => {
     const user = await createTestUser()
     await getDb().update(schema.session).set({ createdAt: Date.now() - 10 * 60 * 1000 }).where(orm.eq(schema.session.id, await sessionIdOf(user.token)))

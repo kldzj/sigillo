@@ -146,11 +146,16 @@ export const app = new Spiceflow({ tracer })
       && !request.headers.has('authorization') && origin && origin !== url.origin) {
       return Response.json({ error: 'cross-origin request refused' }, { status: 403 })
     }
-    // Approving a CLI login makes a login that outlives this session: once
-    // you have a passkey, it takes an approval with it (step-up.ts)
-    if (url.pathname === '/api/auth/device/approve' && request.method === 'POST') {
+    // Approving a CLI login makes a login that outlives this session: only a
+    // Google sign-in may, never a login the device flow made (else each could
+    // approve the next, and the 30 days would end nothing), and once you have
+    // a passkey, it takes an approval with it (step-up.ts)
+    if ((url.pathname === '/api/auth/device/approve' || url.pathname === '/api/auth/device/deny') && request.method === 'POST') {
       const session = await getSession(request)
-      if (session) {
+      if (session && !session.signedIn) {
+        return Response.json({ code: 'SIGN_IN_REQUIRED', message: 'Approve CLI logins in a browser you signed in to with Google' }, { status: 403 })
+      }
+      if (session && url.pathname === '/api/auth/device/approve') {
         try {
           await requirePasskeyOnceEnrolled(session)
         } catch (error) {

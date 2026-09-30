@@ -45,6 +45,12 @@ export function DeviceFlow() {
         if (!await approveInBrowser({ purpose: 'admin', environmentIds: [] })) return
         error = await send()
       }
+      // A login from before the server told Google sign-ins apart
+      if (error?.code === 'SIGN_IN_REQUIRED') {
+        setDecisionError('Only a login from signing in with Google approves a CLI login. Log out, sign in again, and enter the code.')
+        setStep({ kind: 'enter' })
+        return
+      }
       if (error) {
         setDecisionError('Invalid or expired code. Start the login again and enter the new code.')
         setStep({ kind: 'enter' })
