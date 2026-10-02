@@ -420,6 +420,10 @@ export function getDataCenter(request: Request & { cf?: { colo?: string } }): st
 
 type Session = { userId: string; sessionId: string; sessionCreatedAt: number; signedIn: boolean; user: { id: string; name: string; email: string; emailVerified: boolean } }
 
+// What the web UI's actions, and making a token, say to a login that isn't a
+// Google sign-in in a browser (signedIn), such as a CLI login
+export const BROWSER_SIGN_IN_REQUIRED = 'Only a browser you signed in to with Google can do this, not a CLI login or a token'
+
 // Spiceflow passes the SAME request instance to every matched loader/layout in
 // a single navigation (verified against the framework source). Several loaders
 // call getSession concurrently for one navigation, so without deduping each

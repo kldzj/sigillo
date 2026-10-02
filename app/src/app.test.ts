@@ -27,6 +27,8 @@ import { passkeyChallenge, verifyPasskey, StepUpRequiredError, findStepUpRequest
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { createTrustRule, deleteTrustRule, renewTrustRule, replaceTrustRuleKeys, trustRuleEvidence, type TrustRuleInput } from './workload.js'
 import { createToken, deleteToken, expiringCredentials, expiryBanner, regenerateToken, stopPreviousValue } from './tokens.js'
+import * as actions from './actions.js'
+import { runAction } from 'spiceflow/testing'
 import * as jose from 'jose'
 import { formatAbsoluteDate, formatTime, isUserAllowed, loginErrorMessage, describeUserAgent, formatIp, formatUserCode, describeExpiry, GITHUB_ISSUER } from './lib/utils.js'
 import { asId, asString, asText, asBool, asOneOf, asList, asObject, asStringRecord, optional, nullable } from './lib/input.js'
@@ -4241,6 +4243,46 @@ describe('passkey enrollment', () => {
     expect({ approve: approved.status, successor: issued.access_token ?? null }).toEqual({ approve: 403, successor: null })
   })
 
+  test('the web UI\'s actions take a browser signed in with Google: a CLI login can\'t make a token or an invite link with them', async () => {
+    const user = await createTestUser({ name: 'Action Admin' })
+    const af = authedFetch(user.token)
+    const orgId = assertOk(await af('/api/v0/orgs', { method: 'POST', body: { name: 'Action Org' } })).id
+    const projectId = assertOk(await af('/api/v0/projects', { method: 'POST', body: { name: 'Action Project', orgId } })).id
+    const cli = await deviceLogin(user.token)
+    // An action called with the session cookie, as the browser does, or with a bearer token
+    const cookie = (token: string) => ({ cookie: `better-auth.session_token=${encodeURIComponent(token)}` })
+    const bearer = (token: string) => ({ authorization: `Bearer ${token}` })
+    const as = (headers: Record<string, string>, run: () => Promise<unknown>) => runAction(run, { request: new Request(`${origin}/dash`, { method: 'POST', headers }) })
+      .then((result) => result && typeof result === 'object' && 'stepUp' in result ? 'step-up' : 'ok', (error) => (error as Error).message)
+    const makeToken = () => actions.createTokenAction({ name: 'From the web UI', projectId, expiresInDays: 365 })
+    const invite = () => actions.createInviteAction({ orgId })
+    const made = async () => ({
+      tokens: (await getDb().query.apiToken.findMany({ where: { projectId } })).length,
+      invites: (await getDb().query.orgInvitation.findMany({ where: { orgId } })).length,
+    })
+    const refused = 'Only a browser you signed in to with Google can do this, not a CLI login or a token'
+    const byCli = { token: await as(bearer(cli), makeToken), invite: await as(bearer(cli), invite), asCookie: await as(cookie(cli), makeToken) }
+    const byBearer = await as(bearer(user.token), invite)
+    const before = await made()
+    const browser = { token: await as(cookie(user.token), makeToken), invite: await as(cookie(user.token), invite) }
+    // Called directly, making a token or a new value for one checks it too
+    const cliLogin = { userId: user.user.id, sessionId: await sessionIdOf(cli), signedIn: false }
+    const madeToken = (await getDb().query.apiToken.findFirst({ where: { projectId } }))!
+    const direct = {
+      create: await createToken({ ...cliLogin, name: 'Direct', projectId, expiresInDays: 365 }).then(() => 'ok', (error) => (error as Error).message),
+      regenerate: await regenerateToken({ ...cliLogin, tokenId: madeToken.id, prefix: madeToken.prefix, expiresInDays: 365, graceDays: 0 }).then(() => 'ok', (error) => (error as Error).message),
+    }
+    expect({ byCli, byBearer, before, browser, direct, after: await made(), prefix: (await getDb().query.apiToken.findFirst({ where: { id: madeToken.id } }))!.prefix }).toEqual({
+      byCli: { token: refused, invite: refused, asCookie: refused },
+      byBearer: refused,
+      before: { tokens: 0, invites: 0 },
+      browser: { token: 'ok', invite: 'ok' },
+      direct: { create: refused, regenerate: refused },
+      after: { tokens: 1, invites: 1 },
+      prefix: madeToken.prefix,
+    })
+  })
+
   test('a CLI login approved by an old session is no fresh sign-in for a first passkey', async () => {
     const user = await createTestUser()
     await getDb().update(schema.session).set({ createdAt: Date.now() - 10 * 60 * 1000 }).where(orm.eq(schema.session.id, await sessionIdOf(user.token)))
@@ -4666,7 +4708,8 @@ describe('renewals', () => {
   const ISSUER = 'https://issuer.test'
   const AUDIENCE = 'https://secrets.test'
   const DAY = 86_400_000
-  type Login = { userId: string; sessionId: string }
+  // A Google sign-in's login, as the web UI's actions pass it
+  type Login = { userId: string; sessionId: string; signedIn: boolean }
   let admin: Awaited<ReturnType<typeof createTestUser>>
   let member: Awaited<ReturnType<typeof createTestUser>>
   let adminLogin: Login
@@ -4685,8 +4728,8 @@ describe('renewals', () => {
     dev = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'dev' } })).id
     prod = assertOk(await af('/api/v0/projects/:projectId/environments/:id', { params: { projectId, id: 'prod' } })).id
     await getDb().insert(schema.orgMember).values({ orgId, userId: member.user.id, role: 'member' })
-    adminLogin = { userId: admin.user.id, sessionId: await sessionIdOf(admin.token) }
-    memberLogin = { userId: member.user.id, sessionId: await sessionIdOf(member.token) }
+    adminLogin = { userId: admin.user.id, sessionId: await sessionIdOf(admin.token), signedIn: true }
+    memberLogin = { userId: member.user.id, sessionId: await sessionIdOf(member.token), signedIn: true }
     await appendSecretEvents({
       author: { ...adminLogin, apiTokenId: null },
       events: [
@@ -4883,8 +4926,8 @@ describe('renewals', () => {
       .where(orm.and(orm.eq(schema.orgMember.orgId, orgId), orm.eq(schema.orgMember.userId, leaving.user.id)))
     await getDb().update(schema.orgMember).set({ role: 'member' })
       .where(orm.and(orm.eq(schema.orgMember.orgId, orgId), orm.eq(schema.orgMember.userId, demoted.user.id)))
-    const asColleague = { userId: colleague.user.id, sessionId: await sessionIdOf(colleague.token) }
-    const asOtherAdmin = { userId: otherAdmin.user.id, sessionId: await sessionIdOf(otherAdmin.token) }
+    const asColleague = { userId: colleague.user.id, sessionId: await sessionIdOf(colleague.token), signedIn: true }
+    const asOtherAdmin = { userId: otherAdmin.user.id, sessionId: await sessionIdOf(otherAdmin.token), signedIn: true }
     const before = {
       colleague: await outcome(regenerate(plain.tokenId, { by: asColleague })),
       adminWithoutPasskey: await outcome(regenerate(machine.tokenId, { by: asOtherAdmin })),
@@ -4934,7 +4977,7 @@ describe('renewals', () => {
     const owner = await createTestUser({ name: 'Rule Owner' })
     const [membership] = await getDb().insert(schema.orgMember).values({ orgId, userId: owner.user.id, role: 'admin' }).returning({ id: schema.orgMember.id })
     await grantAdmin(owner.token, Date.now() + 10 * 60_000)
-    const { id } = await rule({ name: 'Renewed', subject: 'renewed' }, { userId: owner.user.id, sessionId: await sessionIdOf(owner.token) })
+    const { id } = await rule({ name: 'Renewed', subject: 'renewed' }, { userId: owner.user.id, sessionId: await sessionIdOf(owner.token), signedIn: true })
     await getDb().update(schema.trustRule).set({ expiresAt: Date.now() + DAY }).where(orm.eq(schema.trustRule.id, id))
     await getDb().update(schema.orgMember).set({ role: 'member' }).where(orm.eq(schema.orgMember.id, membership!.id))
     const ownerDemoted = await exchange({ token: await signed({ sub: 'renewed' }) })
@@ -4984,7 +5027,7 @@ describe('renewals', () => {
     const renew = (ruleId: string, expiresInDays: number, by: Login = adminLogin) => outcome(renewTrustRule({ ...by, ownHost: 'e.ly', ruleId, expiresInDays }))
     expect({
       member: await renew(id, 30, memberLogin),
-      adminWithoutPasskey: await renew(id, 30, { userId: newAdmin.user.id, sessionId: await sessionIdOf(newAdmin.token) }),
+      adminWithoutPasskey: await renew(id, 30, { userId: newAdmin.user.id, sessionId: await sessionIdOf(newAdmin.token), signedIn: true }),
       protectedForAYear: await renew(id, 365),
       protectedFor90Days: await renew(id, 90),
       liar: await renew(liar!.id, 30),
@@ -5004,7 +5047,7 @@ describe('renewals', () => {
   test('someone outside the organization gets the same answer for a rule or token that exists as for one that doesn\'t', async () => {
     const stranger = await createTestUser({ name: 'Renewal Stranger' })
     assertOk(await authedFetch(stranger.token)('/api/v0/orgs', { method: 'POST', body: { name: 'Stranger Org' } }))
-    const strangerLogin = { userId: stranger.user.id, sessionId: await sessionIdOf(stranger.token) }
+    const strangerLogin = { userId: stranger.user.id, sessionId: await sessionIdOf(stranger.token), signedIn: true }
     const { id: protectedRule } = await rule({ name: 'Unseen protected', subject: 'unseen-protected', environmentIds: [prod], protectedAccess: true, expiresInDays: 90 })
     const { id: discovered } = await rule({ name: 'Unseen discovered', subject: 'unseen-discovered' })
     const { id: pasted } = await rule({ name: 'Unseen pasted', subject: 'unseen-pasted', jwks: JSON.stringify({ keys: [publicOf(workerEnv.TEST_ISSUER_KEYS.rsa)] }) })
@@ -5238,7 +5281,7 @@ describe('renewals', () => {
     const [logDev, logPreview] = [(await env('dev')).id, (await env('preview')).id]
     const [membership] = await getDb().insert(schema.orgMember).values({ orgId: logOrg, userId: logMember.user.id, role: 'member' }).returning()
     await grantAdmin(logAdmin.token, Date.now() + 10 * 60_000)
-    const by = { userId: logAdmin.user.id, sessionId: await sessionIdOf(logAdmin.token), request: new Request('http://e.ly', { headers: { 'cf-connecting-ip': '203.0.113.9' } }) }
+    const by = { userId: logAdmin.user.id, sessionId: await sessionIdOf(logAdmin.token), signedIn: true, request: new Request('http://e.ly', { headers: { 'cf-connecting-ip': '203.0.113.9' } }) }
 
     const made = await createToken({ ...by, name: 'Logged CI', projectId: logProject, expiresInDays: 30 })
     await regenerateToken({ ...by, tokenId: made.id, prefix: (await tokenRow(made.id)).prefix, expiresInDays: 30, graceDays: 1 })

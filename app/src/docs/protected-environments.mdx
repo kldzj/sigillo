@@ -45,6 +45,8 @@ An approval lets that one browser or CLI login read and change those environment
 
 Once you have a passkey, approving a CLI login on `/device` and creating an API token take it too. Both keep working after the session that made them ends, so a stolen browser session could otherwise turn itself into one. The `/device` page takes the code typed from your terminal, never from the link, like `/approve`.
 
+Approving a CLI login, making or regenerating a token, and everything else in the web UI take a browser you signed in to with Google. A CLI login can do none of them: the CLI uses the REST API.
+
 ## Admin actions
 
 Once an organization has a protected environment, every admin action in it takes a passkey as well: inviting someone, changing a role or a member's projects, removing a member, auto-join, an environment's **Min Role** or protection, deleting or renaming a protected environment or its project, resetting passkeys, making or deleting a machine token, and deleting the organization. Otherwise someone with an admin's session could invite an account of their own, or open production to one. One approval covers admin actions for 5 minutes. Organizations without a protected environment work as before.

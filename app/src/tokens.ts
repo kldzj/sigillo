@@ -15,7 +15,7 @@ import * as orm from 'drizzle-orm'
 import { ulid } from 'ulid'
 import { getDb, schema } from 'db'
 import {
-  generateApiToken, getEnvironmentAccessError, getMemberAccess, getOrgIdForProject, getProjectMemberAccess, requireValidName, tokenCreatorError,
+  BROWSER_SIGN_IN_REQUIRED, generateApiToken, getEnvironmentAccessError, getMemberAccess, getOrgIdForProject, getProjectMemberAccess, requireValidName, tokenCreatorError,
 } from './db.ts'
 import { requireMachineTokenApproval, requireMachineTokenDeletion, requirePasskeyOnceEnrolled, requireTokenDeletion } from './step-up.ts'
 import { securityEvent } from './security-log.ts'
@@ -25,6 +25,15 @@ const DAY_MS = 86_400_000
 
 // The signed-in person changing a token, and their request, for the IP
 type Login = { userId: string; sessionId: string; request?: Request | null }
+
+// A token, or a token's new value, outlives the login that makes it: only a
+// Google sign-in makes one, never a CLI login, which could otherwise turn
+// itself into a token that outlasts it and its 30 days
+type SignedInLogin = Login & { signedIn: boolean }
+
+function requireSignedIn(signedIn: boolean) {
+  if (!signedIn) throw new Error(BROWSER_SIGN_IN_REQUIRED)
+}
 
 // A token reads every secret in its scope, so making, regenerating or
 // deleting one needs access to that whole scope: the listed envs, or every
@@ -68,7 +77,7 @@ function tokenEvent({ userId, request, kind, token, details }: {
   return securityEvent({ request, author: { userId, apiTokenId: null }, kind, where: { projectId: token.projectId }, subject: { id: token.id, name: token.name }, details })
 }
 
-export async function createToken({ userId, sessionId, request = null, name, projectId, environmentIds = [], expiresInDays, protectedAccess = false }: Login & {
+export async function createToken({ userId, sessionId, signedIn, request = null, name, projectId, environmentIds = [], expiresInDays, protectedAccess = false }: SignedInLogin & {
   name: string
   projectId: string
   environmentIds?: string[]
@@ -76,6 +85,7 @@ export async function createToken({ userId, sessionId, request = null, name, pro
   // A machine token, which reads protected environments without a passkey
   protectedAccess?: boolean
 }): Promise<{ id: string; key: string }> {
+  requireSignedIn(signedIn)
   // Token names reach the security log, the CLI and notifications
   requireValidName(name)
   if (!projectId) throw new Error('Project is required')
@@ -133,13 +143,14 @@ export async function deleteToken({ userId, sessionId, request = null, tokenId }
 
 const REGENERATED_MEANWHILE = 'Someone regenerated this token meanwhile: reload the page to see its new value\'s expiry'
 
-export async function regenerateToken({ userId, sessionId, request = null, tokenId, prefix, expiresInDays, graceDays }: Login & {
+export async function regenerateToken({ userId, sessionId, signedIn, request = null, tokenId, prefix, expiresInDays, graceDays }: SignedInLogin & {
   tokenId: string
   // The prefix of the value the page showed: a regeneration since refuses this one
   prefix: string
   expiresInDays: number
   graceDays: number
 }): Promise<{ id: string; key: string; previousExpiresAt: number | null }> {
+  requireSignedIn(signedIn)
   requireExpiryChoice(expiresInDays)
   if (!GRACE_DAYS.some((days) => days === graceDays)) throw new Error('The previous value keeps working for 0, 1 or 7 days')
   const token = await changeableToken({ userId, sessionId, tokenId })

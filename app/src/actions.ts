@@ -1,3 +1,5 @@
+'use server'
+
 // Shared server actions for the Sigillo app UI.
 // Client components import these directly instead of receiving action props.
 //
@@ -7,8 +9,9 @@
 //
 // Actions throw on error (caught by ErrorBoundary in the UI) and return
 // objects on success. Never return strings or scalar values.
-
-'use server'
+//
+// 'use server' stays the first line: spiceflow strips it for the tests only
+// there, and the tests call these as functions.
 
 import { ulid } from 'ulid'
 import { getEnvSlugError, getSecretNameError, TOKEN_EXPIRY_DAYS, GRACE_DAYS } from './lib/utils.ts'
@@ -30,6 +33,7 @@ import {
   deleteEnvironment, deleteProject,
   endUserSession,
   endOtherUserSessions,
+  BROWSER_SIGN_IN_REQUIRED,
 } from './db.ts'
 import { appendSecretEvents, environmentsToDeleteFrom, recordSecretRead, setEnvironmentProtection, readSecretValues, readEventValue, purgeOldValues, type NewSecretEvent } from './audit.ts'
 import {
@@ -41,10 +45,15 @@ import { createTrustRule, deleteTrustRule, renewTrustRule, replaceTrustRuleKeys,
 import { createToken, deleteToken, regenerateToken, stopPreviousValue } from './tokens.ts'
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server'
 
+// Server actions are the web UI's: only a login from signing in with Google,
+// in a browser. A CLI login (the device flow) is none, and a browser never
+// sends a bearer token, so neither may call them. The CLI has the REST API.
 async function requireSession() {
   const request = getActionRequest()
+  if (request.headers.has('authorization')) throw new Error(BROWSER_SIGN_IN_REQUIRED)
   const session = await getSession(request)
   if (!session) throw new Error('Unauthorized')
+  if (!session.signedIn) throw new Error(BROWSER_SIGN_IN_REQUIRED)
   return session
 }
 
@@ -531,8 +540,8 @@ export async function endOtherSessionsAction() {
 
 // The signed-in person changing a token, and their request
 async function tokenLogin() {
-  const { userId, sessionId } = await requireSession()
-  return { userId, sessionId, request: getActionRequest() }
+  const { userId, sessionId, signedIn } = await requireSession()
+  return { userId, sessionId, signedIn, request: getActionRequest() }
 }
 
 export async function createTokenAction({ name, projectId, environmentIds, expiresInDays, protectedAccess }: {

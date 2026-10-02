@@ -58,7 +58,7 @@ Nothing depends on anyone else's servers.
 | Anyone with `~/.sigillo/selfhost.json` and its passphrase | Decrypt a database export or backup and use the sessions in an export, sign history rows, and with a saved login deploy to the account | [The passphrase](./updating.mdx#your-deploy-file) |
 | Anyone who can sign in | What their org role and project access allow | [The sign-in allowlist](./self-hosting.mdx#who-can-sign-in) |
 | A CI job or pod that a trust rule accepts | What the rule grants, with a token of one hour | [Narrow trust rules](./workload-identity.mdx) |
-| Anyone with a stolen browser session or CLI login | What that person can read and change, except protected environments, and admin actions in an org that has one | [Passkeys](./protected-environments.mdx) |
+| Anyone with a stolen browser session or CLI login | What that person can read and change, except protected environments, and admin actions in an org that has one. A CLI login can't use the web UI or make tokens | [Passkeys](./protected-environments.mdx) |
 | Org admins | Every project and environment of their org | [Few admins](./access.mdx) |
 
 ## Encryption
