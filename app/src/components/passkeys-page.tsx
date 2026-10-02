@@ -1,9 +1,9 @@
 // Your passkeys: they approve access to protected environments, in the browser
 // and for the CLI. The first one takes a Google sign-in from the last 5
 // minutes, and an admin's approval once your organization has an admin with a
-// passkey. Each further one takes an approval with a passkey you have: in this
-// browser, or on another device with a code, like the CLI. Additions and
-// removals are logged for the admins of your organizations.
+// passkey. Each further one takes an approval with a passkey you have, with a
+// code typed on /approve in this browser or on another device, like the CLI.
+// Additions and removals are logged for the admins of your organizations.
 
 "use client";
 
@@ -23,7 +23,7 @@ import {
 import { TimeAgo } from "sigillo-app/src/components/ui/time-ago";
 import { authClient } from "../auth-client.ts";
 import { removePasskeyAction, requestEnrollmentAction, enrollmentStatusAction } from "../actions.ts";
-import { approveInBrowser, withStepUp } from "./step-up.ts";
+import { withStepUp } from "./step-up.ts";
 
 const addSchema = z.object({ name: z.string().trim().max(60) });
 const addFields = addSchema.keyof().enum;
@@ -59,9 +59,6 @@ export function PasskeysPage() {
   const add = (name: string) => startTransition(async () => {
     setError(null);
     try {
-      // Another passkey needs an approval with one you already have, unless
-      // one was approved for this browser already
-      if (passkeys.length > 0 && !enrollment.approved && !await approveInBrowser({ purpose: "admin", environmentIds: [] })) return;
       const { error } = await authClient.passkey.addPasskey({ name: name || undefined });
       if (error) {
         // Cancelling the browser's prompt comes back as a passthrough of its NotAllowedError
@@ -164,7 +161,7 @@ export function PasskeysPage() {
       ) : enrollment.pending?.userCode ? (
         <div className="flex flex-col gap-2 max-w-md">
           <p className="text-sm text-muted-foreground">
-            On a device with one of your passkeys, open <code className="mono-sm">{approveUrl}</code> and enter:
+            In this browser or on another device with one of your passkeys, open <code className="mono-sm">{approveUrl}</code> and enter:
           </p>
           <p className="text-2xl font-semibold mono-sm tracking-[0.25em]">{enrollment.pending.userCode}</p>
           <p className="text-xs text-muted-foreground">Waiting for your approval…</p>
@@ -187,20 +184,19 @@ export function PasskeysPage() {
         <div>
           <Button loading={pending} disabled={pending} onClick={() => ask(false)}>Ask an admin to approve</Button>
         </div>
+      ) : passkeys.length === 0 ? (
+        addForm
       ) : (
-        <div className="flex flex-col gap-3">
-          {addForm}
-          {passkeys.length > 0 && (
-            <div className="flex flex-col gap-1 items-start">
-              <p className="text-sm text-muted-foreground">Your passkey isn't in this browser?</p>
-              {freshSignIn ? (
-                <Button variant="outline" size="sm" disabled={pending} onClick={() => ask(true)}>Approve on another device</Button>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  <a className="underline" href="/logout?redirect=/dash/passkeys">Sign in again</a> first, then approve it on a device that has one.
-                </p>
-              )}
-            </div>
+        <div className="flex flex-col gap-2 items-start max-w-md">
+          <p className="text-sm text-muted-foreground">
+            Another passkey takes an approval with one you have: you get a code to enter on <code className="mono-sm">{approveUrl}</code>, in this browser or on another device.
+          </p>
+          {freshSignIn ? (
+            <Button loading={pending} disabled={pending} onClick={() => ask(true)}>Get a code</Button>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              <a className="underline" href="/logout?redirect=/dash/passkeys">Sign in again</a> first: asking for the code takes a sign-in from the last 5 minutes.
+            </p>
           )}
         </div>
       )}

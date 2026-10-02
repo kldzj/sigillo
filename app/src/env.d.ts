@@ -17,3 +17,11 @@ interface D1Migration {
 // nodejs_compat exposes process.env at runtime in Cloudflare Workers.
 // Only the subset we actually use is declared to avoid pulling in @types/node.
 declare var process: { env: Record<string, string | undefined> }
+
+// And AsyncLocalStorage, which step-up.ts uses (oneAction)
+declare module 'node:async_hooks' {
+  export class AsyncLocalStorage<T> {
+    getStore(): T | undefined
+    run<R>(store: T, callback: () => R): R
+  }
+}

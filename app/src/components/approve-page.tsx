@@ -34,7 +34,7 @@ export function ApprovePage() {
           <h1 className="text-2xl font-bold mb-2">Approved</h1>
           <p className="text-muted-foreground">
             {request?.purpose === "enroll"
-              ? "That device can add its passkey now, within the next 15 minutes. You can close this page."
+              ? "The browser that asked can add its passkey now, within the next 15 minutes. You can close this page."
               : "The CLI can read and change these environments for the next 15 minutes. You can close this page."}
           </p>
         </div>

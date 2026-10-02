@@ -378,9 +378,10 @@ export async function getAuth(request: Request) {
         rpName: 'Sigillo',
         origin: getRequestOrigin(request),
         authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
-        // Adding a passkey needs a Google sign-in from the last 5 minutes, or an
-        // approval with an existing passkey. Checked here, inside the endpoint,
-        // where the session is known, and before the passkey is stored.
+        // The first passkey needs a Google sign-in from the last 5 minutes, and
+        // a further one an approval to add it (step-up.ts). Checked here,
+        // inside the endpoint, where the session is known, and before the
+        // passkey is stored.
         registration: {
           afterVerification: async ({ ctx }) => {
             const current = ctx.context.session

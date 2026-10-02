@@ -6,7 +6,7 @@ description: 'Make reading or changing production take a passkey, in the browser
 icon: lucide:lock-keyhole
 ---
 
-A protected environment doesn't trust a session on its own. Reading or changing its values takes a passkey, so someone who copied a browser cookie or a CLI login from a laptop can neither read it nor swap a value, such as a signing key or a webhook URL, for one of their own.
+A protected environment doesn't trust a session on its own. Reading or changing its values takes a passkey approval, so someone who copied a browser cookie or a CLI login from a laptop can't read it or swap a value, such as a signing key or a webhook URL, for one of their own. The exception is the 15 minutes after its owner approved access in that same browser or CLI login: see [what an approval covers](#what-an-approval-covers).
 
 ## Protect an environment
 
@@ -39,17 +39,28 @@ Open `/approve` on your instance, type the code your terminal shows, and approve
 
 ## What an approval covers
 
-An approval lets that one browser or CLI login read and change those environments for 15 minutes. Other logins of the same person still have to ask.
+An approval is for the one browser or CLI login that asked. Other logins of the same person still have to ask.
+
+- **Access** lets that login read and change those environments for 15 minutes.
+- **An admin approval** covers one action, the one that asked for it, such as inviting someone, making a token or approving a CLI login. That action uses it up. One that no action used ends after 5 minutes.
+- **Adding a passkey** takes an approval of its own, which adds one passkey: see [more passkeys](#more-passkeys-and-removing-one).
+
+What someone with a copy of the session, such as a copied browser cookie, can still do:
+
+- Read and change the environments of an access approval during its 15 minutes, like its owner.
+- Use an admin approval that no action has used yet, before the action it was meant for does. The browser runs that action right after the approval, so the window is short, but it is there.
+
+They can't add a passkey of their own with an approval its owner gave for something else, and an action's approval doesn't carry over to the next action.
 
 ## Logins and tokens
 
-Once you have a passkey, approving a CLI login on `/device` and creating an API token take it too. Both keep working after the session that made them ends, so a stolen browser session could otherwise turn itself into one. The `/device` page takes the code typed from your terminal, never from the link, like `/approve`.
+Once you have a passkey, approving a CLI login on `/device` and creating or regenerating an API token take it too, each time. All of them keep working after the session that made them ends, so a stolen browser session could otherwise turn itself into one. The `/device` page takes the code typed from your terminal, never from the link, like `/approve`.
 
 Approving a CLI login, making or regenerating a token, and everything else in the web UI take a browser you signed in to with Google. A CLI login can do none of them: the CLI uses the REST API.
 
 ## Admin actions
 
-Once an organization has a protected environment, every admin action in it takes a passkey as well: inviting someone, changing a role or a member's projects, removing a member, auto-join, an environment's **Min Role** or protection, deleting or renaming a protected environment or its project, resetting passkeys, making or deleting a machine token, and deleting the organization. Otherwise someone with an admin's session could invite an account of their own, or open production to one. One approval covers admin actions for 5 minutes. Organizations without a protected environment work as before.
+Once an organization has a protected environment, every admin action in it takes a passkey as well: inviting someone, changing a role or a member's projects, removing a member, auto-join, an environment's **Min Role** or protection, deleting or renaming a protected environment or its project, resetting passkeys, making or deleting a machine token, and deleting the organization. Otherwise someone with an admin's session could invite an account of their own, or open production to one. Each admin action takes its own approval, so the browser asks for the passkey every time. Organizations without a protected environment work as before.
 
 Some actions take the admin's passkey in every organization: making a machine token, changing [trust rules](./workload-identity.mdx), and [purging old values](./secrets.mdx#history-and-old-values).
 
@@ -67,7 +78,9 @@ Leaving doesn't get around that: someone who left an organization or was removed
 
 ### More passkeys, and removing one
 
-Adding or removing one after that takes an approval with a passkey you already have: in the same browser, or, for a new device such as your phone, with a code you type on `/approve` on a device that has one, like approving the CLI. Asking for that code also takes a fresh Google sign-in. Someone who only has your session can't swap in their own.
+Adding another one takes an approval to add a passkey. The Passkeys page shows a code, which you type on `/approve` in a browser that has one of your passkeys, the same one or another device, and approve with that passkey, like approving the CLI. Asking for the code takes a Google sign-in from the last 5 minutes, and one approval adds one passkey. An approval for anything else, such as approving a CLI login, never adds one.
+
+Removing one takes an approval with a passkey you have, in the same browser. Someone who only has your session can't swap in their own.
 
 ### Reset a member's passkeys
 

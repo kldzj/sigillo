@@ -39,7 +39,7 @@ import { appendSecretEvents, environmentsToDeleteFrom, recordSecretRead, setEnvi
 import {
   StepUpRequiredError, NoPasskeyError, createStepUpRequest, approvalOptions, approveStepUpRequest, findStepUpRequest, logPasskeyEvent,
   requireOldValuesPurge, requireOrgAdmin, requireAdminApproval, requireAdminForProtected, requireProjectChange, requireProtectedAccess, resetMemberPasskeys, type Purpose,
-  requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus,
+  requestEnrollment, approveEnrollment, declineEnrollment, stepUpRequestStatus, oneAction,
 } from './step-up.ts'
 import { createTrustRule, deleteTrustRule, renewTrustRule, replaceTrustRuleKeys, trustRuleEvidence, type TrustRuleInput } from './workload.ts'
 import { createToken, deleteToken, regenerateToken, stopPreviousValue } from './tokens.ts'
@@ -133,12 +133,13 @@ export async function deleteSecretAction({ name, environmentIds }: {
 }
 
 // An action that needs a passkey approval first: the browser asks for one
-// (startStepUpAction) and runs the action again
+// (startStepUpAction) and runs the action again. It runs as one action
+// (oneAction), which uses up one admin approval however often it checks it.
 type StepUp = { stepUp: { purpose: 'access' | 'admin'; environmentIds: string[] } }
 
 async function stepUpOr<T>(action: () => Promise<T>): Promise<T | StepUp> {
   try {
-    return await action()
+    return await oneAction(action)
   } catch (error) {
     if (error instanceof StepUpRequiredError) return { stepUp: { purpose: error.purpose, environmentIds: error.environmentIds } }
     throw error

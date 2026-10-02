@@ -1,12 +1,15 @@
 // Step-up: a person approves with a passkey. An access approval lets one
-// session read and change protected environments; an admin approval lets it
-// run admin actions in an organization with protected environments, and
-// manage its own passkeys.
+// session read and change protected environments for 15 minutes; an admin
+// approval lets it run one admin action in an organization with protected
+// environments, make a token or approve a CLI login once it has a passkey, or
+// remove one of its passkeys, and is used up by that action. Adding a further
+// passkey takes an approval of its own (enroll).
 // better-auth's passkey plugin adds and manages passkeys; its own passkey
 // sign-in would create a new session and accepts a passkey without user
 // verification, so approvals are verified here, on the same passkey table,
 // with user verification required and no session created.
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import * as orm from 'drizzle-orm'
 import {
   generateAuthenticationOptions,
@@ -19,7 +22,8 @@ import { ForbiddenError, InvalidInputError, getOrgIdForProject, getRequestOrigin
 import { MACHINE_TOKEN_MAX_DAYS, formatUserCode } from './lib/utils.ts'
 import { securityEvent, userName } from './security-log.ts'
 
-// How long an approval lasts for the session, and how long a request waits
+// How long an approval lasts for the session, unless an action uses it up
+// first, and how long a request waits
 const GRANT_MS = { access: 15 * 60 * 1000, admin: 5 * 60 * 1000, enroll: 15 * 60 * 1000 }
 const REQUEST_MS = 10 * 60 * 1000
 // An admin may take longer to approve a member's first passkey
@@ -162,8 +166,37 @@ async function hasGrant({ userId, sessionId, purpose }: { userId: string; sessio
   return !!grant
 }
 
-async function hasAdminGrant({ userId, sessionId }: { userId: string; sessionId: string }) {
-  return hasGrant({ userId, sessionId, purpose: 'admin' })
+// The admin approvals each running action has used up. An action may check
+// for one several times (requireAdminWithPasskey asks for the org's admin and
+// then for the approval, resetMemberPasskeys for each of the member's orgs):
+// its first check takes a grant, and its later checks find it here.
+const usedAdminGrants = new AsyncLocalStorage<Set<string>>()
+
+// Runs one action, which uses up at most one admin approval. Every server
+// action that can ask for one runs in it (stepUpOr in actions.ts). Outside of
+// it, each check takes a grant of its own.
+export function oneAction<T>(run: () => Promise<T>): Promise<T> {
+  return usedAdminGrants.getStore() ? run() : usedAdminGrants.run(new Set(), run)
+}
+
+// Uses up an admin approval of the session: deletes one of its grants, so
+// two actions at once can't both use it
+async function useAdminGrant({ userId, sessionId }: { userId: string; sessionId: string }) {
+  const used = usedAdminGrants.getStore()
+  const key = `${userId}:${sessionId}`
+  if (used?.has(key)) return true
+  const db = getDb()
+  const [grant] = await db.delete(schema.stepUpGrant).where(orm.inArray(schema.stepUpGrant.id, db.select({ id: schema.stepUpGrant.id })
+    .from(schema.stepUpGrant)
+    .where(orm.and(
+      orm.eq(schema.stepUpGrant.userId, userId), orm.eq(schema.stepUpGrant.sessionId, sessionId),
+      orm.eq(schema.stepUpGrant.purpose, 'admin'), orm.gt(schema.stepUpGrant.expiresAt, Date.now()),
+    ))
+    .orderBy(schema.stepUpGrant.expiresAt)
+    .limit(1),
+  )).returning({ id: schema.stepUpGrant.id })
+  if (grant) used?.add(key)
+  return !!grant
 }
 
 // An org admin, with an admin approval for the session when the org has a
@@ -178,7 +211,7 @@ export async function requireOrgAdmin({ userId, sessionId, orgId }: { userId: st
     .innerJoin(schema.project, orm.eq(schema.project.id, schema.environment.projectId))
     .where(orm.and(orm.eq(schema.project.orgId, orgId), orm.eq(schema.environment.protected, true)))
     .limit(1)
-  if (protectedEnv && !await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+  if (protectedEnv && !await useAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
 }
 
 // Deleting or renaming a protected environment, or the project it is in, is
@@ -237,7 +270,7 @@ export async function requireMachineTokenApproval({ userId, sessionId, projectId
 // passkey every time (workload.ts)
 export async function requireAdminWithPasskey({ userId, sessionId, projectId }: { userId: string; sessionId: string; projectId: string }) {
   await requireMachineTokenDeletion({ userId, sessionId, projectId })
-  if (!await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+  if (!await useAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
 }
 
 // Deleting one stops whatever uses it: an admin action like any other
@@ -255,7 +288,7 @@ export async function requireOldValuesPurge({ userId, sessionId, environmentId }
     .where(orm.eq(schema.environment.id, environmentId))
   if (!environment) throw new Error('Environment not found')
   await requireOrgAdmin({ userId, sessionId, orgId: environment.orgId })
-  if (!await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+  if (!await useAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
 }
 
 // ── Requests and approvals ──────────────────────────────────────────
@@ -375,13 +408,15 @@ export async function approveStepUpRequest({ request, requestId, userId, respons
   const { origin, rpID } = relyingParty(request)
   if (!await verifyPasskey({ userId, response, expectedChallenge: row.challenge, origin, rpID })) return false
   const db = getDb()
+  // Answers the request once: two approvals at once give one grant
+  const [answered] = await db.update(schema.stepUpRequest).set({ status: 'approved', challenge: null })
+    .where(orm.and(orm.eq(schema.stepUpRequest.id, row.id), orm.eq(schema.stepUpRequest.status, 'pending')))
+    .returning({ id: schema.stepUpRequest.id })
+  if (!answered) return false
   const now = Date.now()
-  await db.batch([
-    db.update(schema.stepUpRequest).set({ status: 'approved', challenge: null }).where(orm.eq(schema.stepUpRequest.id, row.id)),
-    db.insert(schema.stepUpGrant).values({
-      userId, sessionId: row.sessionId, purpose: row.purpose, environmentIds: row.environmentIds, createdAt: now, expiresAt: now + GRANT_MS[row.purpose],
-    }),
-  ])
+  await db.insert(schema.stepUpGrant).values({
+    userId, sessionId: row.sessionId, purpose: row.purpose, environmentIds: row.environmentIds, createdAt: now, expiresAt: now + GRANT_MS[row.purpose],
+  })
   return true
 }
 
@@ -430,10 +465,12 @@ export async function passkeyApproverOrgs(userId: string): Promise<string[]> {
   return orgIds
 }
 
-// Adding a passkey: with an enroll grant for this session (approved on another
-// device, or by an admin, and used up by the passkey it adds); a further one
-// with an admin approval with an existing passkey; the first one with a fresh
-// Google sign-in, unless an admin has to approve it.
+// Adding a passkey: with an enroll grant for this session (approved with a
+// code on /approve with an existing passkey, or by an admin, and used up by
+// the passkey it adds), or the first one with a fresh Google sign-in, unless
+// an admin has to approve it. An admin approval adds none: people give one in
+// everyday use, to approve a CLI login or make a token, and a passkey is
+// lasting access of its own, so it takes an approval for just that.
 export async function canAddPasskey(login: { userId: string; sessionId: string; signedIn: boolean; sessionCreatedAt: number }) {
   if (await hasGrant({ userId: login.userId, sessionId: login.sessionId, purpose: 'enroll' })) return true
   return canAddWithoutApproval(login)
@@ -450,9 +487,8 @@ export async function claimPasskeyAddition(login: { userId: string; sessionId: s
   return !!claimed || canAddWithoutApproval(login)
 }
 
-async function canAddWithoutApproval({ userId, sessionId, signedIn, sessionCreatedAt }: { userId: string; sessionId: string; signedIn: boolean; sessionCreatedAt: number }) {
-  const existing = await getDb().query.passkey.findFirst({ where: { userId }, columns: { id: true } })
-  if (existing) return hasAdminGrant({ userId, sessionId })
+async function canAddWithoutApproval({ userId, signedIn, sessionCreatedAt }: { userId: string; signedIn: boolean; sessionCreatedAt: number }) {
+  if (await getDb().query.passkey.findFirst({ where: { userId }, columns: { id: true } })) return false
   return isFreshSignIn({ signedIn, sessionCreatedAt }) && (await passkeyApproverOrgs(userId)).length === 0
 }
 
@@ -578,18 +614,18 @@ export async function pendingEnrollments({ userIds, orgId }: { userIds: string[]
 }
 
 // What gives lasting access to your account: approving a CLI login, making an
-// API token. Once you have a passkey, these take an approval with it, so a
+// API token. Once you have a passkey, each takes an approval with it, so a
 // stolen session can't turn itself into a login or a token that outlives it.
 export async function requirePasskeyOnceEnrolled({ userId, sessionId }: { userId: string; sessionId: string }) {
   const passkey = await getDb().query.passkey.findFirst({ where: { userId }, columns: { id: true } })
-  if (passkey && !await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+  if (passkey && !await useAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
 }
 
-// An admin approval for the session, whatever the organization: removing one
+// An admin approval of the session, whatever the organization: removing one
 // of your passkeys (so a stolen session can't clear them and add its own after
 // a fresh sign-in), and turning protection off
 export async function requireAdminApproval({ userId, sessionId }: { userId: string; sessionId: string }) {
-  if (!await hasAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
+  if (!await useAdminGrant({ userId, sessionId })) throw new StepUpRequiredError('admin')
 }
 
 // An admin removes a member's passkeys, for a member who lost them. Passkeys

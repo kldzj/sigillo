@@ -16,7 +16,7 @@ function isStepUp(value: unknown): value is StepUp {
 }
 
 // Approves in this browser session: access to the environments for 15
-// minutes, or admin actions and managing passkeys for 5
+// minutes, or the one admin action that asked
 export async function approveInBrowser({ purpose, environmentIds }: StepUp["stepUp"]): Promise<boolean> {
   const started = await startStepUpAction({ purpose, environmentIds });
   if ("noPasskey" in started) {
