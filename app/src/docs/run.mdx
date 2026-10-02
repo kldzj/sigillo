@@ -60,13 +60,18 @@ A globally installed `sigillo` (with `curl` or `npm i -g`) run outside a package
 
 ## Variables Sigillo won't set
 
-A secret named like a variable that decides which programs run and what they load, such as `PATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `GIT_PAGER` or `npm_config_registry`, is skipped with a warning: anyone who can change the environment's secrets could otherwise run code on your machine. Pass `--allow-env NAME` to use one, once per name:
+A secret named like a variable that decides which programs run and what they load, such as `PATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `CC`, `MAKEFLAGS`, `GRADLE_OPTS`, any `*PAGER` or `npm_config_registry`, is skipped with a warning: anyone who can change the environment's secrets could otherwise run code on your machine. Pass `--allow-env NAME` to use one, once per name:
 
 ```bash
 sigillo run --allow-env NODE_OPTIONS -- next build
 ```
 
 Names match in any case, as they do on Windows. The list is best effort: no list of such names is complete, so a secret can still change how a program runs through a variable it doesn't know.
+
+Two kinds are always skipped, whatever `--allow-env` says:
+
+- `SIGILLO_*`, such as `SIGILLO_API_URL` or `SIGILLO_TOKEN`: they configure a `sigillo` that the command runs in turn, which would otherwise send its requests where a secret says.
+- A name that isn't a variable name: letters, digits and `_`, not starting with a digit.
 
 ## Output redaction
 

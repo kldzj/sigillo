@@ -376,7 +376,7 @@ pub fn loginReplacesServer(saved: ?ScopedEntry, api_url: []const u8, from_flag: 
     return if (sameApiUrl(saved_url, api_url)) null else saved_url;
 }
 
-pub fn resolve(allocator: std.mem.Allocator, cwd_input: []const u8, flags: ResolvedConfig) !ResolvedConfig {
+pub fn resolve(allocator: std.mem.Allocator, cwd_input: []const u8, flags: ResolvedConfig) !Resolved {
     const config = try readConfig(allocator);
     const cwd = try normalizeScope(allocator, cwd_input);
 
@@ -398,7 +398,7 @@ pub fn resolve(allocator: std.mem.Allocator, cwd_input: []const u8, flags: Resol
             .{ resolved.config.api_url.?, saved_url, resolved.config.api_url.? },
         );
     }
-    return resolved.config;
+    return resolved;
 }
 
 fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {

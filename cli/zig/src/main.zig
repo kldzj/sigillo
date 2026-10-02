@@ -332,7 +332,7 @@ const Run = zeke.cmd("run <...cmd>", "Run a command with secrets injected")
     .option("--mount [path]", "Write secrets to a new owner-only file (must not exist), deleted when the command exits")
     .option("--mount-format [fmt]", "Format for mounted file: env, env-no-quotes, json, yaml, docker, dotnet-json (default: env)")
     .option("--disable-redaction", "Print child output without secret redaction")
-    .optionMany("--allow-env <name>", "Let a secret set a variable that controls how programs run, like NODE_OPTIONS or PATH (repeatable). Only known names are skipped, on a best effort basis")
+    .optionMany("--allow-env <name>", "Let a secret set a variable that controls how programs run, like NODE_OPTIONS or PATH (repeatable). Only known names are skipped, on a best effort basis. SIGILLO_* is never set")
     .option("-p, --project [id]", "Project ID or name override")
     .option("--env [slug]", "Env slug override (e.g. dev, prod)")
     .option("-c, --config [slug]", "Env slug override")
@@ -444,10 +444,10 @@ fn loginAction(_: Login.Args, opts: Login.Options, global: Global.Options) !void
 
     const scope: []const u8 = opts.scope orelse "/";
 
-    const resolved = try config.resolve(allocator, cwd, .{
+    const resolved = (try config.resolve(allocator, cwd, .{
         .token = global.token,
         .api_url = global.api_url,
-    });
+    })).config;
 
     const api_url = resolved.api_url orelse exitNoApiUrl(stderr);
     if (config.loginReplacesServer(try config.getScope(allocator, scope), api_url, global.api_url != null)) |saved_url| {
@@ -1070,10 +1070,14 @@ fn runAction(args: Run.Args, opts: Run.Options, global: Global.Options) !void {
     var env_map = try std.process.getEnvMap(gpa.allocator());
     defer env_map.deinit();
     const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, secrets, opts.allow_env);
-    for (skipped) |skipped_name| {
-        const name = try color.plain(allocator, skipped_name);
+    for (skipped) |secret| {
+        const name = try color.plain(allocator, secret.name);
         try color.yellow(stderr, "warning");
-        try stderr.print(": skipped the secret {s}: it controls how programs run. Pass --allow-env {s} to use it.\n", .{ name, name });
+        switch (secret.reason) {
+            .invalid_name => try stderr.print(": skipped the secret {s}: it isn't a variable name (letters, digits and _, not starting with a digit)\n", .{name}),
+            .sigillo => try stderr.print(": skipped the secret {s}: SIGILLO_* variables configure sigillo itself, so a secret never sets one\n", .{name}),
+            .controls_execution => try stderr.print(": skipped the secret {s}: it controls how programs run. Pass --allow-env {s} to use it.\n", .{ name, name }),
+        }
     }
 
     // Marker so child processes can detect they're running inside sigillo.
@@ -1714,8 +1718,12 @@ var workload_token: ?[]const u8 = null;
 // The configured token, or else one for the JWT of the job or pod this runs
 // in (workload.zig). login saves only tokens it's given, so it doesn't ask.
 fn resolveConfig(allocator: std.mem.Allocator, cwd: []const u8, flags: config.ResolvedConfig) !config.ResolvedConfig {
-    var resolved = try config.resolve(allocator, cwd, flags);
+    const full = try config.resolve(allocator, cwd, flags);
+    var resolved = full.config;
     if (resolved.token != null) return resolved;
+    // A saved login withheld from a server that SIGILLO_API_URL or --api-url
+    // named: the workload's JWT doesn't go there either
+    if (full.withheld_token_api_url != null) return resolved;
     const api_url = resolved.api_url orelse return resolved;
     if (workload_token) |token| {
         resolved.token = token;
@@ -2795,17 +2803,22 @@ const execution_variables =
     [_][]const u8{ "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS" } ++
     // Commands that git, ssh, less and other tools start: helpers, pagers, editors
     [_][]const u8{ "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF" } ++
-    [_][]const u8{ "GIT_PAGER", "PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "LESSOPEN", "LESSCLOSE", "BROWSER" } ++
+    [_][]const u8{ "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "LESSOPEN", "LESSCLOSE", "BROWSER" } ++
     // Where packages come from and how they are checked: the next install runs their code
     [_][]const u8{ "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_TRUSTED_HOST", "YARN_REGISTRY", "YARN_NPM_REGISTRY_SERVER" } ++
     [_][]const u8{ "COREPACK_NPM_REGISTRY", "COREPACK_INTEGRITY_KEYS", "GOPROXY", "GOSUMDB", "GONOSUMDB", "GONOSUMCHECK", "GOINSECURE", "GOFLAGS", "GOTOOLCHAIN" } ++
     // TLS checks switched off, so anyone on the way can change what is downloaded
-    [_][]const u8{ "NODE_TLS_REJECT_UNAUTHORIZED", "GIT_SSL_NO_VERIFY" };
+    [_][]const u8{ "NODE_TLS_REJECT_UNAUTHORIZED", "GIT_SSL_NO_VERIFY" } ++
+    // Compilers, linkers and build tools that make, cargo, Gradle and Maven start, and their options
+    [_][]const u8{ "CC", "CXX", "CPP", "LD", "MAKEFLAGS", "MAKEFILES", "RUSTC_WRAPPER", "GRADLE_OPTS", "JAVA_OPTS", "MAVEN_OPTS" };
 const execution_prefixes =
     // The dynamic loader, and git config given in the environment
     [_][]const u8{ "LD_", "DYLD_", "GIT_CONFIG" } ++
     // Any npm setting (node_options, script_shell, registry) and Bundler's mirrors
     [_][]const u8{ "NPM_CONFIG_", "BUNDLE_MIRROR__" };
+const execution_suffixes =
+    // The pager a tool starts: PAGER, MANPAGER, GIT_PAGER, SYSTEMD_PAGER and others
+    [_][]const u8{"PAGER"};
 
 // Ignoring case: Windows looks names up that way, so node_options there is
 // NODE_OPTIONS, and npm reads npm_config_* in any case too
@@ -2816,22 +2829,51 @@ fn controlsExecution(name: []const u8) bool {
     for (execution_prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(name, prefix)) return true;
     }
+    for (execution_suffixes) |suffix| {
+        if (std.ascii.endsWithIgnoreCase(name, suffix)) return true;
+    }
     return false;
 }
 
-// Puts the secrets into the child's environment, and returns the names it
-// skipped because they control how programs run
-fn mergeSecretsIntoEnvMap(allocator: std.mem.Allocator, env_map: *std.process.EnvMap, secrets: std.json.ObjectMap, allowed: []const []const u8) ![]const []const u8 {
-    var skipped = std.ArrayListUnmanaged([]const u8).empty;
+// What the server accepts as a secret's name (SECRET_NAME_REGEX), checked
+// again: a name with `=`, a space or a NUL would set another variable, or
+// none, than the one it seems to
+fn isVariableName(name: []const u8) bool {
+    if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    }
+    return true;
+}
+
+const SkippedSecret = struct {
+    name: []const u8,
+    reason: enum { invalid_name, sigillo, controls_execution },
+};
+
+// Puts the secrets into the child's environment, and returns those it
+// skipped: names that aren't variable names, SIGILLO_* (the settings of a
+// sigillo the command runs, never a secret's, whatever --allow-env says),
+// and names that control how programs run unless allowed
+fn mergeSecretsIntoEnvMap(allocator: std.mem.Allocator, env_map: *std.process.EnvMap, secrets: std.json.ObjectMap, allowed: []const []const u8) ![]const SkippedSecret {
+    var skipped = std.ArrayListUnmanaged(SkippedSecret).empty;
     var iter = secrets.iterator();
     next: while (iter.next()) |entry| {
         if (entry.value_ptr.* != .string) continue;
         const name = entry.key_ptr.*;
+        if (!isVariableName(name)) {
+            try skipped.append(allocator, .{ .name = name, .reason = .invalid_name });
+            continue;
+        }
+        if (std.ascii.startsWithIgnoreCase(name, "SIGILLO_")) {
+            try skipped.append(allocator, .{ .name = name, .reason = .sigillo });
+            continue;
+        }
         if (controlsExecution(name)) {
             for (allowed) |allow| {
                 if (std.ascii.eqlIgnoreCase(allow, name)) break;
             } else {
-                try skipped.append(allocator, name);
+                try skipped.append(allocator, .{ .name = name, .reason = .controls_execution });
                 continue :next;
             }
         }
@@ -2993,7 +3035,10 @@ test "run: a secret doesn't set a variable that controls how programs run, unles
     try std.testing.expectEqualStrings("sh /tmp/x.sh", env_map.get("GIT_PAGER").?);
     const blocked = [_][]const u8{ "PATH", "LD_PRELOAD", "NODE_OPTIONS", "BASH_ENV", "node_options", "Path", "PS4", "npm_config_registry", "NPM_CONFIG_SCRIPT_SHELL", "BUNDLE_MIRROR__RUBYGEMS__ORG" };
     try std.testing.expectEqual(blocked.len, skipped.len);
-    for (blocked, skipped) |name, skipped_name| try std.testing.expectEqualStrings(name, skipped_name);
+    for (blocked, skipped) |name, secret| {
+        try std.testing.expectEqualStrings(name, secret.name);
+        try std.testing.expect(secret.reason == .controls_execution);
+    }
     // Credentials that only look like those still pass
     for ([_][]const u8{ "API_KEY", "YARN_NPM_AUTH_TOKEN", "BUNDLE_GEMS__CONTRIBSYS__COM", "GIT_TOKEN", "DATABASE_URL", "GITHUB_TOKEN" }) |name| {
         try std.testing.expect(env_map.get(name) != null);
@@ -3012,7 +3057,42 @@ test "run: --allow-env matches a name in any case" {
     try std.testing.expectEqualStrings("--max-old-space-size=4096", env_map.get("NODE_OPTIONS").?);
     try std.testing.expectEqualStrings("C:/tools", env_map.get("Path").?);
     try std.testing.expectEqual(@as(usize, 1), skipped.len);
-    try std.testing.expectEqualStrings("PS4", skipped[0]);
+    try std.testing.expectEqualStrings("PS4", skipped[0].name);
+}
+
+test "run: a secret never sets SIGILLO_*, a build tool's command or options, or a name that isn't a variable name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    // A nested sigillo would read SIGILLO_* as its own settings: its server,
+    // its token, the JWT file it sends. A name with `=` would set another variable.
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"SIGILLO_API_URL":"https://elsewhere.example","sigillo_oidc_token_file":"/home/me/.ssh/id_ed25519","GRADLE_OPTS":"-javaagent:/tmp/x.jar",
+        \\ "CC":"/tmp/cc","MAKEFLAGS":"SHELL=/tmp/x.sh","MANPAGER":"sh /tmp/x.sh","FOO=BAR":"x","A B":"x","9LIVES":"x","":"x",
+        \\ "API_KEY":"k","SIGILLOSCOPE_TOKEN":"s","_UNDERSCORE":"u"}
+    , .{});
+    var env_map = std.process.EnvMap.init(allocator);
+    // --allow-env never lets one through
+    const skipped = try mergeSecretsIntoEnvMap(allocator, &env_map, parsed.object, &.{ "SIGILLO_API_URL", "sigillo_oidc_token_file" });
+    const expected = [_]SkippedSecret{
+        .{ .name = "SIGILLO_API_URL", .reason = .sigillo },
+        .{ .name = "sigillo_oidc_token_file", .reason = .sigillo },
+        .{ .name = "GRADLE_OPTS", .reason = .controls_execution },
+        .{ .name = "CC", .reason = .controls_execution },
+        .{ .name = "MAKEFLAGS", .reason = .controls_execution },
+        .{ .name = "MANPAGER", .reason = .controls_execution },
+        .{ .name = "FOO=BAR", .reason = .invalid_name },
+        .{ .name = "A B", .reason = .invalid_name },
+        .{ .name = "9LIVES", .reason = .invalid_name },
+        .{ .name = "", .reason = .invalid_name },
+    };
+    try std.testing.expectEqual(expected.len, skipped.len);
+    for (expected, skipped) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try std.testing.expectEqual(want.reason, got.reason);
+    }
+    try std.testing.expectEqual(@as(usize, 3), env_map.count());
+    for ([_][]const u8{ "API_KEY", "SIGILLOSCOPE_TOKEN", "_UNDERSCORE" }) |name| try std.testing.expect(env_map.get(name) != null);
 }
 
 test "the browser opens only a plain web address from the server" {
