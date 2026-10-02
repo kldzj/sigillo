@@ -2884,8 +2884,8 @@ fn mergeSecretsIntoEnvMap(allocator: std.mem.Allocator, env_map: *std.process.En
 
 fn selfHostAction(_: SelfHost.Args, _: SelfHost.Options, _: Global.Options) !void {
     const stderr = getStderr();
-    try stderr.writeAll("self-host is part of the sigillo npm package (it needs Node.js).\n");
-    try stderr.writeAll("Run it with:\n\n  npx sigillo self-host\n");
+    try stderr.writeAll("self-host is part of the @kldzj/sigillo npm package (it needs Node.js).\n");
+    try stderr.writeAll("Run it with:\n\n  npx @kldzj/sigillo self-host\n");
     std.process.exit(1);
 }
 
