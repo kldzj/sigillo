@@ -106,6 +106,17 @@ Rules:
 - An unknown key id refetches at most every 5 minutes per rule, and discovered keys are refetched once a day. `refreshKeys` claims the fetch with a conditional update first, so requests arriving together fetch once.
 - The Doppler download must stay a flat map of names to values (ESO unmarshals it into `map[string]string`), so it never gets a `success` field.
 
+## Server actions and passkey approvals (fork)
+
+`app/src/actions.ts` is the web UI's. `app/src/step-up.ts` keeps the passkey approvals (`step_up_grant`): `access` to environments, `admin` for one action, `enroll` to add a passkey.
+
+Rules:
+- **Server actions take a Google sign-in in a browser.** `requireSession()` refuses a request with an `Authorization` header and a session without `signedIn`, such as a CLI login from the device flow. `createToken` and `regenerateToken` (`tokens.ts`) check `signedIn` themselves, for any other caller. The CLI uses `/api/v0`, never an action, and tests call actions through `runAction` with the session cookie, never a bearer token.
+- **An admin approval is used up by the one action it approves.** `useAdminGrant()` deletes one grant row (`delete … returning`), so two actions can't share one. An action may check it several times (`requireAdminWithPasskey`, `requireOrgAdmin` for each org): `stepUpOr` runs every server action in `oneAction()`, whose AsyncLocalStorage record lets the action's later checks find the grant its first check took. Outside `oneAction()` every check takes a grant of its own, so another caller that checks more than once, such as a test, runs in `oneAction()` too.
+- **Access approvals keep their 15 minutes** and aren't used up.
+- **A further passkey takes an `enroll` approval**, a code typed on `/approve` and approved with an existing passkey, which `claimPasskeyAddition()` uses up. An admin approval never adds a passkey.
+- `approveStepUpRequest()` answers a request once, so two approvals of it at once give one grant.
+
 ## Backups (fork)
 
 `self-host --backup` exports both D1 databases through Cloudflare's export API and saves them gzipped and age-encrypted to `backupIdentity` in `selfhost.json` (`cli/src/selfhost/backup.ts`). `--restore` imports into new databases, checks the history (`history.ts`), then saves their ids and redeploys both workers. It never deletes the old databases.
@@ -476,6 +487,11 @@ or how flags and behavior should work:
 
 When implementing new CLI commands, prefer the smallest useful subset of the
 Doppler UX rather than inventing a new interface.
+
+Rules for `sigillo run` (fork):
+- **A secret never sets `SIGILLO_*`**, whatever `--allow-env` says: a `sigillo` the command runs would read it as its own server, token or JWT file. Names that aren't variable names (the server's `SECRET_NAME_REGEX`, `^[A-Za-z_][A-Za-z0-9_]*$`) are skipped too, with a warning naming them.
+- Names that start programs or change what they load (`execution_variables`, `execution_prefixes`, `execution_suffixes` in `main.zig`, matched in any case) are skipped unless `--allow-env` names them.
+- `resolveConfig()` doesn't exchange a workload's JWT when `config.resolve()` withheld a saved login from the API URL: the JWT doesn't go where the login wouldn't.
 
 ## CLI development process
 
